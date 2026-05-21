@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "SafeView",
+  "version": "0.1.3",
+  "description": "Real-time AI-powered content moderation for web video. Blurs restricted content using a local SafeView backend.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "SafeView",
+    "default_popup": "dist/popup/index.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_ui": {
+    "page": "dist/options/index.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "dist/background/serviceWorker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["dist/content/index.js"],
+      "type": "module",
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*"
+  ]
+}
