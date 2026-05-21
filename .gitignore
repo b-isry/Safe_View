@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+*.pth
+
+# Node / Extension
+node_modules/
+*.js.map
+.cache/
+extension/dist/
+
+# Android / Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+*.iml
+.gradle/
+local.properties
+*.apk
+*.aab
+
+# Environment / secrets
+.env
+.env.*
+*.key
+secrets.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
