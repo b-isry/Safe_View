@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SafeView Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="options" aria-label="SafeView settings">
+      <header class="options__header">
+        <h1 class="options__title">SafeView Settings</h1>
+        <p class="options__subtitle">
+          Changes are saved immediately to this browser.
+        </p>
+      </header>
+
+      <section class="options__section" aria-labelledby="filtersHeading">
+        <h2 id="filtersHeading" class="options__section-title">Content filters</h2>
+        <div class="options__card options__card--toggles">
+          <label class="options__toggle-row">
+            <span>Nudity (required — AI model)</span>
+            <input
+              type="checkbox"
+              id="category-nudity"
+              data-category="nudity"
+              checked
+              disabled
+              title="Nudity detection is always on when protection is enabled"
+            />
+          </label>
+          <label class="options__toggle-row">
+            <span>Violence</span>
+            <input
+              type="checkbox"
+              id="category-violence"
+              data-category="violence"
+            />
+          </label>
+          <label class="options__toggle-row">
+            <span>Kissing / Romantic</span>
+            <input type="checkbox" id="category-kissing" data-category="kissing" />
+          </label>
+          <label class="options__toggle-row">
+            <span>Profanity</span>
+            <input
+              type="checkbox"
+              id="category-profanity"
+              data-category="profanity"
+            />
+          </label>
+          <label class="options__toggle-row">
+            <span>LGBTQ+ Themes</span>
+            <input type="checkbox" id="category-lgbtq" data-category="lgbtq" />
+          </label>
+        </div>
+      </section>
+
+      <section class="options__section" aria-labelledby="sensitivityHeading">
+        <h2 id="sensitivityHeading" class="options__section-title">
+          Sensitivity
+        </h2>
+        <div class="options__card">
+          <label class="options__label" for="sensitivitySlider"
+            >Detection threshold</label
+          >
+          <input
+            type="range"
+            id="sensitivitySlider"
+            class="options__slider"
+            min="0"
+            max="2"
+            step="1"
+            value="1"
+          />
+          <div class="options__slider-labels" aria-hidden="true">
+            <span>Low (0.60)</span>
+            <span>Medium (0.75)</span>
+            <span>High (0.90)</span>
+          </div>
+          <p id="sensitivityValue" class="options__hint">
+            Medium — effective floor 0.75 (BR-01)
+          </p>
+        </div>
+      </section>
+
+      <section class="options__section" aria-labelledby="backendHeading">
+        <h2 id="backendHeading" class="options__section-title">Backend</h2>
+        <div class="options__card">
+          <label class="options__label" for="backendUrl">Backend URL</label>
+          <input
+            type="url"
+            id="backendUrl"
+            class="options__input"
+            placeholder="http://localhost:8000"
+            autocomplete="off"
+          />
+          <div class="options__row-actions">
+            <button type="button" id="testConnection" class="options__button">
+              Test Connection
+            </button>
+            <span
+              id="connectionStatus"
+              class="options__status"
+              role="status"
+              aria-live="polite"
+            ></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="options__section" aria-labelledby="profanityHeading">
+        <h2 id="profanityHeading" class="options__section-title">
+          Profanity word list
+        </h2>
+        <div class="options__card">
+          <p class="options__hint">
+            Words in this list trigger audio muting (BR-03). One entry per add.
+          </p>
+          <div class="options__profanity-add">
+            <input
+              type="text"
+              id="profanityInput"
+              class="options__input"
+              placeholder="Add a word"
+              autocomplete="off"
+            />
+            <button type="button" id="addProfanityWord" class="options__button">
+              Add
+            </button>
+          </div>
+          <ul id="profanityList" class="options__word-list"></ul>
+        </div>
+      </section>
+
+      <footer class="options__footer">
+        <button type="button" id="resetDefaults" class="options__button options__button--danger">
+          Reset to defaults
+        </button>
+        <p id="saveStatus" class="options__save-status" role="status" aria-live="polite"></p>
+      </footer>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

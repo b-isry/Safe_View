@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SafeView</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup" aria-label="SafeView protection popup">
+      <header class="popup__header">
+        <div class="popup__title-row">
+          <h1 class="popup__title">SafeView</h1>
+          <span
+            id="statusDot"
+            class="status-dot status-dot--grey"
+            role="status"
+            aria-live="polite"
+            aria-label="Status: idle"
+          ></span>
+        </div>
+        <p id="statusLabel" class="popup__status-label">Idle</p>
+      </header>
+
+      <section class="popup__card">
+        <div class="popup__row popup__row--toggle">
+          <label class="popup__label" for="protectionToggle">Protection</label>
+          <label class="toggle" aria-label="Toggle protection">
+            <input
+              type="checkbox"
+              id="protectionToggle"
+              class="toggle__input"
+              checked
+            />
+            <span class="toggle__track" aria-hidden="true">
+              <span class="toggle__thumb"></span>
+            </span>
+          </label>
+        </div>
+
+        <div class="popup__row">
+          <span class="popup__label">Active filters</span>
+          <span id="filterCount" class="popup__value">0</span>
+        </div>
+
+        <div class="popup__row popup__row--backend">
+          <span class="popup__label">Backend</span>
+          <span id="backendStatus" class="popup__value popup__value--backend"
+            >Checking…</span
+          >
+        </div>
+      </section>
+
+      <footer class="popup__footer">
+        <button type="button" id="openOptions" class="popup__link-button">
+          Open Settings
+        </button>
+      </footer>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

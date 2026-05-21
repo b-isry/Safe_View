@@ -1,0 +1,282 @@
+/* SafeView — options.css
+   Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
+   Purpose: Options page styles — SafeView brand palette. */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+}
+
+:root {
+  --color-bg: #0d1b2a;
+  --color-accent: #00b4d8;
+  --color-text: #ffffff;
+  --color-warning: #ff6b6b;
+  --color-active: #2ecc71;
+  --color-grey: #6c7a89;
+  --color-card: #132337;
+  --color-border: #1b3350;
+  --font-family: "IBM Plex Sans", system-ui, sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-family);
+  font-size: 0.9375rem;
+  background: var(--color-bg);
+  color: var(--color-text);
+  line-height: 1.5;
+}
+
+.options {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.options__header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.options__title {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.options__subtitle {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--color-accent);
+}
+
+.options__section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.options__section-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--color-accent);
+}
+
+.options__card {
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.options__card--toggles {
+  gap: 0;
+  padding: 0;
+}
+
+.options__toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+}
+
+.options__toggle-row:last-child {
+  border-bottom: none;
+}
+
+.options__toggle-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--color-active);
+  cursor: pointer;
+}
+
+.options__label {
+  font-weight: 500;
+}
+
+.options__hint {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--color-grey);
+}
+
+.options__slider {
+  width: 100%;
+  accent-color: var(--color-accent);
+}
+
+.options__slider-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--color-grey);
+}
+
+.options__input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-family);
+  font-size: 0.875rem;
+}
+
+.options__input:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.options__row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.options__button {
+  border: none;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-family: var(--font-family);
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--color-accent);
+  color: var(--color-bg);
+}
+
+.options__button:hover {
+  filter: brightness(1.1);
+}
+
+.options__button:focus-visible {
+  outline: 2px solid var(--color-text);
+  outline-offset: 2px;
+}
+
+.options__button--danger {
+  background: transparent;
+  color: var(--color-warning);
+  border: 1px solid var(--color-warning);
+}
+
+.options__button--danger:hover {
+  background: rgba(255, 107, 107, 0.12);
+}
+
+.options__status {
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.options__status.is-success {
+  color: var(--color-active);
+}
+
+.options__status.is-error {
+  color: var(--color-warning);
+}
+
+.options__profanity-add {
+  display: flex;
+  gap: 8px;
+}
+
+.options__profanity-add .options__input {
+  flex: 1;
+}
+
+.options__word-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.options__word-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+}
+
+.options__word-text {
+  font-size: 0.875rem;
+  word-break: break-word;
+}
+
+.options__word-remove {
+  border: none;
+  background: transparent;
+  color: var(--color-warning);
+  font-family: var(--font-family);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 6px;
+}
+
+.options__word-remove:hover {
+  text-decoration: underline;
+}
+
+.options__word-list--empty::after {
+  content: "No words added yet.";
+  color: var(--color-grey);
+  font-size: 0.8125rem;
+}
+
+.options__footer {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding-top: 8px;
+}
+
+.options__save-status {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--color-active);
+  min-height: 1rem;
+}
