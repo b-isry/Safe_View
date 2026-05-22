@@ -6,10 +6,18 @@
 from __future__ import annotations
 
 import io
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+
+# Avoid loading the Whisper checkpoint during test collection/import.
+with patch("audio_processor.load_whisper"):
+    import audio_processor
+
+    audio_processor.WHISPER_LOADED = False
+    audio_processor._whisper_model = None
 
 import main
 
@@ -23,6 +31,19 @@ def client() -> TestClient:
         TestClient: HTTP client for route integration tests.
     """
     return TestClient(main.app)
+
+
+@pytest.fixture
+def silent_webm_bytes() -> bytes:
+    """
+    Minimal WebM upload bytes (EBML header + padding) for /analyze-audio tests.
+
+    Transcription is mocked in tests; bytes mimic a silent MediaRecorder chunk.
+    """
+    return (
+        bytes.fromhex("1a45dfa3010000000000000015428680")
+        + b"\x00" * 64
+    )
 
 
 @pytest.fixture
