@@ -120,8 +120,6 @@ def _split_checkpoint(
     for key, value in checkpoint.items():
         if key.startswith(BACKBONE_STATE_PREFIX):
             stripped_key = key[len(BACKBONE_STATE_PREFIX) :]
-            if stripped_key.startswith(MODEL_WRAPPER_PREFIX):
-                stripped_key = stripped_key[len(MODEL_WRAPPER_PREFIX) :]
             backbone_state[stripped_key] = value
         elif key.startswith("head."):
             head_state[key] = value
@@ -132,6 +130,43 @@ def _split_checkpoint(
         raise ValueError(f"Missing head.weight/head.bias in {MODEL_FILENAME}")
 
     return backbone_state, head_state
+
+
+def _align_backbone_state_dict(
+    backbone_state: Dict[str, torch.Tensor],
+    backbone: PreTrainedModel,
+) -> Dict[str, torch.Tensor]:
+    """
+    Rename checkpoint keys to match the Hugging Face backbone state dict.
+
+    Team checkpoints use backbone.model.layer.* while some transformers builds
+    expect layer.* (and vice versa). Align against the live module keys.
+    """
+    expected_keys = set(backbone.state_dict().keys())
+    if set(backbone_state.keys()) == expected_keys:
+        return backbone_state
+
+    stripped: Dict[str, torch.Tensor] = {}
+    for key, value in backbone_state.items():
+        if key.startswith(MODEL_WRAPPER_PREFIX):
+            alt_key = key[len(MODEL_WRAPPER_PREFIX) :]
+            if alt_key in expected_keys:
+                stripped[alt_key] = value
+                continue
+        stripped[key] = value
+
+    if set(stripped.keys()) == expected_keys:
+        return stripped
+
+    prefixed: Dict[str, torch.Tensor] = {}
+    for key, value in stripped.items():
+        wrapped_key = f"{MODEL_WRAPPER_PREFIX}{key}"
+        if key not in expected_keys and wrapped_key in expected_keys:
+            prefixed[wrapped_key] = value
+        else:
+            prefixed[key] = value
+
+    return prefixed
 
 
 def _build_model_from_checkpoint(
@@ -152,6 +187,7 @@ def _build_model_from_checkpoint(
 
     config = AutoConfig.from_pretrained(DINOV3_CONFIG_ID)
     backbone = AutoModel.from_config(config)
+    backbone_state = _align_backbone_state_dict(backbone_state, backbone)
     backbone.load_state_dict(backbone_state, strict=True)
 
     head = nn.Linear(HEAD_IN_FEATURES, HEAD_OUT_FEATURES)

@@ -11,7 +11,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+import audio_processor
 import inference
+import main
 import model_loader
 from models import kissing, lgbtq, profanity, violence
 
@@ -21,8 +23,9 @@ ANALYZE_RESPONSE_KEYS = {
     "confidence",
     "action",
     "model_loaded",
+    "label",
 }
-HEALTH_RESPONSE_KEYS = {"status", "model", "model_loaded"}
+HEALTH_RESPONSE_KEYS = {"status", "model", "model_loaded", "whisper_loaded"}
 
 
 def test_health_response_shape(client: TestClient) -> None:
@@ -36,6 +39,7 @@ def test_health_response_shape(client: TestClient) -> None:
     assert body["status"] == "ok"
     assert body["model"] == model_loader.MODEL_NAME
     assert isinstance(body["model_loaded"], bool)
+    assert isinstance(body["whisper_loaded"], bool)
 
 
 def test_analyze_image_blank_jpeg_response_shape(
@@ -63,7 +67,7 @@ def test_analyze_image_blank_jpeg_response_shape(
 
 def test_br01_threshold_floor_low_sensitivity() -> None:
     """
-    BR-01: sensitivity=0.1 still uses effective threshold 0.75 (not 0.1).
+    BR-01: sensitivity=0.1 still uses effective threshold floor (not 0.1).
     """
     low_sensitivity = 0.1
     effective = max(inference.CONFIDENCE_FLOOR, low_sensitivity)
@@ -72,8 +76,8 @@ def test_br01_threshold_floor_low_sensitivity() -> None:
     mock_model = MagicMock()
     mock_model.training = False
     mock_model.eval = MagicMock()
-    # confidence 0.72 after sigmoid — above 0.1 but below BR-01 floor 0.75
-    mock_model.return_value = __import__("torch").tensor([[0.0, 0.97]])
+    # confidence ~0.38 after sigmoid — above 0.1 but below BR-01 floor
+    mock_model.return_value = __import__("torch").tensor([[0.0, -0.5]])
 
     tensor = __import__("torch").zeros(1, 3, 224, 224)
 
@@ -84,7 +88,7 @@ def test_br01_threshold_floor_low_sensitivity() -> None:
 
     assert result["detected"] is False
     assert result["action"] == inference.ACTION_ALLOW
-    assert result["confidence"] == pytest.approx(0.7253, rel=1e-2)
+    assert result["confidence"] == pytest.approx(0.3775, rel=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -139,3 +143,120 @@ def test_analyze_image_stubs_via_api(
     assert body["detected"] is False
     assert body["confidence"] == 0.0
     assert body["action"] == "ALLOW"
+
+
+def test_analyze_audio_silent_webm_chunk_detected_false(
+    client: TestClient,
+    silent_webm_bytes: bytes,
+) -> None:
+    """
+    POST /analyze-audio with a silent WebM chunk returns detected=false and valid shape.
+    """
+    with patch.object(audio_processor, "WHISPER_LOADED", True), patch.object(
+        audio_processor, "transcribe_audio", return_value=""
+    ):
+        response = client.post(
+            "/analyze-audio",
+            files={
+                "audio_chunk": ("silent.webm", silent_webm_bytes, "audio/webm"),
+            },
+            data={"language": "en", "sensitivity": "0.75"},
+        )
+
+    assert response.status_code == 200
+    body: Dict[str, Any] = response.json()
+    assert set(body.keys()) == main.ANALYZE_AUDIO_RESPONSE_KEYS
+    assert body["detected"] is False
+    assert body["action"] == "ALLOW"
+    assert body["duration_ms"] == 1500
+    assert body["whisper_loaded"] is True
+    assert isinstance(body["action"], str)
+
+
+@pytest.mark.parametrize(
+    "whisper_loaded,transcript,expected_detected,expected_action",
+    [
+        (True, "", False, "ALLOW"),
+        (True, "what the fuck", True, "MUTE"),
+        (False, "", False, "ALLOW"),
+    ],
+)
+def test_analyze_audio_duration_ms_always_1500_br05(
+    client: TestClient,
+    silent_webm_bytes: bytes,
+    whisper_loaded: bool,
+    transcript: str,
+    expected_detected: bool,
+    expected_action: str,
+) -> None:
+    """
+    BR-05: duration_ms is always exactly 1500 whether or not profanity is detected.
+    """
+    patches = {"WHISPER_LOADED": whisper_loaded}
+    if whisper_loaded:
+        patches["transcribe_audio"] = transcript
+
+    with patch.object(audio_processor, "WHISPER_LOADED", whisper_loaded), patch.object(
+        audio_processor,
+        "transcribe_audio",
+        return_value=transcript,
+    ):
+        response = client.post(
+            "/analyze-audio",
+            files={
+                "audio_chunk": ("chunk.webm", silent_webm_bytes, "audio/webm"),
+            },
+            data={"language": "en", "sensitivity": "0.75"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["duration_ms"] == 1500
+    assert body["detected"] is expected_detected
+    assert body["action"] == expected_action
+
+
+def test_analyze_audio_detected_via_api(
+    client: TestClient,
+) -> None:
+    """
+    POST /analyze-audio returns MUTE when transcription matches the blacklist.
+    """
+    with patch.object(audio_processor, "WHISPER_LOADED", True), patch.object(
+        audio_processor, "transcribe_audio", return_value="what the fuck"
+    ):
+        response = client.post(
+            "/analyze-audio",
+            files={"audio_chunk": ("chunk.webm", b"fake-webm", "audio/webm")},
+            data={"language": "en", "sensitivity": "0.75"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["detected"] is True
+    assert body["action"] == "MUTE"
+    assert body["duration_ms"] == 1500
+    assert body["whisper_loaded"] is True
+
+
+def test_analyze_audio_invalid_language(client: TestClient) -> None:
+    """POST /analyze-audio rejects unsupported language codes."""
+    response = client.post(
+        "/analyze-audio",
+        files={"audio_chunk": ("chunk.webm", b"\x00", "audio/webm")},
+        data={"language": "fr", "sensitivity": "0.75"},
+    )
+    assert response.status_code == 400
+
+
+def test_profanity_analyze_audio_module() -> None:
+    """profanity.analyze_audio wires transcription and blacklist detection."""
+    with patch.object(audio_processor, "WHISPER_LOADED", True), patch.object(
+        audio_processor, "transcribe_audio", return_value="clean speech"
+    ):
+        result = profanity.analyze_audio(b"audio", "en", 0.75)
+
+    assert result["detected"] is False
+    assert result["action"] == "ALLOW"
+    assert result["duration_ms"] == 1500
+    assert result["whisper_loaded"] is True

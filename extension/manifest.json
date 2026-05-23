@@ -29,12 +29,12 @@
     {
       "matches": ["<all_urls>"],
       "js": ["dist/content/index.js"],
-      "type": "module",
       "run_at": "document_idle"
     }
   ],
-  "permissions": ["storage"],
+  "permissions": ["storage", "tabs", "tabCapture", "offscreen"],
   "host_permissions": [
+    "<all_urls>",
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*"
   ]

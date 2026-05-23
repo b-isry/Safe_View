@@ -3,22 +3,34 @@
 // Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
 // Purpose: MV3 service worker — receive frames, call backend, send BLUR/CLEAR to tabs.
 
-import { analyzeImage, loadBackendStatusFromStorage } from "./aiClient";
+import { analyzeAudio, analyzeImage, loadBackendStatusFromStorage } from "./aiClient";
+import {
+  evaluateBlurState,
+  logBlurEvaluation,
+  normalizeBlurLabel,
+  type BlurLabel,
+} from "./blurDecision";
 import {
   CONFIDENCE_FLOOR,
+  MUTE_DURATION_MS,
+  SETTINGS_STORAGE_KEY,
   effectiveThreshold,
+  getCachedSettings,
   getEnabledCategories,
+  initSettingsCache,
   loadSettings,
-  shouldBlur,
+  type SafeViewSettings,
 } from "./businessRules";
-import {
-  OPTIMISTIC_BLUR_SCORE_FLOOR,
-  OPTIMISTIC_CLEAR_STREAK,
-  SERVICE_WORKER_KEEPALIVE_MS,
-} from "./latencyPolicy";
+import { SERVICE_WORKER_KEEPALIVE_MS } from "./latencyPolicy";
 
 /** Content script → service worker: JPEG frame sample. */
 export const MESSAGE_ACTION_FRAME_SAMPLE = "FRAME_SAMPLE";
+
+/** Content script → service worker: WebM audio chunk. */
+export const MESSAGE_ACTION_AUDIO_CHUNK = "AUDIO_CHUNK";
+
+/** Service worker → content script: mute video (BR-05). */
+export const MESSAGE_ACTION_MUTE = "MUTE";
 
 /** Service worker → content script: apply blur. */
 export const MESSAGE_ACTION_BLUR = "BLUR";
@@ -26,21 +38,100 @@ export const MESSAGE_ACTION_BLUR = "BLUR";
 /** Service worker → content script: remove blur. */
 export const MESSAGE_ACTION_CLEAR = "CLEAR";
 
+/** Service worker → offscreen document: begin tab-capture audio pipeline. */
+export const MESSAGE_ACTION_INIT_AUDIO_PIPELINE = "INIT_AUDIO_PIPELINE";
+
+/** Service worker → offscreen document: tear down audio pipeline. */
+export const MESSAGE_ACTION_STOP_AUDIO_PIPELINE = "STOP_AUDIO_PIPELINE";
+
+/** Offscreen document → service worker: profanity detected in captured audio. */
+export const MESSAGE_ACTION_PROFANITY_DETECTED = "PROFANITY_DETECTED";
+
+/** Offscreen scout path → service worker: WebM chunk for Whisper backend. */
+export const MESSAGE_ACTION_AUDIO_CHUNK_PIPELINE = "AUDIO_CHUNK_PIPELINE";
+
+/** Service worker → offscreen document: apply gain mute for BR-05 duration. */
+export const MESSAGE_ACTION_MUTE_GAIN = "MUTE_GAIN";
+
+/** Popup → service worker: begin pipeline with streamId from user-gesture tabCapture. */
+export const MESSAGE_ACTION_START_PIPELINE_WITH_STREAM =
+  "START_PIPELINE_WITH_STREAM";
+
+/** Service worker → content script: mute page <video> speakers (H5 dual-audio). */
+export const MESSAGE_ACTION_SET_TAB_SPEAKER_SUPPRESSED =
+  "SET_TAB_SPEAKER_SUPPRESSED";
+
+/** Offscreen → service worker: tab capture failed. */
+export const MESSAGE_ACTION_TAB_CAPTURE_INIT_FAILED = "TAB_CAPTURE_INIT_FAILED";
+
+/** Offscreen → service worker: tab capture stream is silent. */
+export const MESSAGE_ACTION_TAB_CAPTURE_SILENT_STREAM =
+  "TAB_CAPTURE_SILENT_STREAM";
+
+/** Service worker → content script: native video element audio fallback. */
+export const MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK =
+  "START_ELEMENT_AUDIO_FALLBACK";
+
+/** Service worker → content script: stop element audio fallback. */
+export const MESSAGE_ACTION_STOP_ELEMENT_AUDIO_FALLBACK =
+  "STOP_ELEMENT_AUDIO_FALLBACK";
+
+/** Service worker → content script: mute element-path gain. */
+export const MESSAGE_ACTION_ELEMENT_MUTE_GAIN = "ELEMENT_MUTE_GAIN";
+
+/** Service worker / content: force pipeline gain nodes back to 1.0. */
+export const MESSAGE_ACTION_RESET_PIPELINE_GAIN = "RESET_PIPELINE_GAIN";
+
+/** Content script → service worker: YouTube SPA navigation / watch id change. */
+export const MESSAGE_ACTION_PIPELINE_NAVIGATION = "PIPELINE_NAVIGATION";
+
+/** Offscreen document HTML path (built to dist/offscreen/). */
+const OFFSCREEN_AUDIO_PROCESSOR_URL = "dist/offscreen/audioProcessor.html";
+
 /**
  * Frame sample message from the content script.
  */
 export interface FrameSampleMessage {
   action: typeof MESSAGE_ACTION_FRAME_SAMPLE;
   videoId: number;
-  /** JPEG as base64 — reliable through chrome.runtime.sendMessage structured clone. */
-  frameBase64: string;
+  /** JPEG bytes as number[] — reliable through chrome.runtime structured clone. */
+  framePayload?: number[];
+  /** @deprecated Legacy; may arrive as plain Object after clone — use framePayload. */
+  frameBuffer?: ArrayBuffer | Uint8Array | Record<string, number>;
+  /** @deprecated Legacy base64 transport — still accepted for tests. */
+  frameBase64?: string;
   frameMimeType?: string;
   /** Content script build id (manifest version) for stale-tab detection. */
   contentBuild?: string;
-  /** performance.now() when the frame JPEG was ready in the content script. */
+  /** Date.now() when the frame JPEG was ready in the content script. */
   capturedAt?: number;
-  /** performance.now() immediately before chrome.runtime.sendMessage. */
+  /** Date.now() immediately before chrome.runtime.sendMessage. */
   sentAt?: number;
+  /** Monotonic per-video frame id for latest-frame-wins. */
+  frameSeq?: number;
+  /** drawImage + blank-check duration (ms). */
+  captureMs?: number;
+  /** canvas.toBlob duration (ms). */
+  encodeMs?: number;
+}
+
+/**
+ * Audio chunk message from the content script.
+ */
+export interface AudioChunkMessage {
+  action: typeof MESSAGE_ACTION_AUDIO_CHUNK;
+  videoId: number;
+  audioBase64: string;
+  language: string;
+}
+
+/**
+ * Mute command sent to a tab content script.
+ */
+export interface MuteCommandMessage {
+  action: typeof MESSAGE_ACTION_MUTE;
+  videoId: number;
+  duration_ms: number;
 }
 
 /**
@@ -53,13 +144,24 @@ export interface BlurCommandMessage {
   sentAt?: number;
   swReceivedAt?: number;
   backendDoneAt?: number;
+  /** Monotonic command id — content script ignores stale BLUR/CLEAR. */
+  commandSeq?: number;
+  /** True when blur is applied before backend confirms (latency policy). */
+  preemptive?: boolean;
 }
 
 /**
- * Per-tab/video optimistic blur state (client latency policy only).
+ * Per-tab/video frame analysis pipeline (latest-frame-wins).
  */
-interface OptimisticBlurState {
-  consecutiveLowScoreCount: number;
+interface FramePipelineState {
+  generation: number;
+  abortController: AbortController | null;
+  analysisInFlight: boolean;
+  lastUnsafe: boolean;
+  lastBlurCommandSeq: number;
+  lastProcessedFrameSeq: number;
+  /** Latest frame while analysis is in flight (coalesced, not aborted). */
+  pendingSample: FrameSampleMessage | null;
 }
 
 const DEFAULT_FRAME_MIME_TYPE = "image/jpeg";
@@ -69,7 +171,21 @@ const THRESHOLD_HINT_INTERVAL_MS = 5000;
 
 let lastThresholdHintAt = 0;
 
-const optimisticBlurState = new Map<string, OptimisticBlurState>();
+const framePipelineState = new Map<string, FramePipelineState>();
+
+/** Tab id currently wired to the offscreen tab-capture pipeline, if any. */
+let activeAudioPipelineTabId: number | undefined;
+
+/** Active audio path: offscreen tabCapture or content-script video element. */
+type AudioPipelineMode = "offscreen" | "element" | null;
+
+let audioPipelineMode: AudioPipelineMode = null;
+
+/** Max in-flight /analyze-audio calls per tab (offscreen scout path). */
+const MAX_CONCURRENT_AUDIO = 2;
+
+/** Per-tab pipeline audio analysis in progress. */
+const audioProcessingCount = new Map<number, number>();
 
 /**
  * Stable key for per-video optimistic blur tracking.
@@ -103,71 +219,157 @@ function base64ToBlob(base64: string, mimeType: string): Blob | null {
 }
 
 /**
+ * Rebuild bytes when structured clone turns Uint8Array into a plain Object (numeric keys).
+ *
+ * @param raw - frameBuffer field after chrome.runtime.sendMessage.
+ * @returns Uint8Array or null.
+ */
+function uint8ArrayFromClonePayload(raw: unknown): Uint8Array | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const tag = Object.prototype.toString.call(raw);
+  if (tag === "[object Uint8Array]") {
+    const bytes = raw as Uint8Array;
+    return bytes.byteLength > 0 ? bytes : null;
+  }
+
+  if (tag === "[object ArrayBuffer]") {
+    const buffer = raw as ArrayBuffer;
+    return buffer.byteLength > 0 ? new Uint8Array(buffer) : null;
+  }
+
+  if (Array.isArray(raw)) {
+    const numbers = raw as number[];
+    return numbers.length > 0 ? new Uint8Array(numbers) : null;
+  }
+
+  if (tag === "[object Object]") {
+    const record = raw as Record<string, unknown>;
+    const numericKeys = Object.keys(record).filter((key) => /^\d+$/.test(key));
+    if (numericKeys.length === 0) {
+      return null;
+    }
+
+    const maxIndex = numericKeys.reduce(
+      (max, key) => Math.max(max, Number(key)),
+      0
+    );
+    const out = new Uint8Array(maxIndex + 1);
+    for (const key of numericKeys) {
+      const value = record[key];
+      if (typeof value === "number") {
+        out[Number(key)] = value & 0xff;
+      }
+    }
+    return out.byteLength > 0 ? out : null;
+  }
+
+  return null;
+}
+
+/**
+ * True when the message carries decodable JPEG bytes.
+ *
+ * @param message - FRAME_SAMPLE from content script.
+ * @returns True when framePayload or frameBuffer can be decoded.
+ */
+function hasDecodableFrameBytes(message: FrameSampleMessage): boolean {
+  if (Array.isArray(message.framePayload) && message.framePayload.length > 0) {
+    return true;
+  }
+
+  if (typeof message.frameBase64 === "string" && message.frameBase64.length > 0) {
+    return true;
+  }
+
+  return uint8ArrayFromClonePayload(message.frameBuffer as unknown) !== null;
+}
+
+/**
+ * Extract JPEG bytes from a FRAME_SAMPLE message (cross-realm + clone safe).
+ *
+ * @param message - FRAME_SAMPLE from content script.
+ * @returns Uint8Array or null.
+ */
+function getFrameBytesFromMessage(message: FrameSampleMessage): Uint8Array | null {
+  if (Array.isArray(message.framePayload) && message.framePayload.length > 0) {
+    return new Uint8Array(message.framePayload);
+  }
+
+  return uint8ArrayFromClonePayload(message.frameBuffer as unknown);
+}
+
+/**
  * Rebuild a JPEG Blob from the content script's base64 payload.
  *
  * @param message - FRAME_SAMPLE message from the content script.
  * @returns Blob for analyze-image, or null when bytes are missing.
  */
 function frameFromMessage(message: FrameSampleMessage): Blob | null {
-  if (typeof message.frameBase64 !== "string" || message.frameBase64.length === 0) {
-    return null;
-  }
-
   const mimeType = message.frameMimeType || DEFAULT_FRAME_MIME_TYPE;
-  return base64ToBlob(message.frameBase64, mimeType);
-}
 
-/**
- * True when the service worker should command BLUR (BR-01 hit or optimistic ≥0.65).
- *
- * @param outcome - Backend analysis for this frame.
- * @returns True to send BLUR to the content script.
- */
-function shouldCommandBlur(outcome: FrameAnalysisOutcome): boolean {
-  if (outcome.blurRequired) {
-    return true;
+  const bytes = getFrameBytesFromMessage(message);
+  if (bytes) {
+    return new Blob([bytes], { type: mimeType });
   }
 
-  return (
-    outcome.nudityConfidence !== null &&
-    outcome.nudityConfidence >= OPTIMISTIC_BLUR_SCORE_FLOOR
-  );
+  if (typeof message.frameBase64 === "string" && message.frameBase64.length > 0) {
+    return base64ToBlob(message.frameBase64, mimeType);
+  }
+
+  return null;
 }
 
 /**
- * True when enough consecutive low-score frames justify CLEAR.
+ * Return or create latest-frame-wins pipeline state for a tab/video pair.
  *
  * @param tabId - Chrome tab id.
  * @param videoId - Content-script video id.
- * @param outcome - Backend analysis for this frame.
- * @returns True to send CLEAR to the content script.
+ * @returns Mutable pipeline state.
  */
-function shouldCommandClear(
-  tabId: number,
-  videoId: number,
-  outcome: FrameAnalysisOutcome
-): boolean {
+function getFramePipelineState(tabId: number, videoId: number): FramePipelineState {
   const key = optimisticStateKey(tabId, videoId);
-  let state = optimisticBlurState.get(key);
+  let state = framePipelineState.get(key);
 
   if (!state) {
-    state = { consecutiveLowScoreCount: 0 };
-    optimisticBlurState.set(key, state);
+    state = {
+      generation: 0,
+      abortController: null,
+      analysisInFlight: false,
+      lastUnsafe: false,
+      lastBlurCommandSeq: 0,
+      lastProcessedFrameSeq: 0,
+      pendingSample: null,
+    };
+    framePipelineState.set(key, state);
   }
 
-  if (shouldCommandBlur(outcome)) {
-    state.consecutiveLowScoreCount = 0;
-    return false;
-  }
+  return state;
+}
 
-  const confidence = outcome.nudityConfidence ?? 0;
-  if (confidence < OPTIMISTIC_BLUR_SCORE_FLOOR) {
-    state.consecutiveLowScoreCount += 1;
-  } else {
-    state.consecutiveLowScoreCount = 0;
-  }
+/**
+ * Allocate the next blur command sequence for a tab/video.
+ *
+ * @param tabId - Chrome tab id.
+ * @param videoId - Content-script video id.
+ * @returns New command sequence number.
+ */
+function nextBlurCommandSeq(tabId: number, videoId: number): number {
+  const pipeline = getFramePipelineState(tabId, videoId);
+  pipeline.lastBlurCommandSeq += 1;
+  return pipeline.lastBlurCommandSeq;
+}
 
-  return state.consecutiveLowScoreCount >= OPTIMISTIC_CLEAR_STREAK;
+/**
+ * True when a DOMException represents an aborted fetch / analysis.
+ *
+ * @param error - Caught rejection value.
+ * @returns True for AbortError.
+ */
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 /**
@@ -176,8 +378,8 @@ function shouldCommandClear(
  * @param tabId - Chrome tab id.
  * @param videoId - Content-script video id.
  * @param message - Frame sample with content-script timestamps.
- * @param swReceivedAt - performance.now() when the SW handler started.
- * @param backendDoneAt - performance.now() after /analyze-image returned.
+ * @param swReceivedAt - Date.now() when the SW handler started.
+ * @param backendDoneAt - Date.now() after /analyze-image returned.
  * @param command - BLUR or CLEAR.
  */
 function logPipelineLatency(
@@ -186,7 +388,8 @@ function logPipelineLatency(
   message: FrameSampleMessage,
   swReceivedAt: number,
   backendDoneAt: number,
-  command: typeof MESSAGE_ACTION_BLUR | typeof MESSAGE_ACTION_CLEAR
+  command: typeof MESSAGE_ACTION_BLUR | typeof MESSAGE_ACTION_CLEAR,
+  inferenceMs?: number
 ): void {
   const capturedAt = message.capturedAt;
   const sentAt = message.sentAt;
@@ -195,20 +398,54 @@ function logPipelineLatency(
     return;
   }
 
-  const swMs =
+  const transportMs =
     sentAt !== undefined ? Math.round(swReceivedAt - sentAt) : undefined;
   const backendMs = Math.round(backendDoneAt - swReceivedAt);
-  const totalToBackendMs = Math.round(backendDoneAt - capturedAt);
+  const totalMs = Math.round(backendDoneAt - capturedAt);
 
   console.info(
-    "[SafeView][Latency] tab=%s video=%s command=%s | encode+send→SW=%sms backend=%sms capture→backend=%sms (blur apply logged in content script)",
+    "[SafeView][Latency] tab=%s video=%s frameSeq=%s command=%s | capture=%sms encode=%sms transport→SW=%sms backend=%sms inference=%sms total→decision=%sms",
     tabId,
     videoId,
+    message.frameSeq ?? "?",
     command,
-    swMs ?? "?",
+    message.captureMs ?? "?",
+    message.encodeMs ?? "?",
+    transportMs ?? "?",
     backendMs,
-    totalToBackendMs
+    inferenceMs ?? "?",
+    totalMs
   );
+}
+
+/**
+ * Send MUTE to the content script for a specific tab/video (BR-05).
+ *
+ * @param tabId - Chrome tab id that sent the audio chunk.
+ * @param videoId - Target video element id.
+ * @param durationMs - Mute hold duration from backend (expected 1500).
+ */
+export async function sendMuteCommand(
+  tabId: number,
+  videoId: number,
+  durationMs: number = MUTE_DURATION_MS
+): Promise<void> {
+  const message: MuteCommandMessage = {
+    action: MESSAGE_ACTION_MUTE,
+    videoId,
+    duration_ms: durationMs,
+  };
+
+  try {
+    await chrome.tabs.sendMessage(tabId, message);
+  } catch (error) {
+    console.warn(
+      "[SafeView] Could not deliver MUTE to tab %s (video %s):",
+      tabId,
+      videoId,
+      error
+    );
+  }
 }
 
 /**
@@ -223,9 +460,13 @@ export async function sendBlurCommand(
   tabId: number,
   action: typeof MESSAGE_ACTION_BLUR | typeof MESSAGE_ACTION_CLEAR,
   videoId: number,
-  trace?: Pick<BlurCommandMessage, "capturedAt" | "sentAt" | "swReceivedAt" | "backendDoneAt">
+  trace?: Pick<
+    BlurCommandMessage,
+    "capturedAt" | "sentAt" | "swReceivedAt" | "backendDoneAt" | "preemptive"
+  >
 ): Promise<void> {
-  const message: BlurCommandMessage = { action, videoId, ...trace };
+  const commandSeq = nextBlurCommandSeq(tabId, videoId);
+  const message: BlurCommandMessage = { action, videoId, commandSeq, ...trace };
 
   try {
     await chrome.tabs.sendMessage(tabId, message);
@@ -244,9 +485,9 @@ export async function sendBlurCommand(
  * Outcome of one frame analysis pass (for BLUR/CLEAR and debug logs).
  */
 export interface FrameAnalysisOutcome {
-  blurRequired: boolean;
+  label: BlurLabel;
+  score: number;
   categories: string[];
-  nudityConfidence: number | null;
   nudityDetected: boolean | null;
   nudityAction: string | null;
 }
@@ -260,86 +501,131 @@ export interface FrameAnalysisOutcome {
  */
 export async function analyzeFrameAgainstEnabledCategories(
   frame: Blob,
-  settings: Awaited<ReturnType<typeof loadSettings>>
-): Promise<FrameAnalysisOutcome> {
+  settings: SafeViewSettings,
+  signal?: AbortSignal
+): Promise<FrameAnalysisOutcome | null> {
   const categories = getEnabledCategories(settings);
 
   if (categories.length === 0) {
     return {
-      blurRequired: false,
+      label: "SFW",
+      score: 0,
       categories,
-      nudityConfidence: null,
       nudityDetected: null,
       nudityAction: null,
     };
   }
 
-  let nudityConfidence: number | null = null;
+  let nudityScore = 0;
+  let nudityLabel: BlurLabel = "SFW";
   let nudityDetected: boolean | null = null;
   let nudityAction: string | null = null;
 
   for (const category of categories) {
-    const result = await analyzeImage(frame, settings.sensitivity, category);
+    const result = await analyzeImage(
+      frame,
+      settings.sensitivity,
+      category,
+      signal
+    );
+
+    if (result === null) {
+      return null;
+    }
 
     if (!result.backendOnline || result.fromFallback) {
       return {
-        blurRequired: false,
+        label: "SFW",
+        score: 0,
         categories,
-        nudityConfidence,
         nudityDetected,
         nudityAction,
       };
     }
 
     if (category === "nudity") {
-      nudityConfidence = result.response.confidence;
+      nudityScore = result.response.confidence;
+      nudityLabel = normalizeBlurLabel(result.response.label, nudityScore);
       nudityDetected = result.response.detected;
       nudityAction = result.response.action;
-    }
-
-    if (
-      result.response.action === "BLUR" ||
-      result.response.detected ||
-      shouldBlur(result.response.confidence, settings.sensitivity)
-    ) {
-      return {
-        blurRequired: true,
-        categories,
-        nudityConfidence,
-        nudityDetected,
-        nudityAction,
-      };
     }
   }
 
   return {
-    blurRequired: false,
+    label: nudityLabel,
+    score: nudityScore,
     categories,
-    nudityConfidence,
     nudityDetected,
     nudityAction,
   };
 }
 
 /**
- * Handle one FRAME_SAMPLE message: backend inference then BLUR/CLEAR.
+ * Invalidate in-flight analysis and reset blur decision state for one tab/video.
  *
- * @param message - Frame sample from the content script.
- * @param sender - Message sender metadata (tab id required).
+ * @param tabId - Chrome tab id.
+ * @param videoId - Content-script video id.
  */
-export async function handleFrameSample(
-  message: FrameSampleMessage,
-  sender: chrome.runtime.MessageSender
-): Promise<void> {
-  const tabId = sender.tab?.id;
-
-  if (tabId === undefined) {
-    console.warn("[SafeView] FRAME_SAMPLE ignored — missing tab id.");
+function resetFramePipelineForVideo(tabId: number, videoId: number): void {
+  const key = optimisticStateKey(tabId, videoId);
+  const pipeline = framePipelineState.get(key);
+  if (!pipeline) {
     return;
   }
 
-  const swReceivedAt = performance.now();
-  const settings = await loadSettings();
+  pipeline.abortController?.abort();
+  pipeline.generation += 1;
+  pipeline.lastUnsafe = false;
+  pipeline.lastProcessedFrameSeq = 0;
+  pipeline.pendingSample = null;
+  pipeline.analysisInFlight = false;
+  pipeline.abortController = null;
+}
+
+/**
+ * Reset all frame pipelines for a tab (YouTube navigation / new video).
+ *
+ * @param tabId - Chrome tab id.
+ * @returns Video ids that had pipeline state (for CLEAR commands).
+ */
+function resetFramePipelineForTab(tabId: number): number[] {
+  const videoIds: number[] = [];
+
+  for (const key of [...framePipelineState.keys()]) {
+    if (!key.startsWith(`${tabId}:`)) {
+      continue;
+    }
+
+    const videoId = Number(key.split(":")[1]);
+    if (!Number.isFinite(videoId)) {
+      continue;
+    }
+
+    resetFramePipelineForVideo(tabId, videoId);
+    videoIds.push(videoId);
+  }
+
+  return videoIds;
+}
+
+/**
+ * Process one coalesced frame sample (no per-frame abort — latest pending wins).
+ *
+ * @param message - Frame sample from the content script.
+ * @param tabId - Sender tab id.
+ * @param pipeline - Mutable pipeline state for this tab/video.
+ */
+async function processFrameSample(
+  message: FrameSampleMessage,
+  tabId: number,
+  pipeline: FramePipelineState
+): Promise<void> {
+  const generationAtStart = pipeline.generation;
+  const abortController = new AbortController();
+  pipeline.abortController = abortController;
+
+  const swReceivedAt = Date.now();
+  const settings = getCachedSettings();
   const frame = frameFromMessage(message);
 
   if (!frame) {
@@ -348,20 +634,62 @@ export async function handleFrameSample(
   }
 
   if (!settings.protectionEnabled) {
-    optimisticBlurState.delete(optimisticStateKey(tabId, message.videoId));
+    framePipelineState.delete(optimisticStateKey(tabId, message.videoId));
     await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId);
     return;
   }
 
   try {
-    const outcome = await analyzeFrameAgainstEnabledCategories(frame, settings);
-    const backendDoneAt = performance.now();
+    const inferenceStarted = Date.now();
+    const outcome = await analyzeFrameAgainstEnabledCategories(
+      frame,
+      settings,
+      abortController.signal
+    );
+
+    if (outcome === null) {
+      return;
+    }
+
+    if (generationAtStart !== pipeline.generation) {
+      return;
+    }
+
+    const backendDoneAt = Date.now();
+    const inferenceMs = backendDoneAt - inferenceStarted;
+
+    const threshold = effectiveThreshold(settings.sensitivity);
+    const frameSeq = message.frameSeq ?? 0;
+
+    const evaluation = evaluateBlurState({
+      label: outcome.label,
+      score: outcome.score,
+      threshold,
+      frameSeq,
+      lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
+      resultGeneration: generationAtStart,
+      currentGeneration: pipeline.generation,
+      analysisInFlight: false,
+      lastUnsafe: pipeline.lastUnsafe,
+    });
+
+    logBlurEvaluation(evaluation, {
+      label: outcome.label,
+      score: outcome.score,
+      frame: frameSeq,
+      gen: generationAtStart,
+      currentGen: pipeline.generation,
+    });
+
+    if (evaluation.action === "DROP" || evaluation.action === "HOLD") {
+      return;
+    }
 
     const extensionVersion = chrome.runtime.getManifest().version;
     const contentBuild = message.contentBuild ?? "unknown";
     const contentStale = contentBuild !== extensionVersion;
 
-    if (contentStale && outcome.blurRequired) {
+    if (contentStale && evaluation.action === "BLUR") {
       console.warn(
         "[SafeView] Tab content script is stale (content %s, extension %s). Reload the YouTube tab after updating the extension.",
         contentBuild,
@@ -369,23 +697,24 @@ export async function handleFrameSample(
       );
     }
 
-    const threshold = effectiveThreshold(settings.sensitivity);
     if (
-      !outcome.blurRequired &&
-      outcome.nudityConfidence !== null &&
-      outcome.nudityConfidence >= CONFIDENCE_FLOOR &&
-      outcome.nudityConfidence < threshold
+      evaluation.action === "CLEAR" &&
+      outcome.label === "NSFW" &&
+      outcome.score >= CONFIDENCE_FLOOR &&
+      outcome.score < threshold
     ) {
       const now = Date.now();
       if (now - lastThresholdHintAt >= THRESHOLD_HINT_INTERVAL_MS) {
         lastThresholdHintAt = now;
         console.info(
           "[SafeView] Nudity score %.2f is below your sensitivity threshold %.2f — set sensitivity to Medium in extension options to blur at ≥75%%.",
-          outcome.nudityConfidence,
+          outcome.score,
           threshold
         );
       }
     }
+
+    pipeline.lastProcessedFrameSeq = frameSeq;
 
     const trace = {
       capturedAt: message.capturedAt,
@@ -394,61 +723,720 @@ export async function handleFrameSample(
       backendDoneAt,
     };
 
-    if (shouldCommandBlur(outcome)) {
+    if (evaluation.action === "BLUR") {
+      pipeline.lastUnsafe = true;
       logPipelineLatency(
         tabId,
         message.videoId,
         message,
         swReceivedAt,
         backendDoneAt,
-        MESSAGE_ACTION_BLUR
+        MESSAGE_ACTION_BLUR,
+        inferenceMs
       );
       await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, trace);
-    } else if (shouldCommandClear(tabId, message.videoId, outcome)) {
+    } else {
+      pipeline.lastUnsafe = false;
       logPipelineLatency(
         tabId,
         message.videoId,
         message,
         swReceivedAt,
         backendDoneAt,
-        MESSAGE_ACTION_CLEAR
+        MESSAGE_ACTION_CLEAR,
+        inferenceMs
       );
       await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId, trace);
     }
   } catch (error) {
+    if (isAbortError(error)) {
+      return;
+    }
+
     console.error("[SafeView] Frame handling failed — failing open:", error);
+
+    if (generationAtStart !== pipeline.generation) {
+      return;
+    }
+
+    pipeline.lastUnsafe = false;
     await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId);
+  } finally {
+    if (pipeline.abortController === abortController) {
+      pipeline.abortController = null;
+    }
   }
 }
 
 /**
- * Route runtime messages from content scripts.
+ * Handle one FRAME_SAMPLE message: backend inference then BLUR/CLEAR (push via tabs.sendMessage).
+ *
+ * @param message - Frame sample from the content script.
+ * @param tabId - Sender tab id captured before the runtime message channel closes.
+ */
+export async function handleFrameSample(
+  message: FrameSampleMessage,
+  tabId: number
+): Promise<void> {
+  const pipeline = getFramePipelineState(tabId, message.videoId);
+  pipeline.pendingSample = message;
+
+  if (pipeline.analysisInFlight) {
+    return;
+  }
+
+  pipeline.analysisInFlight = true;
+
+  try {
+    while (pipeline.pendingSample) {
+      const latest = pipeline.pendingSample;
+      pipeline.pendingSample = null;
+      await processFrameSample(latest, tabId, pipeline);
+    }
+  } finally {
+    pipeline.analysisInFlight = false;
+
+    if (pipeline.pendingSample) {
+      void handleFrameSample(pipeline.pendingSample, tabId);
+    }
+  }
+}
+
+/**
+ * Reset blur pipeline and send CLEAR after YouTube navigation / new video.
+ *
+ * @param tabId - Chrome tab id.
+ * @param reason - Diagnostic label.
+ */
+export async function resetBlurPipelineOnNavigation(
+  tabId: number,
+  reason: string
+): Promise<void> {
+  const videoIds = resetFramePipelineForTab(tabId);
+
+  await Promise.all(
+    videoIds.map((videoId) =>
+      sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, videoId)
+    )
+  );
+
+  console.info(
+    "[SafeView] NEW VIDEO detected — pipeline reset (%s) tab=%s videos=%s",
+    reason,
+    tabId,
+    videoIds.length
+  );
+}
+
+/**
+ * Rebuild a WebM Blob from the content script's base64 audio payload.
+ *
+ * @param message - AUDIO_CHUNK message from the content script.
+ * @returns Blob for /analyze-audio, or null when bytes are missing.
+ */
+function audioFromMessage(message: AudioChunkMessage): Blob | null {
+  if (
+    typeof message.audioBase64 !== "string" ||
+    message.audioBase64.length === 0
+  ) {
+    return null;
+  }
+
+  return base64ToBlob(message.audioBase64, "audio/webm");
+}
+
+/**
+ * Offscreen delay-pipeline chunk for Whisper + profanity (tab capture scout path).
+ */
+export interface PipelineAudioChunkMessage {
+  action: typeof MESSAGE_ACTION_AUDIO_CHUNK_PIPELINE;
+  audioBase64?: string;
+  payload?: string;
+  capturedAt: number;
+  tabId: number;
+}
+
+/**
+ * Resolve base64 audio from offscreen pipeline messages (audioBase64 or payload).
+ */
+function resolvePipelineAudioBase64(
+  message: PipelineAudioChunkMessage
+): string | null {
+  if (
+    typeof message.audioBase64 === "string" &&
+    message.audioBase64.length > 0
+  ) {
+    return message.audioBase64;
+  }
+
+  if (typeof message.payload === "string" && message.payload.length > 0) {
+    return message.payload;
+  }
+
+  return null;
+}
+
+/**
+ * Handle AUDIO_CHUNK_PIPELINE from the offscreen document (separate from content AUDIO_CHUNK).
+ *
+ * @param message - Scout chunk with base64 WebM audio.
+ * @param tabId - Tab that owns the capture pipeline.
+ */
+export async function handlePipelineAudioChunk(
+  message: PipelineAudioChunkMessage,
+  tabId: number
+): Promise<void> {
+  const current = audioProcessingCount.get(tabId) ?? 0;
+  if (current >= MAX_CONCURRENT_AUDIO) {
+    return;
+  }
+
+  audioProcessingCount.set(tabId, current + 1);
+
+  console.info("[SafeView] AUDIO_CHUNK_PIPELINE processing — tab=%s", tabId);
+
+  try {
+    const audioBase64 = resolvePipelineAudioBase64(message);
+    if (!audioBase64) {
+      console.warn("[SafeView] AUDIO_CHUNK_PIPELINE missing audio payload.");
+      return;
+    }
+
+    const audio = base64ToBlob(audioBase64, "audio/webm");
+    if (!audio) {
+      return;
+    }
+
+    const result = await analyzeAudio(
+      audio,
+      "en" // pipeline always english — subtitle path handles language switching
+    );
+
+    console.info(
+      "[SafeView][Audio-5] Backend response: detected=%s, confidence=%s, action=%s, whisper_loaded=%s",
+      result.response.detected,
+      result.response.confidence,
+      result.response.action,
+      result.response.whisper_loaded
+    );
+
+    if (
+      result.backendOnline &&
+      !result.fromFallback &&
+      result.response.detected
+    ) {
+      console.info(
+        "[SafeView][Audio-6] Profanity confirmed — sending ELEMENT_MUTE_GAIN"
+      );
+      console.info(
+        "[SafeView] Profanity detected in pipeline — triggering gain mute"
+      );
+      await sendPipelineMuteGain(MUTE_DURATION_MS);
+    }
+  } catch (error) {
+    console.error("[SafeView] Pipeline audio chunk handling failed:", error);
+  } finally {
+    const inFlight = audioProcessingCount.get(tabId) ?? 1;
+    audioProcessingCount.set(tabId, Math.max(0, inFlight - 1));
+  }
+}
+
+/**
+ * Handle one AUDIO_CHUNK message: transcribe + profanity, then push MUTE when detected.
+ *
+ * @param message - Audio chunk from the content script.
+ * @param tabId - Sender tab id captured before the runtime message channel closes.
+ */
+export async function handleAudioChunk(
+  message: AudioChunkMessage,
+  tabId: number
+): Promise<void> {
+  const settings = await loadSettings();
+
+  if (!settings.protectionEnabled || !settings.categories.profanity) {
+    return;
+  }
+
+  const audio = audioFromMessage(message);
+
+  if (!audio) {
+    console.warn("[SafeView] AUDIO_CHUNK ignored — invalid audio buffer.");
+    return;
+  }
+
+  const language = message.language === "am" ? "am" : "en";
+
+  try {
+    const result = await analyzeAudio(audio, language, settings.sensitivity);
+
+    if (
+      !result.backendOnline ||
+      result.fromFallback ||
+      !result.response.detected
+    ) {
+      return;
+    }
+
+    const durationMs =
+      result.response.duration_ms > 0
+        ? result.response.duration_ms
+        : MUTE_DURATION_MS;
+
+    console.info("[SafeView] Profanity detected — sending MUTE to tab.");
+    await sendMuteCommand(tabId, message.videoId, durationMs);
+  } catch (error) {
+    console.error("[SafeView] Audio chunk handling failed — failing open:", error);
+  }
+}
+
+/**
+ * Stop only the offscreen graph (keep document open for quick restart).
+ */
+async function stopOffscreenPipelineOnly(): Promise<void> {
+  try {
+    await chrome.runtime.sendMessage({
+      action: MESSAGE_ACTION_STOP_AUDIO_PIPELINE,
+    });
+  } catch {
+    /* Offscreen may already be stopped. */
+  }
+}
+
+/**
+ * Fall back to content-script MediaElementAudioSource when tabCapture is unusable.
+ *
+ * @param tabId - Tab to run the element graph in.
+ * @param reason - Diagnostic label for logs.
+ * @returns True when the fallback message was dispatched.
+ */
+async function sendWithRetry(
+  tabId: number,
+  message: object,
+  maxAttempts = 5,
+  delayMs = 500
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await chrome.tabs.sendMessage(tabId, message);
+      return;
+    } catch (e) {
+      if (attempt === maxAttempts) {
+        throw e;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+async function triggerElementAudioFallback(
+  tabId: number,
+  reason: string
+): Promise<boolean> {
+  try {
+    await sendWithRetry(tabId, {
+      action: MESSAGE_ACTION_RESET_PIPELINE_GAIN,
+    });
+    await sendWithRetry(tabId, {
+      action: MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK,
+      tabId,
+    });
+    audioPipelineMode = "element";
+    activeAudioPipelineTabId = tabId;
+    console.info("[SafeView] Element audio pipeline rebound (%s).", reason);
+    return true;
+  } catch (error) {
+    console.warn("[SafeView] Element audio fallback failed:", error);
+    return false;
+  }
+}
+
+/**
+ * Reset offscreen + content gain to 1.0 after navigation or watch-id change.
+ *
+ * @param reason - Diagnostic label for logs.
+ */
+async function resetPipelineGainsForActiveTab(reason: string): Promise<void> {
+  const tabId = activeAudioPipelineTabId;
+
+  try {
+    await chrome.runtime.sendMessage({
+      action: MESSAGE_ACTION_RESET_PIPELINE_GAIN,
+    });
+  } catch {
+    /* Offscreen may be stopped. */
+  }
+
+  if (tabId !== undefined) {
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        action: MESSAGE_ACTION_RESET_PIPELINE_GAIN,
+      });
+    } catch {
+      /* Content script may not be ready. */
+    }
+
+    if (audioPipelineMode === "element") {
+      try {
+        await chrome.tabs.sendMessage(tabId, {
+          action: MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK,
+          tabId,
+        });
+      } catch {
+        /* Rebind failed; element graph may recover on next navigation. */
+      }
+    }
+  }
+
+  console.info("[SafeView] Pipeline gain reset (%s).", reason);
+}
+
+/**
+ * Route profanity mute to the active audio path (offscreen or element).
+ *
+ * @param durationMs - BR-05 mute duration.
+ */
+async function sendPipelineMuteGain(durationMs: number): Promise<void> {
+  if (activeAudioPipelineTabId !== undefined) {
+    try {
+      await chrome.tabs.sendMessage(activeAudioPipelineTabId, {
+        action: MESSAGE_ACTION_ELEMENT_MUTE_GAIN,
+        duration: durationMs,
+        duration_ms: durationMs,
+      });
+    } catch (error) {
+      console.warn("[SafeView] Could not deliver ELEMENT_MUTE_GAIN:", error);
+    }
+    return;
+  }
+
+  await sendMuteGainToOffscreen(durationMs);
+}
+
+/**
+ * Start element audio pipeline in the content script (primary path for demo).
+ *
+ * @param tabId - Chrome tab running the YouTube page.
+ */
+export async function startAudioPipelineWithStream(
+  tabId: number,
+  _streamId?: string
+): Promise<void> {
+  await startAudioPipeline(tabId);
+}
+
+/**
+ * Start element audio pipeline in the content script (primary path for demo).
+ *
+ * @param tabId - Chrome tab to route audio from.
+ */
+export async function startAudioPipeline(tabId: number): Promise<void> {
+  try {
+    await sendWithRetry(tabId, {
+      action: MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK,
+      tabId,
+    });
+    audioPipelineMode = "element";
+    activeAudioPipelineTabId = tabId;
+    console.info("[SafeView] Element audio pipeline started for tab %s.", tabId);
+  } catch (error) {
+    console.error("[SafeView] Failed to start audio pipeline:", error);
+  }
+}
+
+/**
+ * Stop tab-capture audio pipeline and close the offscreen document when open.
+ *
+ * @param reason - Diagnostic label for why the pipeline is stopping.
+ */
+export async function stopAudioPipeline(reason = "unknown"): Promise<void> {
+  console.info("[SafeView] stopAudioPipeline called — reason: %s", reason);
+
+  const pipelineTabId = activeAudioPipelineTabId;
+
+  if (pipelineTabId !== undefined) {
+    try {
+      await chrome.tabs.sendMessage(pipelineTabId, {
+        action: MESSAGE_ACTION_STOP_ELEMENT_AUDIO_FALLBACK,
+      });
+    } catch {
+      /* Tab may have closed. */
+    }
+  }
+
+  activeAudioPipelineTabId = undefined;
+  audioPipelineMode = null;
+}
+
+/**
+ * Push MUTE_GAIN to the offscreen document with exact BR-05 mute duration.
+ *
+ * @param durationMs - Mute hold in milliseconds (default 1500).
+ */
+async function sendMuteGainToOffscreen(
+  durationMs: number = MUTE_DURATION_MS
+): Promise<void> {
+  try {
+    await chrome.runtime.sendMessage({
+      action: MESSAGE_ACTION_MUTE_GAIN,
+      duration: durationMs,
+      duration_ms: durationMs,
+    });
+  } catch (error) {
+    console.warn("[SafeView] Could not deliver MUTE_GAIN to offscreen:", error);
+  }
+}
+
+/**
+ * Read whether protection is enabled from storage (BR-04).
+ */
+async function getProtectionState(): Promise<boolean> {
+  const settings = await loadSettings();
+  return settings.protectionEnabled;
+}
+
+/**
+ * Restart the offscreen audio pipeline when the user switches tabs.
+ */
+function setupPipelineTabNavigationListener(): void {
+  if (typeof process !== "undefined" && process.env.JEST_WORKER_ID !== undefined) {
+    return;
+  }
+
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (tabId !== activeAudioPipelineTabId || !changeInfo.url) {
+      return;
+    }
+
+    void resetPipelineGainsForActiveTab("tab-url-change").catch((error) => {
+      console.warn("[SafeView] Tab URL gain reset failed:", error);
+    });
+  });
+}
+
+function setupTabActivationListener(): void {
+  if (typeof process !== "undefined" && process.env.JEST_WORKER_ID !== undefined) {
+    return;
+  }
+
+  chrome.tabs.onActivated.addListener((activeInfo) => {
+    void (async () => {
+      const isProtectionOn = await getProtectionState();
+      if (!isProtectionOn) {
+        return;
+      }
+
+      if (activeInfo.tabId === activeAudioPipelineTabId) {
+        return;
+      }
+
+      console.info('[SafeView] Tab switched — user must re-enable protection from popup for audio pipeline on new tab.');
+    })().catch((error) => {
+      console.error("[SafeView] Tab activation handler failed:", error);
+    });
+  });
+}
+
+/**
+ * React to protection toggle changes persisted from the popup (BR-04).
+ */
+function setupProtectionToggleListener(): void {
+  if (typeof process !== "undefined" && process.env.JEST_WORKER_ID !== undefined) {
+    return;
+  }
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") {
+      return;
+    }
+
+    const settingsChange = changes[SETTINGS_STORAGE_KEY];
+    if (settingsChange === undefined) {
+      return;
+    }
+
+    const next = settingsChange.newValue as SafeViewSettings | undefined;
+    const prev = settingsChange.oldValue as SafeViewSettings | undefined;
+
+    if (!next?.protectionEnabled) {
+      if (prev?.protectionEnabled) {
+        void stopAudioPipeline("protection-off");
+      }
+    }
+  });
+}
+
+/**
+ * Route runtime messages from content scripts (ack immediately; push actions via tabs.sendMessage).
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== "object") {
     return false;
   }
 
-  if (message.action !== MESSAGE_ACTION_FRAME_SAMPLE) {
+  if (message.action === MESSAGE_ACTION_FRAME_SAMPLE) {
+    const tabId = sender.tab?.id;
+    const frameMessage = message as FrameSampleMessage;
+
+    const payloadLen = Array.isArray(frameMessage.framePayload)
+      ? frameMessage.framePayload.length
+      : 0;
+    const normalized = getFrameBytesFromMessage(frameMessage);
+    const hasFrameBytes = hasDecodableFrameBytes(frameMessage);
+
+    if (typeof frameMessage.videoId !== "number" || !hasFrameBytes) {
+      console.warn(
+        "[SafeView] Invalid FRAME_SAMPLE payload (payloadLen=%s).",
+        payloadLen
+      );
+      sendResponse({ received: false });
+      return false;
+    }
+
+    sendResponse({ received: true });
+    console.info(
+      "[SafeView] FRAME_SAMPLE received — tab=%s video=%s payloadLen=%s normalized=%s",
+      tabId ?? "?",
+      frameMessage.videoId,
+      payloadLen,
+      normalized?.byteLength ?? 0
+    );
+    if (tabId !== undefined) {
+      void handleFrameSample(frameMessage, tabId).catch((error) => {
+        console.error("[SafeView] FRAME_SAMPLE handler error:", error);
+      });
+    }
+
     return false;
   }
 
-  const frameMessage = message as FrameSampleMessage;
+  if (message.action === MESSAGE_ACTION_AUDIO_CHUNK) {
+    const tabId = sender.tab?.id;
+    const audioMessage = message as AudioChunkMessage;
 
-  if (
-    typeof frameMessage.videoId !== "number" ||
-    typeof frameMessage.frameBase64 !== "string" ||
-    frameMessage.frameBase64.length === 0
-  ) {
-    console.warn("[SafeView] Invalid FRAME_SAMPLE payload.");
-    sendResponse({ ok: false });
+    if (
+      typeof audioMessage.videoId !== "number" ||
+      typeof audioMessage.audioBase64 !== "string" ||
+      audioMessage.audioBase64.length === 0
+    ) {
+      console.warn("[SafeView] Invalid AUDIO_CHUNK payload.");
+      sendResponse({ received: false });
+      return false;
+    }
+
+    sendResponse({ received: true });
+    if (tabId !== undefined) {
+      void handleAudioChunk(audioMessage, tabId).catch((error) => {
+        console.error("[SafeView] AUDIO_CHUNK handler error:", error);
+      });
+    }
+
     return false;
   }
 
-  sendResponse({ ok: true });
-  void handleFrameSample(frameMessage, sender).catch((error) => {
-    console.error("[SafeView] FRAME_SAMPLE handler error:", error);
-  });
+  if (message.action === MESSAGE_ACTION_PROFANITY_DETECTED) {
+    const durationMs =
+      typeof message.duration_ms === "number" && message.duration_ms > 0
+        ? message.duration_ms
+        : MUTE_DURATION_MS;
+
+    sendResponse({ received: true });
+    void sendPipelineMuteGain(durationMs);
+    return false;
+  }
+
+  if (message.action === MESSAGE_ACTION_TAB_CAPTURE_INIT_FAILED) {
+    sendResponse({ received: true });
+    const failMessage = message as { error?: string };
+    console.error(
+      "[SafeView] TAB_CAPTURE_INIT_FAILED received, error=%s",
+      failMessage.error ?? "(none)"
+    );
+    return false;
+  }
+
+  if (message.action === MESSAGE_ACTION_PIPELINE_NAVIGATION) {
+    const navTabId = sender.tab?.id;
+    const navReason =
+      typeof message.reason === "string" ? message.reason : "pipeline-navigation";
+
+    sendResponse({ received: true });
+
+    if (navTabId !== undefined) {
+      void resetBlurPipelineOnNavigation(navTabId, navReason).catch((error) => {
+        console.warn("[SafeView] Navigation blur reset failed:", error);
+      });
+    }
+
+    void resetPipelineGainsForActiveTab(navReason);
+    return false;
+  }
+
+  if (message.action === MESSAGE_ACTION_TAB_CAPTURE_SILENT_STREAM) {
+    const tabId = message.tabId;
+    sendResponse({ received: true });
+    if (typeof tabId === "number") {
+      console.warn(
+        "[SafeView] Tab capture stream reported silent (tab %s) — keeping offscreen pipeline running.",
+        tabId
+      );
+    }
+    return false;
+  }
+
+  if (message.action === MESSAGE_ACTION_AUDIO_CHUNK_PIPELINE) {
+    const tabId = (message as PipelineAudioChunkMessage).tabId;
+    const pipelineMessage = message as PipelineAudioChunkMessage;
+
+    sendResponse({ received: true });
+    console.info(
+      "[SafeView][Audio-4] SW received pipeline chunk, tabId=%s, base64Len=%s",
+      tabId,
+      resolvePipelineAudioBase64(pipelineMessage)?.length ?? 0
+    );
+    console.info(
+      "[SafeView] AUDIO_CHUNK_PIPELINE received — tab=%s",
+      tabId ?? "?"
+    );
+
+    if (typeof tabId === "number") {
+      void handlePipelineAudioChunk(
+        message as PipelineAudioChunkMessage,
+        tabId
+      ).catch((error) => {
+        console.error("[SafeView] AUDIO_CHUNK_PIPELINE handler error:", error);
+      });
+    }
+
+    return false;
+  }
+
+  if (message.action === MESSAGE_ACTION_START_PIPELINE_WITH_STREAM) {
+    const tabId = message.tabId;
+
+    if (typeof tabId !== "number") {
+      console.warn("[SafeView] Invalid START_PIPELINE_WITH_STREAM payload.");
+      sendResponse({ success: false, error: "Invalid payload" });
+      return false;
+    }
+
+    void (async () => {
+      try {
+        await startAudioPipeline(tabId);
+        sendResponse({ success: true });
+      } catch (error) {
+        console.error(
+          "[SafeView] Error starting audio pipeline:",
+          error
+        );
+        sendResponse({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
+
+    return true;
+  }
 
   return false;
 });
@@ -467,10 +1455,13 @@ function startServiceWorkerKeepalive(): void {
 }
 
 void loadBackendStatusFromStorage();
+void initSettingsCache();
 startServiceWorkerKeepalive();
+setupProtectionToggleListener();
+setupTabActivationListener();
+setupPipelineTabNavigationListener();
 
 console.info(
-  "[SafeView] Service worker loaded (v%s, nudity-only, optimistic blur ≥%.2f).",
-  chrome.runtime.getManifest().version,
-  OPTIMISTIC_BLUR_SCORE_FLOOR
+  "[SafeView] Service worker loaded (v%s, label-gated blur).",
+  chrome.runtime.getManifest().version
 );

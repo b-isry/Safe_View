@@ -4,20 +4,26 @@
 // Purpose: Service worker sends BLUR/CLEAR based on mocked backend responses.
 
 const mockAnalyzeImage = jest.fn();
+const mockAnalyzeAudio = jest.fn();
 const mockLoadSettings = jest.fn();
 const mockGetEnabledCategories = jest.fn();
 const tabsSendMessage = jest.fn().mockResolvedValue(undefined);
 
 jest.mock("../src/background/aiClient", () => ({
   analyzeImage: (...args: unknown[]) => mockAnalyzeImage(...args),
+  analyzeAudio: (...args: unknown[]) => mockAnalyzeAudio(...args),
   loadBackendStatusFromStorage: jest.fn().mockResolvedValue({
     online: true,
     lastCheckedAt: 0,
   }),
 }));
 
+const mockGetCachedSettings = jest.fn();
+
 jest.mock("../src/background/businessRules", () => ({
   loadSettings: (...args: unknown[]) => mockLoadSettings(...args),
+  getCachedSettings: () => mockGetCachedSettings(),
+  initSettingsCache: jest.fn().mockResolvedValue(undefined),
   getEnabledCategories: (...args: unknown[]) => mockGetEnabledCategories(...args),
   shouldBlur: jest.requireActual("../src/background/businessRules").shouldBlur,
   effectiveThreshold: jest.requireActual("../src/background/businessRules")
@@ -56,29 +62,34 @@ const defaultSettings = {
     lgbtq: false,
   },
   profanityWords: [] as string[],
+  language: "en" as const,
 };
 
+const jpegBytes = Array.from(new TextEncoder().encode("jpeg"));
 const framePayload = {
   action: "FRAME_SAMPLE" as const,
   videoId: 1,
-  frameBase64: btoa("jpeg"),
+  framePayload: jpegBytes,
   frameMimeType: "image/jpeg",
+  frameSeq: 1,
 };
 
 describe("serviceWorker", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockLoadSettings.mockResolvedValue(defaultSettings);
+    mockGetCachedSettings.mockReturnValue(defaultSettings);
     mockGetEnabledCategories.mockReturnValue(["nudity"]);
   });
 
-  it("sends BLUR to the tab when backend confidence exceeds BR-01 threshold", async () => {
+  it("sends BLUR to the tab when label is NSFW and score exceeds threshold", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: true,
         confidence: 0.87,
         action: "BLUR",
+        label: "NSFW",
         model_loaded: true,
       },
       backendOnline: true,
@@ -89,7 +100,7 @@ describe("serviceWorker", () => {
       "../src/background/serviceWorker"
     );
 
-    await handleFrameSample(framePayload, { tab: { id: 99 } } as chrome.runtime.MessageSender);
+    await handleFrameSample(framePayload, 99);
 
     expect(mockAnalyzeImage).toHaveBeenCalled();
     expect(tabsSendMessage).toHaveBeenCalledWith(
@@ -101,35 +112,42 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("sends optimistic BLUR when score is ≥0.65 but below BR-01", async () => {
+  it("does not blur high score when label is SFW", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: false,
-        confidence: 0.68,
+        confidence: 0.95,
         action: "ALLOW",
+        label: "SFW",
         model_loaded: true,
       },
       backendOnline: true,
       fromFallback: false,
     });
 
-    const { handleFrameSample, MESSAGE_ACTION_BLUR } = await import(
-      "../src/background/serviceWorker"
-    );
+    const { handleFrameSample, MESSAGE_ACTION_BLUR, MESSAGE_ACTION_CLEAR } =
+      await import("../src/background/serviceWorker");
 
-    await handleFrameSample(framePayload, { tab: { id: 7 } } as chrome.runtime.MessageSender);
+    await handleFrameSample(framePayload, 7);
 
-    expect(tabsSendMessage).toHaveBeenCalledWith(
+    expect(tabsSendMessage).not.toHaveBeenCalledWith(
       7,
       expect.objectContaining({
         action: MESSAGE_ACTION_BLUR,
         videoId: 1,
       })
     );
+    expect(tabsSendMessage).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_CLEAR,
+        videoId: 1,
+      })
+    );
   });
 
-  it("sends CLEAR only after two consecutive scores below 0.65", async () => {
+  it("does not blur when score is below model floor (0.65)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -142,15 +160,39 @@ describe("serviceWorker", () => {
       fromFallback: false,
     });
 
+    const { handleFrameSample, MESSAGE_ACTION_BLUR } = await import(
+      "../src/background/serviceWorker"
+    );
+
+    await handleFrameSample(framePayload, 7);
+
+    expect(tabsSendMessage).not.toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_BLUR,
+        videoId: 1,
+      })
+    );
+  });
+
+  it("sends CLEAR on first SFW frame", async () => {
+    mockAnalyzeImage.mockResolvedValue({
+      response: {
+        category: "nudity",
+        detected: false,
+        confidence: 0.5,
+        action: "ALLOW",
+        label: "SFW",
+        model_loaded: true,
+      },
+      backendOnline: true,
+      fromFallback: false,
+    });
+
     const { handleFrameSample, MESSAGE_ACTION_CLEAR } = await import(
       "../src/background/serviceWorker"
     );
-    const sender = { tab: { id: 12 } } as chrome.runtime.MessageSender;
-
-    await handleFrameSample(framePayload, sender);
-    expect(tabsSendMessage).not.toHaveBeenCalled();
-
-    await handleFrameSample({ ...framePayload, videoId: 1 }, sender);
+    await handleFrameSample(framePayload, 12);
     expect(tabsSendMessage).toHaveBeenCalledWith(
       12,
       expect.objectContaining({
@@ -176,10 +218,7 @@ describe("serviceWorker", () => {
     const { handleFrameSample, MESSAGE_ACTION_CLEAR } = await import(
       "../src/background/serviceWorker"
     );
-    const sender = { tab: { id: 5 } } as chrome.runtime.MessageSender;
-
-    await handleFrameSample({ ...framePayload, videoId: 2 }, sender);
-    await handleFrameSample({ ...framePayload, videoId: 2 }, sender);
+    await handleFrameSample({ ...framePayload, videoId: 2 }, 5);
 
     expect(tabsSendMessage).toHaveBeenCalledWith(
       5,
@@ -188,5 +227,68 @@ describe("serviceWorker", () => {
         videoId: 2,
       })
     );
+  });
+
+  it("sends MUTE when analyze-audio reports profanity", async () => {
+    mockLoadSettings.mockResolvedValue({
+      ...defaultSettings,
+      categories: { ...defaultSettings.categories, profanity: true },
+    });
+    mockAnalyzeAudio.mockResolvedValue({
+      response: {
+        detected: true,
+        action: "MUTE",
+        duration_ms: 1500,
+        whisper_loaded: true,
+      },
+      backendOnline: true,
+      fromFallback: false,
+    });
+
+    const { handleAudioChunk, MESSAGE_ACTION_MUTE } = await import(
+      "../src/background/serviceWorker"
+    );
+
+    await handleAudioChunk(
+      {
+        action: "AUDIO_CHUNK",
+        videoId: 3,
+        audioBase64: btoa("webm"),
+        language: "en",
+      },
+      12
+    );
+
+    expect(mockAnalyzeAudio).toHaveBeenCalled();
+    expect(tabsSendMessage).toHaveBeenCalledWith(
+      12,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_MUTE,
+        videoId: 3,
+        duration_ms: 1500,
+      })
+    );
+  });
+
+  it("skips analyze-audio when profanity filter is disabled", async () => {
+    mockLoadSettings.mockResolvedValue({
+      ...defaultSettings,
+      categories: { ...defaultSettings.categories, profanity: false },
+    });
+
+    const { handleAudioChunk } = await import("../src/background/serviceWorker");
+
+    await handleAudioChunk(
+      {
+        action: "AUDIO_CHUNK",
+        videoId: 4,
+        audioBase64: btoa("webm"),
+        language: "en",
+      },
+      7
+    );
+
+    expect(mockAnalyzeAudio).not.toHaveBeenCalled();
+    expect(tabsSendMessage).not.toHaveBeenCalled();
   });
 });

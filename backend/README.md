@@ -60,6 +60,7 @@ Verify:
 ```text
 GET  http://localhost:8000/health
 POST http://localhost:8000/analyze-image
+POST http://localhost:8000/analyze-audio
 ```
 
 Interactive docs: `http://localhost:8000/docs`
@@ -86,7 +87,8 @@ Tests cover:
 {
   "status": "ok",
   "model": "dino_v3_linear",
-  "model_loaded": true
+  "model_loaded": true,
+  "whisper_loaded": true
 }
 ```
 
@@ -111,6 +113,29 @@ Example response:
   "model_loaded": true
 }
 ```
+
+### `POST /analyze-audio`
+
+Multipart form fields:
+
+| Field          | Type   | Description                                      |
+|----------------|--------|--------------------------------------------------|
+| `audio_chunk`  | file   | WebM/Opus audio bytes (MediaRecorder)            |
+| `language`     | string | `en` or `am`                                     |
+| `sensitivity`  | float  | 0.0–1.0 (accepted; not used for profanity)       |
+
+Example response:
+
+```json
+{
+  "detected": true,
+  "action": "MUTE",
+  "duration_ms": 1500,
+  "whisper_loaded": true
+}
+```
+
+`duration_ms` is always `1500` (BR-05). If Whisper failed to load at startup, `whisper_loaded` is `false` and `detected` is `false`.
 
 ## Clients
 

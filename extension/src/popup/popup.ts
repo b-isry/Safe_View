@@ -10,6 +10,7 @@ import {
   loadBackendStatusFromStorage,
   type BackendStatus,
 } from "../background/aiClient";
+import { MESSAGE_ACTION_START_PIPELINE_WITH_STREAM } from "../background/serviceWorker";
 import {
   getEnabledCategories,
   loadSettings,
@@ -155,8 +156,42 @@ async function refreshPopup(runHealthCheck: boolean): Promise<void> {
 async function handleProtectionToggle(): Promise<void> {
   try {
     const settings = await loadSettings();
-    settings.protectionEnabled = protectionToggle.checked;
-    await saveSettings(settings);
+    const turningOn = protectionToggle.checked;
+
+    if (turningOn) {
+      const [tab] = await chrome.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+      const tabId = tab?.id;
+
+      if (tabId === undefined) {
+        protectionToggle.checked = false;
+        settings.protectionEnabled = false;
+        await saveSettings(settings);
+        await refreshPopup(false);
+        return;
+      }
+
+      settings.protectionEnabled = true;
+      await saveSettings(settings);
+
+      try {
+        await chrome.runtime.sendMessage({
+          action: MESSAGE_ACTION_START_PIPELINE_WITH_STREAM,
+          tabId,
+        });
+      } catch (pipelineError) {
+        console.warn(
+          "[SafeView] Audio pipeline start failed — visual moderation continues:",
+          pipelineError
+        );
+      }
+    } else {
+      settings.protectionEnabled = false;
+      await saveSettings(settings);
+    }
+
     await refreshPopup(false);
   } catch (error) {
     console.error("[SafeView] Protection toggle failed:", error);

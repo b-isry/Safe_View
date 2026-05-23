@@ -17,11 +17,17 @@ export const BLUR_FILTER = `blur(${BLUR_RADIUS_PX}px)`;
 /** Backdrop blur for sites where <video> filter is not visible (e.g. YouTube). */
 export const BLUR_BACKDROP = `blur(${BLUR_RADIUS_PX}px)`;
 
-/** Transition duration when blur is applied or removed (seconds). */
-export const BLUR_TRANSITION_SECONDS = 0.15;
+/** Transition duration when blur is removed (seconds). */
+export const BLUR_CLEAR_TRANSITION_SECONDS = 0.15;
 
-/** CSS transition for filter changes. */
-export const BLUR_TRANSITION = `filter ${BLUR_TRANSITION_SECONDS}s ease`;
+/** CSS transition for unblur only — BLUR applies instantly. */
+export const BLUR_CLEAR_TRANSITION = `filter ${BLUR_CLEAR_TRANSITION_SECONDS}s ease`;
+
+/** @deprecated Use BLUR_CLEAR_TRANSITION — kept for tests. */
+export const BLUR_TRANSITION_SECONDS = BLUR_CLEAR_TRANSITION_SECONDS;
+
+/** @deprecated Use BLUR_CLEAR_TRANSITION — kept for tests. */
+export const BLUR_TRANSITION = BLUR_CLEAR_TRANSITION;
 
 /** Minimum time blur stays on after BLUR (matches BR-05 mute duration). */
 export const MIN_BLUR_HOLD_MS = 1500;
@@ -34,6 +40,11 @@ export const BLUR_OVERLAY_CLASS = "safeview-blur-overlay";
 
 /** Frosted overlay tint when backdrop-filter alone is insufficient (YouTube). */
 export const BLUR_OVERLAY_TINT = "rgba(13, 27, 42, 0.72)";
+
+/**
+ * Overlay stacking — above the video pixels, below site player chrome (YouTube controls ~61).
+ */
+export const BLUR_OVERLAY_Z_INDEX = 1;
 
 /** Service worker → content script: apply blur to a video. */
 export const MESSAGE_ACTION_BLUR = "BLUR";
@@ -51,6 +62,8 @@ export interface BlurCommandMessage {
   sentAt?: number;
   swReceivedAt?: number;
   backendDoneAt?: number;
+  commandSeq?: number;
+  preemptive?: boolean;
 }
 
 /**
@@ -63,44 +76,14 @@ interface BlurRestoreState {
 
 const blurredStyles = new WeakMap<HTMLVideoElement, BlurRestoreState>();
 const blurOverlays = new WeakMap<HTMLVideoElement, HTMLDivElement>();
-const blurredPlayerHosts = new WeakMap<HTMLVideoElement, BlurRestoreState>();
 const blurredVideoSet = new Set<HTMLVideoElement>();
 
 let removalObserver: MutationObserver | null = null;
 let isBlurManagerInitialized = false;
-let blurHoldUntil = 0;
-let consecutiveClearCount = 0;
 let overlaySyncHandle: number | null = null;
 
-/** Session cdc754 — blur overlay diagnostics. */
-function debugBlurLog(
-  message: string,
-  data: Record<string, unknown>,
-  hypothesisId: string
-): void {
-  if (typeof fetch === "undefined") {
-    return;
-  }
-
-  // #region agent log
-  fetch("http://127.0.0.1:7640/ingest/54f2aeff-4399-4b9d-ae56-da0825d96b38", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "cdc754",
-    },
-    body: JSON.stringify({
-      sessionId: "cdc754",
-      runId: "overlay-fix",
-      hypothesisId,
-      location: "blurManager.ts",
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  // #endregion
-}
+/** Latest accepted commandSeq per videoId (stale BLUR/CLEAR ignored). */
+const latestBlurCommandSeq = new Map<number, number>();
 
 /**
  * True on YouTube watch pages where <video> CSS filter is often not visible.
@@ -110,15 +93,18 @@ function shouldUseBlurOverlay(): boolean {
 }
 
 /**
- * YouTube wraps the real player in #movie_player — blur this host when present.
+ * Parent for the overlay — direct parent of <video> (excludes player chrome siblings).
  *
  * @param video - Target HTMLVideoElement.
- * @returns Player container element, or null on non-YouTube pages.
+ * @returns Positioning parent, or null.
  */
-function findYouTubePlayerHost(video: HTMLVideoElement): HTMLElement | null {
-  const host =
-    video.closest("#movie_player") ?? video.closest(".html5-video-player");
-  return host instanceof HTMLElement ? host : null;
+function findOverlayParent(video: HTMLVideoElement): HTMLElement | null {
+  const parent = video.parentElement;
+  if (parent instanceof HTMLElement && parent !== document.body) {
+    return parent;
+  }
+
+  return null;
 }
 
 /**
@@ -147,53 +133,49 @@ function resolveBlurTarget(videoId: number): HTMLVideoElement | undefined {
 }
 
 /**
- * Returns true while a recent BLUR is within the minimum hold window.
- */
-function isBlurHoldActive(): boolean {
-  return Date.now() < blurHoldUntil;
-}
-
-/**
- * True when the overlay is anchored inside the YouTube player container.
- *
- * @param overlay - Blur overlay element.
- * @returns True if parent is the YouTube movie player.
- */
-function isPlayerHostedOverlay(overlay: HTMLDivElement): boolean {
-  const parent = overlay.parentElement;
-  return (
-    parent instanceof HTMLElement &&
-    (parent.id === "movie_player" || parent.classList.contains("html5-video-player"))
-  );
-}
-
-/**
- * Position the overlay over the video's on-screen bounds.
+ * Position the overlay to match only the <video> element bounds (not player chrome).
  *
  * @param video - Target HTMLVideoElement.
  * @param overlay - Overlay div to align.
  */
 function syncOverlayToVideo(video: HTMLVideoElement, overlay: HTMLDivElement): void {
-  if (isPlayerHostedOverlay(overlay)) {
-    overlay.style.display = "block";
-    overlay.style.left = "0";
-    overlay.style.top = "0";
-    overlay.style.width = "100%";
-    overlay.style.height = "100%";
+  const parent = overlay.parentElement;
+  if (!parent) {
     return;
   }
 
-  const rect = video.getBoundingClientRect();
-  if (rect.width < 1 || rect.height < 1) {
+  const videoRect = video.getBoundingClientRect();
+  const parentRect = parent.getBoundingClientRect();
+
+  const width = Math.round(videoRect.width);
+  const height = Math.round(videoRect.height);
+
+  if (width < 1 || height < 1) {
     overlay.style.display = "none";
     return;
   }
 
+  const x = Math.round(videoRect.left - parentRect.left);
+  const y = Math.round(videoRect.top - parentRect.top);
+
   overlay.style.display = "block";
-  overlay.style.left = `${rect.left}px`;
-  overlay.style.top = `${rect.top}px`;
-  overlay.style.width = `${rect.width}px`;
-  overlay.style.height = `${rect.height}px`;
+  overlay.style.left = `${x}px`;
+  overlay.style.top = `${y}px`;
+  overlay.style.width = `${width}px`;
+  overlay.style.height = `${height}px`;
+
+  const posKey = `${x},${y},${width},${height}`;
+  if (overlay.dataset.safeviewPos !== posKey) {
+    overlay.dataset.safeviewPos = posKey;
+    console.info(
+      "[SafeView][OVERLAY] positioned %s %s %s %s z-index=%s",
+      x,
+      y,
+      width,
+      height,
+      overlay.style.zIndex
+    );
+  }
 }
 
 /**
@@ -212,72 +194,25 @@ function ensureBlurOverlay(video: HTMLVideoElement): HTMLDivElement {
   overlay.className = BLUR_OVERLAY_CLASS;
   overlay.setAttribute("aria-hidden", "true");
   overlay.style.pointerEvents = "none";
-  overlay.style.zIndex = "2147483646";
+  overlay.style.position = "absolute";
+  overlay.style.zIndex = String(BLUR_OVERLAY_Z_INDEX);
   overlay.style.backgroundColor = BLUR_OVERLAY_TINT;
   overlay.style.backdropFilter = BLUR_BACKDROP;
   overlay.style.setProperty("-webkit-backdrop-filter", BLUR_BACKDROP);
   overlay.style.display = "none";
 
-  const playerHost = shouldUseBlurOverlay() ? findYouTubePlayerHost(video) : null;
-  if (playerHost) {
-    overlay.style.position = "absolute";
-    overlay.style.inset = "0";
-    if (getComputedStyle(playerHost).position === "static") {
-      playerHost.style.position = "relative";
+  if (shouldUseBlurOverlay()) {
+    const parent = findOverlayParent(video);
+    if (parent) {
+      if (getComputedStyle(parent).position === "static") {
+        parent.style.position = "relative";
+      }
+      parent.appendChild(overlay);
     }
-    playerHost.appendChild(overlay);
-  } else {
-    overlay.style.position = "fixed";
-    document.body.appendChild(overlay);
   }
 
   blurOverlays.set(video, overlay);
   return overlay;
-}
-
-/**
- * Apply blur to YouTube's player container (filter on <video> alone is often ignored).
- *
- * @param video - Target HTMLVideoElement.
- */
-function applyBlurToPlayerHost(video: HTMLVideoElement): void {
-  const host = findYouTubePlayerHost(video);
-  if (!host) {
-    return;
-  }
-
-  if (!blurredPlayerHosts.has(video)) {
-    blurredPlayerHosts.set(video, {
-      originalFilter: host.style.filter,
-      originalTransition: host.style.transition,
-    });
-  }
-
-  host.style.transition = BLUR_TRANSITION;
-  host.style.setProperty("filter", BLUR_FILTER, "important");
-}
-
-/**
- * Restore YouTube player container styles after CLEAR.
- *
- * @param video - Target HTMLVideoElement.
- */
-function clearBlurFromPlayerHost(video: HTMLVideoElement): void {
-  const saved = blurredPlayerHosts.get(video);
-  const host = findYouTubePlayerHost(video);
-
-  if (host) {
-    host.style.removeProperty("filter");
-  }
-
-  if (saved && host) {
-    host.style.transition = saved.originalTransition;
-    if (saved.originalFilter) {
-      host.style.filter = saved.originalFilter;
-    }
-  }
-
-  blurredPlayerHosts.delete(video);
 }
 
 /**
@@ -323,20 +258,13 @@ function stopOverlaySyncLoop(): void {
  * @param video - HTMLVideoElement to cover.
  */
 function showBlurOverlay(video: HTMLVideoElement): void {
+  if (!shouldUseBlurOverlay()) {
+    return;
+  }
+
   const overlay = ensureBlurOverlay(video);
   syncOverlayToVideo(video, overlay);
   startOverlaySyncLoop();
-
-  // #region agent log
-  debugBlurLog(
-    "blur overlay shown",
-    {
-      rectW: video.getBoundingClientRect().width,
-      rectH: video.getBoundingClientRect().height,
-    },
-    "H3"
-  );
-  // #endregion
 }
 
 /**
@@ -376,36 +304,17 @@ export function applyBlur(videoId: number, trace?: Partial<BlurCommandMessage>):
         : undefined;
 
     console.info(
-      "[SafeView][Latency] blur applied video=%s capture→blur=%sms backend→blur=%sms",
+      "[SafeView][Latency] blur apply video=%s capture→blur=%sms backend→blur=%sms preemptive=%s",
       videoId,
       captureToBlurMs,
-      backendToBlurMs ?? "?"
+      backendToBlurMs ?? "?",
+      trace?.preemptive === true ? "yes" : "no"
     );
   }
-
-  // #region agent log
-  debugBlurLog(
-    video ? "applyBlur" : "applyBlur skipped",
-    {
-      commandVideoId: videoId,
-      useOverlay: shouldUseBlurOverlay(),
-      targetArea: video
-        ? video.getBoundingClientRect().width * video.getBoundingClientRect().height
-        : 0,
-      inlineFilter: video?.style.filter ?? "",
-      computedFilter: video ? getComputedStyle(video).filter : "",
-      playerHostId: video ? findYouTubePlayerHost(video)?.id ?? null : null,
-    },
-    "H2"
-  );
-  // #endregion
 
   if (!video) {
     return;
   }
-
-  consecutiveClearCount = 0;
-  blurHoldUntil = Date.now() + MIN_BLUR_HOLD_MS;
 
   if (!blurredStyles.has(video)) {
     blurredStyles.set(video, {
@@ -415,13 +324,10 @@ export function applyBlur(videoId: number, trace?: Partial<BlurCommandMessage>):
     blurredVideoSet.add(video);
   }
 
-  video.style.transition = BLUR_TRANSITION;
+  video.style.transition = "none";
   video.style.setProperty("filter", BLUR_FILTER, "important");
 
-  if (shouldUseBlurOverlay()) {
-    applyBlurToPlayerHost(video);
-    showBlurOverlay(video);
-  }
+  showBlurOverlay(video);
 }
 
 /**
@@ -432,38 +338,10 @@ export function applyBlur(videoId: number, trace?: Partial<BlurCommandMessage>):
 export function clearBlur(videoId: number): void {
   pruneDisconnectedBlurredVideos();
 
-  consecutiveClearCount += 1;
-
-  if (consecutiveClearCount < CLEAR_STREAK_REQUIRED) {
-    // #region agent log
-    debugBlurLog(
-      "clearBlur deferred — streak",
-      { commandVideoId: videoId, consecutiveClearCount },
-      "H1"
-    );
-    // #endregion
-    return;
-  }
-
-  if (isBlurHoldActive()) {
-    // #region agent log
-    debugBlurLog(
-      "clearBlur deferred — hold",
-      { commandVideoId: videoId, blurHoldUntil },
-      "H1"
-    );
-    // #endregion
-    return;
-  }
-
   const video = resolveBlurTarget(videoId);
   if (!video) {
     return;
   }
-
-  // #region agent log
-  debugBlurLog("clearBlur executed", { commandVideoId: videoId }, "H1");
-  // #endregion
 
   clearBlurForElement(video);
 }
@@ -477,21 +355,24 @@ function clearBlurForElement(video: HTMLVideoElement): void {
   const saved = blurredStyles.get(video);
 
   video.style.removeProperty("filter");
-  clearBlurFromPlayerHost(video);
   hideBlurOverlay(video);
 
   if (saved) {
-    video.style.transition = saved.originalTransition;
+    video.style.transition = BLUR_CLEAR_TRANSITION;
     if (saved.originalFilter) {
       video.style.filter = saved.originalFilter;
     }
+    if (saved.originalTransition) {
+      window.setTimeout(() => {
+        video.style.transition = saved.originalTransition;
+      }, BLUR_CLEAR_TRANSITION_SECONDS * 1000);
+    }
     blurredStyles.delete(video);
   } else {
-    video.style.transition = "";
+    video.style.transition = BLUR_CLEAR_TRANSITION;
   }
 
   blurredVideoSet.delete(video);
-  consecutiveClearCount = 0;
 
   if (blurredVideoSet.size === 0) {
     stopOverlaySyncLoop();
@@ -542,6 +423,27 @@ function handleBlurRemovalMutations(mutations: MutationRecord[]): void {
  * @param message - Runtime message payload.
  * @returns True when the message was handled.
  */
+/**
+ * Ignore BLUR/CLEAR when an older commandSeq arrives after a newer one.
+ *
+ * @param videoId - Target video id.
+ * @param commandSeq - Sequence from the service worker.
+ * @returns True when the command should be applied.
+ */
+function acceptBlurCommand(videoId: number, commandSeq: number | undefined): boolean {
+  if (commandSeq === undefined) {
+    return true;
+  }
+
+  const last = latestBlurCommandSeq.get(videoId) ?? 0;
+  if (commandSeq < last) {
+    return false;
+  }
+
+  latestBlurCommandSeq.set(videoId, commandSeq);
+  return true;
+}
+
 function handleRuntimeMessage(message: unknown): boolean {
   if (!message || typeof message !== "object") {
     return false;
@@ -552,6 +454,10 @@ function handleRuntimeMessage(message: unknown): boolean {
 
   if (typeof videoId !== "number") {
     return false;
+  }
+
+  if (!acceptBlurCommand(videoId, command.commandSeq)) {
+    return true;
   }
 
   if (command.action === MESSAGE_ACTION_BLUR) {
@@ -601,6 +507,23 @@ export function initBlurManager(): void {
 }
 
 /**
+ * Reset all blur state when the user navigates to a new video (SPA / URL change).
+ *
+ * @param _reason - Diagnostic label (unused; kept for callers).
+ */
+export function resetBlurStateForNavigation(_reason: string): void {
+  for (const video of [...blurredVideoSet]) {
+    clearBlurForElement(video);
+  }
+
+  blurredVideoSet.clear();
+  latestBlurCommandSeq.clear();
+  stopOverlaySyncLoop();
+
+  console.info("[SafeView] NEW VIDEO detected — all blur state reset");
+}
+
+/**
  * Tear down blur manager observers and clear all active blurs.
  */
 export function teardownBlurManager(): void {
@@ -620,6 +543,7 @@ export function teardownBlurManager(): void {
   }
 
   blurredVideoSet.clear();
+  latestBlurCommandSeq.clear();
   stopOverlaySyncLoop();
 }
 
