@@ -109,6 +109,12 @@ function renderBackendStatusText(backendStatus: BackendStatus): void {
   backendStatusEl.classList.remove("is-online", "is-offline");
 
   if (backendStatus.online) {
+    if (backendStatus.modelLoaded === false) {
+      backendStatusEl.textContent = "Connected — nudity model not loaded";
+      backendStatusEl.classList.add("is-offline");
+      return;
+    }
+
     backendStatusEl.textContent = "Connected";
     backendStatusEl.classList.add("is-online");
     return;

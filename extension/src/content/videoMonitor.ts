@@ -20,6 +20,7 @@ import {
 import {
   applyImmediateLocalBlur,
   clearAllFullVideoBlurs,
+  clearImmediateLocalBlur,
 } from "./fullVideoBlur";
 import {
   onYouTubeWatchIdBoundary,
@@ -71,8 +72,21 @@ export const MESSAGE_ACTION_FRAME_SAMPLE = "FRAME_SAMPLE";
 /** Service worker → content script: one frame analysis cycle finished. */
 export const MESSAGE_ACTION_FRAME_ANALYSIS_DONE = "FRAME_ANALYSIS_DONE";
 
+/** Downscaled scene snapshot width (pixels). */
+const SCENE_SNAPSHOT_WIDTH = 32;
+
+/** Downscaled scene snapshot height (pixels). */
+const SCENE_SNAPSHOT_HEIGHT = 18;
+
+/** Average per-channel delta that counts as a major scene change. */
+const SCENE_CHANGE_PIXEL_THRESHOLD = 28;
+
+/** Playback jump larger than this triggers a fresh blur cycle (seconds). */
+const PLAYBACK_JUMP_SECONDS = 1.5;
+
 /** Minimum layout size (px) for a video to count as the visible player. */
 const MIN_VISIBLE_LAYOUT_PX = 200;
+
 
 /** data-* marker: video registered for SafeView monitoring. */
 const SAFE_VIEW_TRACKED_DATASET = "safeViewTracked";
@@ -96,7 +110,15 @@ export type VideoAnalysisState = {
   firstDecisionMade: boolean;
   unsafeSeen: boolean;
   safeStreak: number;
-  uncertainStreak: number;
+  unsafeLockUntil: number;
+  /** True when blur is cleared and monitoring continues. */
+  isClear: boolean;
+  /** Downscaled RGBA snapshot for scene-change detection. */
+  lastSceneSnapshot: Uint8ClampedArray | null;
+  /** Last observed playback time (seek detection). */
+  lastVideoTime: number;
+  /** Last observed media src (route / video swap detection). */
+  lastSrc: string;
 };
 
 /**
@@ -200,8 +222,156 @@ function createAnalysisState(): VideoAnalysisState {
     firstDecisionMade: false,
     unsafeSeen: false,
     safeStreak: 0,
-    uncertainStreak: 0,
+    unsafeLockUntil: 0,
+    isClear: false,
+    lastSceneSnapshot: null,
+    lastVideoTime: -1,
+    lastSrc: "",
   };
+}
+
+/**
+ * Capture a tiny RGBA snapshot for lightweight scene-change detection.
+ */
+function captureSceneSnapshot(video: HTMLVideoElement): Uint8ClampedArray | null {
+  if (!canCaptureFrame(video)) {
+    return null;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = SCENE_SNAPSHOT_WIDTH;
+  canvas.height = SCENE_SNAPSHOT_HEIGHT;
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    return null;
+  }
+
+  try {
+    ctx.drawImage(video, 0, 0, SCENE_SNAPSHOT_WIDTH, SCENE_SNAPSHOT_HEIGHT);
+    return ctx.getImageData(0, 0, SCENE_SNAPSHOT_WIDTH, SCENE_SNAPSHOT_HEIGHT).data;
+  } catch {
+    return null;
+  } finally {
+    purgeCanvas(canvas);
+  }
+}
+
+/**
+ * True when the current snapshot differs strongly from the previous one.
+ */
+function hasMajorSceneChange(
+  previous: Uint8ClampedArray | null,
+  current: Uint8ClampedArray
+): boolean {
+  if (!previous || previous.length !== current.length) {
+    return previous !== null;
+  }
+
+  let channelSum = 0;
+  const pixels = previous.length / 4;
+  for (let i = 0; i < previous.length; i += 4) {
+    channelSum +=
+      Math.abs(current[i] - previous[i]) +
+      Math.abs(current[i + 1] - previous[i + 1]) +
+      Math.abs(current[i + 2] - previous[i + 2]);
+  }
+
+  return channelSum / pixels / 3 >= SCENE_CHANGE_PIXEL_THRESHOLD;
+}
+
+/**
+ * Reset analysis after seek, src change, or route swap — blur and rescan.
+ */
+function resetForPlaybackBoundary(
+  video: HTMLVideoElement,
+  state: VideoTrackState,
+  reason: string
+): void {
+  state.analysis.firstDecisionMade = false;
+  state.analysis.safeStreak = 0;
+  state.analysis.unsafeSeen = false;
+  state.analysis.unsafeLockUntil = 0;
+  state.analysis.isClear = false;
+  state.analysis.lastSceneSnapshot = null;
+  applyImmediateLocalBlur(video);
+
+  console.info(
+    "[SafeView][Capture] BOUNDARY RESET video=%s reason=%s",
+    state.videoId,
+    reason
+  );
+}
+
+/**
+ * Detect seek jumps and src changes; blur immediately when they occur.
+ *
+ * @returns True when a boundary reset was applied.
+ */
+function checkPlaybackBoundary(video: HTMLVideoElement, state: VideoTrackState): boolean {
+  const src = video.currentSrc || video.src || "";
+  const time = video.currentTime;
+  let jumped = false;
+
+  if (state.analysis.lastVideoTime >= 0) {
+    const delta = Math.abs(time - state.analysis.lastVideoTime);
+    jumped =
+      delta > PLAYBACK_JUMP_SECONDS || time < state.analysis.lastVideoTime - 0.25;
+  }
+
+  const srcChanged =
+    state.analysis.lastSrc.length > 0 &&
+    src.length > 0 &&
+    src !== state.analysis.lastSrc;
+
+  state.analysis.lastVideoTime = time;
+  if (src.length > 0) {
+    state.analysis.lastSrc = src;
+  }
+
+  if (jumped || srcChanged) {
+    resetForPlaybackBoundary(video, state, jumped ? "seek-jump" : "src-change");
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * When the video is clear, blur immediately on a major visual scene change.
+ *
+ * @returns True when scene-change preemptive blur was applied.
+ */
+function maybeHandleSceneChange(
+  video: HTMLVideoElement,
+  state: VideoTrackState
+): boolean {
+  if (!state.analysis.isClear) {
+    return false;
+  }
+
+  const snapshot = captureSceneSnapshot(video);
+  if (!snapshot) {
+    return false;
+  }
+
+  const sceneChanged = hasMajorSceneChange(state.analysis.lastSceneSnapshot, snapshot);
+  state.analysis.lastSceneSnapshot = snapshot;
+
+  if (!sceneChanged) {
+    return false;
+  }
+
+  state.analysis.firstDecisionMade = false;
+  state.analysis.safeStreak = 0;
+  state.analysis.isClear = false;
+  applyImmediateLocalBlur(video);
+
+  console.info(
+    "[SafeView][Capture] SCENE CHANGE video=%s — temporary blur",
+    state.videoId
+  );
+  return true;
 }
 
 /**
@@ -276,7 +446,12 @@ function markAnalysisComplete(state: VideoTrackState, requestId: number): void {
 /**
  * Handle FRAME_ANALYSIS_DONE from the service worker.
  */
-function handleFrameAnalysisDone(videoId: number, requestId?: number): void {
+function handleFrameAnalysisDone(
+  videoId: number,
+  requestId?: number,
+  decision?: string,
+  reason?: string
+): void {
   const video = videoIdToElement.get(videoId);
   if (!video) {
     return;
@@ -287,7 +462,48 @@ function handleFrameAnalysisDone(videoId: number, requestId?: number): void {
     return;
   }
 
-  markAnalysisComplete(state, requestId ?? state.analysis.requestId);
+  const resolvedRequestId = requestId ?? state.analysis.requestId;
+  if (resolvedRequestId > 0 && resolvedRequestId < state.analysis.requestId) {
+    return;
+  }
+
+  markAnalysisComplete(state, resolvedRequestId);
+
+  const primary = findPrimaryVisibleVideo();
+  if (video !== primary) {
+    return;
+  }
+
+  if (decision === "CLEAR") {
+    state.analysis.unsafeSeen = false;
+    state.analysis.safeStreak = 0;
+    state.analysis.unsafeLockUntil = 0;
+    state.analysis.firstDecisionMade = true;
+    state.analysis.isClear = true;
+    clearImmediateLocalBlur(video);
+    const snapshot = captureSceneSnapshot(video);
+    if (snapshot) {
+      state.analysis.lastSceneSnapshot = snapshot;
+    }
+  } else if (decision === "BLUR") {
+    state.analysis.isClear = false;
+    state.analysis.safeStreak = 0;
+    state.analysis.firstDecisionMade = true;
+    if (reason === "unsafe") {
+      state.analysis.unsafeSeen = true;
+    }
+    applyImmediateLocalBlur(video);
+  } else if (
+    decision === "HOLD" &&
+    reason === "building_safe_streak" &&
+    state.analysis.unsafeSeen
+  ) {
+    state.analysis.safeStreak += 1;
+  }
+
+  if (isNudityProtectionActiveCached() && video === primary) {
+    void sampleFrame(video, state.captureSession, true);
+  }
 }
 
 /**
@@ -466,8 +682,12 @@ function ensureVideoRegistered(video: HTMLVideoElement): void {
     }
 
     resetVideoAnalysisState(state);
-    applyImmediateLocalBlur(video);
-    triggerImmediateFirstSample(video);
+    if (findPrimaryVisibleVideo() === video) {
+      applyImmediateLocalBlur(video);
+      triggerImmediateFirstSample(video);
+    } else {
+      clearImmediateLocalBlur(video);
+    }
     reconcilePrimaryCaptureLoop("settings-rescan");
     return;
   }
@@ -609,6 +829,7 @@ function reconcilePrimaryCaptureLoop(reason: string): void {
 
     if (video !== primary) {
       stopSampling(video, state, `not-primary:${reason}`);
+      clearImmediateLocalBlur(video);
     }
   }
 
@@ -693,9 +914,6 @@ function registerVideo(video: HTMLVideoElement): void {
   startSubtitleMonitor(video);
   onVideoTrackedForSpeakerSuppression(video);
 
-  applyImmediateLocalBlur(video);
-  scheduleFirstSample(video, state);
-
   console.info(
     "[SafeView][Capture] REGISTER video=%s session=0 tracked=%s",
     videoId,
@@ -718,6 +936,7 @@ function unregisterVideo(video: HTMLVideoElement, reason = "unregister"): void {
   }
 
   stopSampling(video, state, reason);
+  clearImmediateLocalBlur(video);
   video.removeEventListener("loadedmetadata", state.onMetadataLoaded);
   teardownFirstSampleListeners(video, state);
   stopSubtitleMonitor(video);
@@ -1004,7 +1223,7 @@ async function sampleFrame(
 
   if (state.analysis.isAnalyzing) {
     const pendingMs = now - state.analysis.lastAnalysisStartedAt;
-    if (pendingMs < MAX_PENDING_ANALYSIS_MS) {
+    if (pendingMs < MAX_PENDING_ANALYSIS_MS && !immediate) {
       console.debug(
         "[SafeView][Capture] SKIP pending analysis video=%s request=%s pendingMs=%s",
         state.videoId,
@@ -1024,6 +1243,14 @@ async function sampleFrame(
     clearAnalysisTimeout(state);
   }
 
+  if (canCaptureFrame(video)) {
+    const boundaryReset = checkPlaybackBoundary(video, state);
+    const sceneChanged = !boundaryReset && maybeHandleSceneChange(video, state);
+    if (boundaryReset || sceneChanged) {
+      immediate = true;
+    }
+  }
+
   const intervalMs = getSampleIntervalMs(video);
   if (!immediate && now - state.lastSampleAt < intervalMs) {
     return;
@@ -1041,7 +1268,12 @@ async function sampleFrame(
     return;
   }
 
-  if (!document.hidden && !video.paused && video.currentTime === state.lastSampledTime) {
+  if (
+    !immediate &&
+    !document.hidden &&
+    !video.paused &&
+    video.currentTime === state.lastSampledTime
+  ) {
     return;
   }
 
@@ -1112,11 +1344,20 @@ async function sampleFrame(
     after.analysisTimeoutId = window.setTimeout(() => {
       if (after.analysis.requestId === requestId && after.analysis.isAnalyzing) {
         after.analysis.isAnalyzing = false;
-        console.warn(
-          "[SafeView][Capture] BACKEND TIMEOUT video=%s request=%s — keeping blur",
-          after.videoId,
-          requestId
-        );
+        if (after.analysis.isClear) {
+          console.warn(
+            "[SafeView][Capture] BACKEND TIMEOUT video=%s request=%s — retry (video clear)",
+            after.videoId,
+            requestId
+          );
+          void sampleFrame(video, captureSession, true);
+        } else {
+          console.warn(
+            "[SafeView][Capture] BACKEND TIMEOUT video=%s request=%s — keeping blur",
+            after.videoId,
+            requestId
+          );
+        }
       }
     }, BACKEND_TIMEOUT_MS);
 
@@ -1381,7 +1622,16 @@ function setupRuntimeMessageListener(): void {
 
     if (payload.action === MESSAGE_ACTION_FRAME_ANALYSIS_DONE) {
       if (typeof payload.videoId === "number") {
-        handleFrameAnalysisDone(payload.videoId, payload.requestId);
+        const framePayload = message as {
+          decision?: string;
+          reason?: string;
+        };
+        handleFrameAnalysisDone(
+          payload.videoId,
+          payload.requestId,
+          framePayload.decision,
+          framePayload.reason
+        );
       }
       return;
     }

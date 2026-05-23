@@ -6,15 +6,14 @@
 import { analyzeAudio, analyzeImage, loadBackendStatusFromStorage } from "./aiClient";
 import {
   evaluateBlurState,
+  applyBlurStateUpdates,
   logBlurEvaluation,
   normalizeBlurLabel,
   type BlurLabel,
 } from "./blurDecision";
 import {
-  CONFIDENCE_FLOOR,
   MUTE_DURATION_MS,
   SETTINGS_STORAGE_KEY,
-  effectiveThreshold,
   getCachedSettings,
   getEnabledCategories,
   initSettingsCache,
@@ -164,28 +163,19 @@ interface FramePipelineState {
   generation: number;
   abortController: AbortController | null;
   analysisInFlight: boolean;
-  lastUnsafe: boolean;
+  unsafeSeen: boolean;
   lastBlurCommandSeq: number;
   lastProcessedFrameSeq: number;
-  /** Latest requestId accepted for this video pipeline. */
   latestRequestId: number;
-  /** True after the first trusted backend blur decision. */
   firstDecisionMade: boolean;
-  /** Consecutive clearly-safe frames while blurred. */
   safeStreak: number;
-  /** Consecutive uncertain-band frames without high nudity confidence. */
-  uncertainStreak: number;
-  /** Latest frame while analysis is in flight (coalesced, not aborted). */
+  unsafeLockUntil: number;
   pendingSample: FrameSampleMessage | null;
 }
 
 const DEFAULT_FRAME_MIME_TYPE = "image/jpeg";
 
 /** Throttle "below sensitivity threshold" console hints (ms). */
-const THRESHOLD_HINT_INTERVAL_MS = 5000;
-
-let lastThresholdHintAt = 0;
-
 const framePipelineState = new Map<string, FramePipelineState>();
 
 /** Tab id currently wired to the offscreen tab-capture pipeline, if any. */
@@ -353,13 +343,13 @@ function getFramePipelineState(tabId: number, videoId: number): FramePipelineSta
       generation: 0,
       abortController: null,
       analysisInFlight: false,
-      lastUnsafe: false,
+      unsafeSeen: false,
       lastBlurCommandSeq: 0,
       lastProcessedFrameSeq: 0,
       latestRequestId: 0,
       firstDecisionMade: false,
       safeStreak: 0,
-      uncertainStreak: 0,
+      unsafeLockUntil: 0,
       pendingSample: null,
     };
     framePipelineState.set(key, state);
@@ -510,83 +500,70 @@ export interface FrameAnalysisOutcome {
   nudityDetected: boolean | null;
   nudityAction: string | null;
   backendTrusted: boolean;
+  modelLoaded: boolean;
 }
 
 /**
- * Run enabled category checks; return true if any category triggers blur (BR-01).
+ * Run nudity-only /analyze-image check (blur uses detected + confidence only).
  *
  * @param frame - JPEG blob from the content script.
  * @param settings - User settings from storage.
- * @returns True when any enabled category exceeds the BR-01 threshold.
+ * @returns Nudity model outcome for blurDecision.
  */
 export async function analyzeFrameAgainstEnabledCategories(
   frame: Blob,
   settings: SafeViewSettings,
   signal?: AbortSignal
 ): Promise<FrameAnalysisOutcome | null> {
-  const categories = getEnabledCategories(settings);
-
-  if (categories.length === 0) {
+  if (!isNudityProtectionActive(settings)) {
     return {
       label: "SFW",
       score: 0,
-      categories,
+      categories: [],
       nudityDetected: null,
       nudityAction: null,
       backendTrusted: true,
+      modelLoaded: true,
     };
   }
 
-  let nudityScore = 0;
-  let nudityLabel: BlurLabel = "SFW";
-  let nudityDetected: boolean | null = null;
-  let nudityAction: string | null = null;
+  const result = await analyzeImage(frame, settings.sensitivity, "nudity", signal);
 
-  for (const category of categories) {
-    const result = await analyzeImage(
-      frame,
-      settings.sensitivity,
-      category,
-      signal
-    );
-
-    if (result === null) {
-      return {
-        label: "SFW",
-        score: 0,
-        categories,
-        nudityDetected: null,
-        nudityAction: null,
-        backendTrusted: false,
-      };
-    }
-
-    if (!result.backendOnline || result.fromFallback) {
-      return {
-        label: "SFW",
-        score: 0,
-        categories,
-        nudityDetected,
-        nudityAction,
-        backendTrusted: false,
-      };
-    }
-
-    if (category === "nudity") {
-      nudityScore = result.response.confidence;
-      nudityLabel = normalizeBlurLabel(result.response.label, nudityScore);
-      nudityDetected = result.response.detected;
-      nudityAction = result.response.action;
-    }
+  if (result === null) {
+    return {
+      label: "SFW",
+      score: 0,
+      categories: ["nudity"],
+      nudityDetected: null,
+      nudityAction: null,
+      backendTrusted: false,
+      modelLoaded: false,
+    };
   }
+
+  if (!result.backendOnline || result.fromFallback) {
+    return {
+      label: "SFW",
+      score: 0,
+      categories: ["nudity"],
+      nudityDetected: null,
+      nudityAction: null,
+      backendTrusted: false,
+      modelLoaded: false,
+    };
+  }
+
+  const nudityScore = result.response.confidence;
+  const nudityLabel = normalizeBlurLabel(result.response.label, nudityScore);
 
   return {
     label: nudityLabel,
     score: nudityScore,
-    categories,
-    nudityDetected,
-    nudityAction,
+    categories: ["nudity"],
+    nudityDetected: result.response.detected,
+    nudityAction: result.response.action,
     backendTrusted: true,
+    modelLoaded: Boolean(result.response.model_loaded),
   };
 }
 
@@ -605,12 +582,12 @@ function resetFramePipelineForVideo(tabId: number, videoId: number): void {
 
   pipeline.abortController?.abort();
   pipeline.generation += 1;
-  pipeline.lastUnsafe = false;
+  pipeline.unsafeSeen = false;
   pipeline.lastProcessedFrameSeq = 0;
   pipeline.latestRequestId = 0;
   pipeline.firstDecisionMade = false;
   pipeline.safeStreak = 0;
-  pipeline.uncertainStreak = 0;
+  pipeline.unsafeLockUntil = 0;
   pipeline.pendingSample = null;
   pipeline.analysisInFlight = false;
   pipeline.abortController = null;
@@ -648,13 +625,17 @@ function resetFramePipelineForTab(tabId: number): number[] {
 async function sendFrameAnalysisDone(
   tabId: number,
   videoId: number,
-  requestId: number | undefined
+  requestId: number | undefined,
+  decision: string,
+  reason: string
 ): Promise<void> {
   try {
     await chrome.tabs.sendMessage(tabId, {
       action: MESSAGE_ACTION_FRAME_ANALYSIS_DONE,
       videoId,
       requestId,
+      decision,
+      reason,
     });
   } catch {
     /* Tab may have navigated away. */
@@ -678,9 +659,20 @@ async function processFrameSample(
   pipeline.abortController = abortController;
 
   const requestId = message.requestId ?? 0;
+  let analysisDecision = "HOLD";
+  let analysisReason = "pending";
+
   if (requestId > 0 && requestId < pipeline.latestRequestId) {
+    await sendFrameAnalysisDone(
+      tabId,
+      message.videoId,
+      requestId,
+      "DROP",
+      "stale_request"
+    );
     return;
   }
+
   if (requestId > 0) {
     pipeline.latestRequestId = requestId;
   }
@@ -691,156 +683,193 @@ async function processFrameSample(
 
   if (!frame) {
     console.warn("[SafeView] FRAME_SAMPLE ignored — invalid frame buffer.");
-  } else if (!settings.protectionEnabled) {
+    await sendFrameAnalysisDone(
+      tabId,
+      message.videoId,
+      requestId,
+      "HOLD",
+      "invalid_frame"
+    );
+    return;
+  }
+
+  if (!settings.protectionEnabled) {
     framePipelineState.delete(optimisticStateKey(tabId, message.videoId));
     await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId);
-  } else {
-    try {
-      const inferenceStarted = Date.now();
-      const outcome = await analyzeFrameAgainstEnabledCategories(
-        frame,
-        settings,
-        abortController.signal
+    await sendFrameAnalysisDone(
+      tabId,
+      message.videoId,
+      requestId,
+      "CLEAR",
+      "protection_off"
+    );
+    return;
+  }
+
+  try {
+    const inferenceStarted = Date.now();
+    const outcome = await analyzeFrameAgainstEnabledCategories(
+      frame,
+      settings,
+      abortController.signal
+    );
+
+    if (generationAtStart !== pipeline.generation) {
+      await sendFrameAnalysisDone(
+        tabId,
+        message.videoId,
+        requestId,
+        "DROP",
+        "stale_gen"
       );
+      return;
+    }
 
-      if (generationAtStart !== pipeline.generation) {
-        return;
-      }
+    const backendDoneAt = Date.now();
+    const inferenceMs = backendDoneAt - inferenceStarted;
+    const frameSeq = message.frameSeq ?? 0;
+    const nowMs = Date.now();
 
-      const backendDoneAt = Date.now();
-      const inferenceMs = backendDoneAt - inferenceStarted;
+    const evaluation = evaluateBlurState({
+      score: outcome.score,
+      nudityDetected: outcome.nudityDetected === true,
+      frameSeq,
+      lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
+      resultGeneration: generationAtStart,
+      currentGeneration: pipeline.generation,
+      backendTrusted: outcome.backendTrusted,
+      modelLoaded: outcome.modelLoaded,
+      requestId,
+      latestRequestId: pipeline.latestRequestId,
+      unsafeSeen: pipeline.unsafeSeen,
+      firstDecisionMade: pipeline.firstDecisionMade,
+      safeStreak: pipeline.safeStreak,
+      unsafeLockUntil: pipeline.unsafeLockUntil,
+      nowMs,
+    });
 
-      const threshold = effectiveThreshold(settings.sensitivity);
-      const frameSeq = message.frameSeq ?? 0;
+    logBlurEvaluation(evaluation, {
+      label: outcome.label,
+      score: outcome.score,
+      nudityDetected: outcome.nudityDetected === true,
+      frame: frameSeq,
+      gen: generationAtStart,
+      currentGen: pipeline.generation,
+    });
 
-      const evaluation = evaluateBlurState({
-        label: outcome.label,
-        score: outcome.score,
-        threshold,
-        frameSeq,
-        lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
-        resultGeneration: generationAtStart,
-        currentGeneration: pipeline.generation,
-        analysisInFlight: false,
-        lastUnsafe: pipeline.lastUnsafe,
-        backendTrusted: outcome.backendTrusted,
+    analysisDecision = evaluation.action;
+    analysisReason = evaluation.reason;
+
+    if (evaluation.action === "DROP") {
+      await sendFrameAnalysisDone(
+        tabId,
+        message.videoId,
+        requestId,
+        analysisDecision,
+        analysisReason
+      );
+      return;
+    }
+
+    const updates = applyBlurStateUpdates(
+      {
+        unsafeSeen: pipeline.unsafeSeen,
         firstDecisionMade: pipeline.firstDecisionMade,
         safeStreak: pipeline.safeStreak,
-        uncertainStreak: pipeline.uncertainStreak,
-        nudityDetected: outcome.nudityDetected === true,
-      });
+        unsafeLockUntil: pipeline.unsafeLockUntil,
+        nowMs,
+      },
+      evaluation
+    );
+    pipeline.unsafeSeen = updates.unsafeSeen;
+    pipeline.firstDecisionMade = updates.firstDecisionMade;
+    pipeline.safeStreak = updates.safeStreak;
+    pipeline.unsafeLockUntil = updates.unsafeLockUntil;
 
-      logBlurEvaluation(evaluation, {
-        label: outcome.label,
-        score: outcome.score,
-        frame: frameSeq,
-        gen: generationAtStart,
-        currentGen: pipeline.generation,
-      });
+    if (evaluation.action === "HOLD") {
+      await sendFrameAnalysisDone(
+        tabId,
+        message.videoId,
+        requestId,
+        analysisDecision,
+        analysisReason
+      );
+      return;
+    }
 
-      if (evaluation.action === "DROP") {
-        return;
-      }
+    pipeline.lastProcessedFrameSeq = frameSeq;
 
-      if (evaluation.action === "HOLD") {
-        if (evaluation.reason === "building_safe_streak") {
-          pipeline.safeStreak += 1;
-        } else if (evaluation.reason === "uncertain") {
-          pipeline.uncertainStreak += 1;
-        }
-        return;
-      }
+    const extensionVersion = chrome.runtime.getManifest().version;
+    const contentBuild = message.contentBuild ?? "unknown";
+    const contentStale = contentBuild !== extensionVersion;
 
-      pipeline.firstDecisionMade = true;
+    if (contentStale && evaluation.action === "BLUR") {
+      console.warn(
+        "[SafeView] Tab content script is stale (content %s, extension %s). Reload the YouTube tab after updating the extension.",
+        contentBuild,
+        extensionVersion
+      );
+    }
 
-      const extensionVersion = chrome.runtime.getManifest().version;
-      const contentBuild = message.contentBuild ?? "unknown";
-      const contentStale = contentBuild !== extensionVersion;
+    const trace = {
+      capturedAt: message.capturedAt,
+      sentAt: message.sentAt,
+      swReceivedAt,
+      backendDoneAt,
+    };
 
-      if (contentStale && evaluation.action === "BLUR") {
-        console.warn(
-          "[SafeView] Tab content script is stale (content %s, extension %s). Reload the YouTube tab after updating the extension.",
-          contentBuild,
-          extensionVersion
-        );
-      }
-
-      if (
-        evaluation.action === "CLEAR" &&
-        outcome.label === "NSFW" &&
-        outcome.score >= CONFIDENCE_FLOOR &&
-        outcome.score < threshold
-      ) {
-        const now = Date.now();
-        if (now - lastThresholdHintAt >= THRESHOLD_HINT_INTERVAL_MS) {
-          lastThresholdHintAt = now;
-          console.info(
-            "[SafeView] Nudity score %.2f is below your sensitivity threshold %.2f — set sensitivity to Medium in extension options to blur at ≥75%%.",
-            outcome.score,
-            threshold
-          );
-        }
-      }
-
-      pipeline.lastProcessedFrameSeq = frameSeq;
-
-      const trace = {
-        capturedAt: message.capturedAt,
-        sentAt: message.sentAt,
+    if (evaluation.action === "BLUR") {
+      logPipelineLatency(
+        tabId,
+        message.videoId,
+        message,
         swReceivedAt,
         backendDoneAt,
-      };
-
-      if (evaluation.action === "BLUR") {
-        pipeline.lastUnsafe = true;
-        pipeline.safeStreak = 0;
-        pipeline.uncertainStreak = 0;
-        logPipelineLatency(
-          tabId,
-          message.videoId,
-          message,
-          swReceivedAt,
-          backendDoneAt,
-          MESSAGE_ACTION_BLUR,
-          inferenceMs
-        );
-        await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, trace);
-      } else {
-        pipeline.lastUnsafe = false;
-        pipeline.safeStreak = 0;
-        pipeline.uncertainStreak = 0;
-        logPipelineLatency(
-          tabId,
-          message.videoId,
-          message,
-          swReceivedAt,
-          backendDoneAt,
-          MESSAGE_ACTION_CLEAR,
-          inferenceMs
-        );
-        await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId, trace);
-      }
-    } catch (error) {
-      if (isAbortError(error)) {
-        return;
-      }
-
-      console.error(
-        "[SafeView] Frame handling failed — keeping blur (fail closed):",
-        error
+        MESSAGE_ACTION_BLUR,
+        inferenceMs
       );
+      await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, trace);
+    } else {
+      logPipelineLatency(
+        tabId,
+        message.videoId,
+        message,
+        swReceivedAt,
+        backendDoneAt,
+        MESSAGE_ACTION_CLEAR,
+        inferenceMs
+      );
+      await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId, trace);
+    }
+  } catch (error) {
+    if (isAbortError(error)) {
+      return;
+    }
 
-      if (generationAtStart !== pipeline.generation) {
-        return;
-      }
-    } finally {
-      if (pipeline.abortController === abortController) {
-        pipeline.abortController = null;
-      }
+    console.error(
+      "[SafeView] Frame handling failed — keeping blur (fail closed):",
+      error
+    );
+
+    if (generationAtStart !== pipeline.generation) {
+      return;
+    }
+
+    analysisDecision = "HOLD";
+    analysisReason = "backend_error";
+  } finally {
+    if (pipeline.abortController === abortController) {
+      pipeline.abortController = null;
     }
   }
 
-  await sendFrameAnalysisDone(tabId, message.videoId, requestId);
+  await sendFrameAnalysisDone(
+    tabId,
+    message.videoId,
+    requestId,
+    analysisDecision,
+    analysisReason
+  );
 }
 
 /**
@@ -1622,6 +1651,6 @@ setupTabActivationListener();
 setupPipelineTabNavigationListener();
 
 console.info(
-  "[SafeView] Service worker loaded (v%s, label-gated blur).",
+  "[SafeView] Service worker loaded (v%s, nudity-only blur).",
   chrome.runtime.getManifest().version
 );

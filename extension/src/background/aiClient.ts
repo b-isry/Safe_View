@@ -56,6 +56,8 @@ export interface BackendStatus {
   online: boolean;
   lastCheckedAt: number;
   lastError?: string;
+  /** From GET /health — false when nudity weights are not loaded. */
+  modelLoaded?: boolean;
 }
 
 /** chrome.storage.local key for backend online/offline status. */
@@ -125,11 +127,15 @@ async function markBackendOffline(errorMessage?: string): Promise<void> {
 
 /**
  * Mark backend online after a successful request.
+ *
+ * @param modelLoaded - From GET /health model_loaded when known.
  */
-async function markBackendOnline(): Promise<void> {
+async function markBackendOnline(modelLoaded?: boolean): Promise<void> {
   await persistBackendStatus({
     online: true,
     lastCheckedAt: Date.now(),
+    modelLoaded:
+      typeof modelLoaded === "boolean" ? modelLoaded : cachedBackendStatus.modelLoaded,
   });
 }
 
@@ -549,11 +555,14 @@ export async function checkBackendHealthAt(
       return false;
     }
 
-    const body = (await response.json()) as { status?: string };
+    const body = (await response.json()) as {
+      status?: string;
+      model_loaded?: boolean;
+    };
 
     if (body.status === "ok") {
       if (updateStatusFlag) {
-        await markBackendOnline();
+        await markBackendOnline(body.model_loaded);
       }
       return true;
     }
@@ -594,6 +603,7 @@ export async function loadBackendStatusFromStorage(): Promise<BackendStatus> {
         online: raw.online,
         lastCheckedAt: raw.lastCheckedAt ?? 0,
         lastError: raw.lastError,
+        modelLoaded: raw.modelLoaded,
       };
     }
   } catch (error) {
