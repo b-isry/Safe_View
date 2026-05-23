@@ -183,7 +183,7 @@ describe("blurManager", () => {
     stopVideoMonitor();
   });
 
-  it("blurs the largest visible video when multiple players exist", () => {
+  it("routes blur commands to the largest visible primary video", () => {
     jest.useFakeTimers();
     const videoA = document.createElement("video");
     const videoB = document.createElement("video");
@@ -198,7 +198,7 @@ describe("blurManager", () => {
     applyBlur(idB!);
 
     expect(readVideoFilter(videoA)).toBe(BLUR_FILTER);
-    expect(readVideoFilter(videoB)).toBe(BLUR_FILTER);
+    expect(readVideoFilter(videoB)).toBe("");
 
     clearBlur(idB!);
     jest.useRealTimers();
@@ -252,11 +252,14 @@ describe("blurManager", () => {
     document.body.appendChild(video);
     startVideoMonitor();
 
+    expect(readVideoFilter(video)).toBe(BLUR_FILTER);
+
     applyBlur(999);
     expect(readVideoFilter(video)).toBe(BLUR_FILTER);
 
     const videoId = getVideoTrackState(video)?.videoId;
     applyBlur(videoId!);
+    expect(readVideoFilter(video)).toBe(BLUR_FILTER);
     video.remove();
     applyBlur(videoId!);
     expect(isVideoBlurred(video)).toBe(false);

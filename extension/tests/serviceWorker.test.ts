@@ -20,17 +20,19 @@ jest.mock("../src/background/aiClient", () => ({
 
 const mockGetCachedSettings = jest.fn();
 
-jest.mock("../src/background/businessRules", () => ({
-  loadSettings: (...args: unknown[]) => mockLoadSettings(...args),
-  getCachedSettings: () => mockGetCachedSettings(),
-  initSettingsCache: jest.fn().mockResolvedValue(undefined),
-  getEnabledCategories: (...args: unknown[]) => mockGetEnabledCategories(...args),
-  shouldBlur: jest.requireActual("../src/background/businessRules").shouldBlur,
-  effectiveThreshold: jest.requireActual("../src/background/businessRules")
-    .effectiveThreshold,
-  CONFIDENCE_FLOOR: jest.requireActual("../src/background/businessRules")
-    .CONFIDENCE_FLOOR,
-}));
+jest.mock("../src/background/businessRules", () => {
+  const actual = jest.requireActual("../src/background/businessRules") as Record<
+    string,
+    unknown
+  >;
+  return {
+    ...actual,
+    loadSettings: (...args: unknown[]) => mockLoadSettings(...args),
+    getCachedSettings: () => mockGetCachedSettings(),
+    initSettingsCache: jest.fn().mockResolvedValue(undefined),
+    getEnabledCategories: (...args: unknown[]) => mockGetEnabledCategories(...args),
+  };
+});
 
 Object.defineProperty(globalThis, "chrome", {
   value: {
@@ -77,6 +79,7 @@ const framePayload = {
 describe("serviceWorker", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockAnalyzeImage.mockReset();
     mockLoadSettings.mockResolvedValue(defaultSettings);
     mockGetCachedSettings.mockReturnValue(defaultSettings);
     mockGetEnabledCategories.mockReturnValue(["nudity"]);
@@ -112,7 +115,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("does not blur high score when label is SFW", async () => {
+  it("sends BLUR for high suspicious score even when nudity not detected", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -126,22 +129,16 @@ describe("serviceWorker", () => {
       fromFallback: false,
     });
 
-    const { handleFrameSample, MESSAGE_ACTION_BLUR, MESSAGE_ACTION_CLEAR } =
-      await import("../src/background/serviceWorker");
+    const { handleFrameSample, MESSAGE_ACTION_BLUR } = await import(
+      "../src/background/serviceWorker"
+    );
 
     await handleFrameSample(framePayload, 7);
 
-    expect(tabsSendMessage).not.toHaveBeenCalledWith(
-      7,
-      expect.objectContaining({
-        action: MESSAGE_ACTION_BLUR,
-        videoId: 1,
-      })
-    );
     expect(tabsSendMessage).toHaveBeenCalledWith(
       7,
       expect.objectContaining({
-        action: MESSAGE_ACTION_CLEAR,
+        action: MESSAGE_ACTION_BLUR,
         videoId: 1,
       })
     );
@@ -176,12 +173,12 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("HOLDs uncertain score in the safe/unsafe band (0.50–0.65)", async () => {
+  it("BLURs suspicious score in the uncertain band", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: false,
-        confidence: 0.55,
+        confidence: 0.65,
         action: "ALLOW",
         label: "NSFW",
         model_loaded: true,
@@ -190,33 +187,27 @@ describe("serviceWorker", () => {
       fromFallback: false,
     });
 
-    const { handleFrameSample, MESSAGE_ACTION_BLUR, MESSAGE_ACTION_CLEAR } =
-      await import("../src/background/serviceWorker");
+    const { handleFrameSample, MESSAGE_ACTION_BLUR } = await import(
+      "../src/background/serviceWorker"
+    );
 
     await handleFrameSample(framePayload, 7);
 
-    expect(tabsSendMessage).not.toHaveBeenCalledWith(
+    expect(tabsSendMessage).toHaveBeenCalledWith(
       7,
       expect.objectContaining({
         action: MESSAGE_ACTION_BLUR,
         videoId: 1,
       })
     );
-    expect(tabsSendMessage).not.toHaveBeenCalledWith(
-      7,
-      expect.objectContaining({
-        action: MESSAGE_ACTION_CLEAR,
-        videoId: 1,
-      })
-    );
   });
 
-  it("blurs when nudity detected at or above unsafe threshold (0.65)", async () => {
+  it("blurs when nudity detected at or above unsafe threshold (0.72)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: true,
-        confidence: 0.7,
+        confidence: 0.75,
         action: "BLUR",
         label: "NSFW",
         model_loaded: true,
@@ -240,12 +231,65 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("sends CLEAR on first SFW frame", async () => {
+  it("re-blurs when unsafe appears after a prior safe result", async () => {
+    mockAnalyzeImage
+      .mockResolvedValueOnce({
+        response: {
+          category: "nudity",
+          detected: false,
+          confidence: 0.2,
+          action: "ALLOW",
+          label: "SFW",
+          model_loaded: true,
+        },
+        backendOnline: true,
+        fromFallback: false,
+      })
+      .mockResolvedValueOnce({
+        response: {
+          category: "nudity",
+          detected: true,
+          confidence: 0.8,
+          action: "BLUR",
+          label: "NSFW",
+          model_loaded: true,
+        },
+        backendOnline: true,
+        fromFallback: false,
+      });
+
+    const { handleFrameSample, MESSAGE_ACTION_BLUR, MESSAGE_ACTION_CLEAR } =
+      await import("../src/background/serviceWorker");
+
+    await handleFrameSample({ ...framePayload, videoId: 50, requestId: 1 }, 7);
+    expect(tabsSendMessage).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_CLEAR,
+        videoId: 50,
+      })
+    );
+
+    tabsSendMessage.mockClear();
+    await handleFrameSample(
+      { ...framePayload, videoId: 50, requestId: 2, frameSeq: 2 },
+      7
+    );
+    expect(tabsSendMessage).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_BLUR,
+        videoId: 50,
+      })
+    );
+  });
+
+  it("sends CLEAR on first clearly safe frame (confidence < 0.50)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: false,
-        confidence: 0.5,
+        confidence: 0.4,
         action: "ALLOW",
         label: "SFW",
         model_loaded: true,
