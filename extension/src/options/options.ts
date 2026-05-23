@@ -16,6 +16,7 @@ import {
   type CategoryToggles,
   type SafeViewSettings,
 } from "../background/businessRules";
+import { notifySettingsUpdated } from "../shared/settingsMessages";
 
 /** Category checkbox metadata for the options UI. */
 const CATEGORY_FIELDS: { key: keyof CategoryToggles; label: string }[] = [
@@ -123,9 +124,9 @@ function showSavedStatus(): void {
  * Persist current in-memory settings immediately (BR-04).
  */
 async function persistSettings(): Promise<void> {
-  currentSettings.categories.nudity = true;
   await saveSettings(currentSettings);
   showSavedStatus();
+  await notifySettingsUpdated("options_save");
 }
 
 /**

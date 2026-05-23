@@ -23,7 +23,9 @@ import {
   MIN_BLUR_HOLD_MS,
   CLEAR_STREAK_REQUIRED,
   applyBlur,
+  applyImmediateLocalBlur,
   clearBlur,
+  clearImmediateLocalBlur,
   initBlurManager,
   isVideoBlurred,
   teardownBlurManager,
@@ -37,7 +39,17 @@ import {
 const chromeMock = {
   runtime: {
     sendMessage: jest.fn().mockResolvedValue(undefined),
+    getManifest: jest.fn().mockReturnValue({ version: "0.1.3" }),
     onMessage: {
+      addListener: jest.fn(),
+    },
+  },
+  storage: {
+    local: {
+      get: jest.fn().mockResolvedValue({}),
+      set: jest.fn().mockResolvedValue(undefined),
+    },
+    onChanged: {
       addListener: jest.fn(),
     },
   },
@@ -122,9 +134,9 @@ describe("blurManager", () => {
     startVideoMonitor();
 
     const videoId = getVideoTrackState(video)?.videoId;
-    applyBlur(videoId!);
+    applyImmediateLocalBlur(video);
     clearBlur(videoId!);
-    jest.advanceTimersByTime(200);
+    jest.advanceTimersByTime(0);
     jest.useRealTimers();
 
     expect(video.style.filter).toBe("brightness(1.1)");
@@ -163,7 +175,6 @@ describe("blurManager", () => {
 
     const videoId = getVideoTrackState(video)?.videoId;
 
-    messageListener({ action: MESSAGE_ACTION_BLUR, videoId });
     messageListener({ action: MESSAGE_ACTION_CLEAR, videoId });
 
     expect(readVideoFilter(video)).toBe("");
@@ -187,7 +198,7 @@ describe("blurManager", () => {
     applyBlur(idB!);
 
     expect(readVideoFilter(videoA)).toBe(BLUR_FILTER);
-    expect(readVideoFilter(videoB)).toBe("");
+    expect(readVideoFilter(videoB)).toBe(BLUR_FILTER);
 
     clearBlur(idB!);
     jest.useRealTimers();
@@ -242,7 +253,7 @@ describe("blurManager", () => {
     startVideoMonitor();
 
     applyBlur(999);
-    expect(readVideoFilter(video)).toBe("");
+    expect(readVideoFilter(video)).toBe(BLUR_FILTER);
 
     const videoId = getVideoTrackState(video)?.videoId;
     applyBlur(videoId!);

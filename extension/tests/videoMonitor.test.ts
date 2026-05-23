@@ -53,6 +53,18 @@ const chromeMock = {
   runtime: {
     sendMessage: jest.fn().mockResolvedValue(undefined),
     getManifest: jest.fn().mockReturnValue({ version: "0.1.3" }),
+    onMessage: {
+      addListener: jest.fn(),
+    },
+  },
+  storage: {
+    local: {
+      get: jest.fn().mockResolvedValue({}),
+      set: jest.fn().mockResolvedValue(undefined),
+    },
+    onChanged: {
+      addListener: jest.fn(),
+    },
   },
 };
 
@@ -75,8 +87,8 @@ describe("videoMonitor", () => {
     stopVideoMonitor();
   });
 
-  it("exposes 100 ms active sample interval constant", () => {
-    expect(SAMPLE_INTERVAL_MS).toBe(100);
+  it("exposes 40 ms active sample interval constant", () => {
+    expect(SAMPLE_INTERVAL_MS).toBe(40);
   });
 
   it("finds a <video> element after DOM insertion", async () => {
@@ -286,7 +298,7 @@ describe("videoMonitor", () => {
     expect(toBlob).toHaveBeenCalledWith(
       expect.any(Function),
       "image/jpeg",
-      0.65
+      0.45
     );
     expect(createdCanvas?.width).toBe(0);
     expect(createdCanvas?.height).toBe(0);

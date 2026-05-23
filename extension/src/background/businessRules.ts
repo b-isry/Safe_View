@@ -206,20 +206,22 @@ export function getEnabledCategories(settings: SafeViewSettings): string[] {
   }
 
   const activeSet = new Set<string>(ACTIVE_MODEL_CATEGORIES);
-  const enabled = (Object.keys(settings.categories) as (keyof CategoryToggles)[]).filter(
+  return (Object.keys(settings.categories) as (keyof CategoryToggles)[]).filter(
     (key) => settings.categories[key] && activeSet.has(key)
   );
+}
 
-  if (enabled.length > 0) {
-    return enabled;
-  }
-
-  // Strict mode: nudity inference stays on while protection is enabled.
-  if (activeSet.has("nudity")) {
-    return ["nudity"];
-  }
-
-  return enabled;
+/**
+ * True when nudity full-video protection should run on the active page.
+ *
+ * @param settings - Resolved SafeView settings.
+ */
+export function isNudityProtectionActive(settings: SafeViewSettings): boolean {
+  return (
+    settings.protectionEnabled &&
+    settings.categories.nudity &&
+    getEnabledCategories(settings).includes("nudity")
+  );
 }
 
 /**

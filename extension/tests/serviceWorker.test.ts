@@ -147,13 +147,14 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("does not blur when score is below model floor (0.65)", async () => {
+  it("does not blur when score is below suspicious floor (0.50)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: false,
-        confidence: 0.5,
+        confidence: 0.45,
         action: "ALLOW",
+        label: "SFW",
         model_loaded: true,
       },
       backendOnline: true,
@@ -167,6 +168,70 @@ describe("serviceWorker", () => {
     await handleFrameSample(framePayload, 7);
 
     expect(tabsSendMessage).not.toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_BLUR,
+        videoId: 1,
+      })
+    );
+  });
+
+  it("HOLDs uncertain score in the safe/unsafe band (0.50–0.65)", async () => {
+    mockAnalyzeImage.mockResolvedValue({
+      response: {
+        category: "nudity",
+        detected: false,
+        confidence: 0.55,
+        action: "ALLOW",
+        label: "NSFW",
+        model_loaded: true,
+      },
+      backendOnline: true,
+      fromFallback: false,
+    });
+
+    const { handleFrameSample, MESSAGE_ACTION_BLUR, MESSAGE_ACTION_CLEAR } =
+      await import("../src/background/serviceWorker");
+
+    await handleFrameSample(framePayload, 7);
+
+    expect(tabsSendMessage).not.toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_BLUR,
+        videoId: 1,
+      })
+    );
+    expect(tabsSendMessage).not.toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_CLEAR,
+        videoId: 1,
+      })
+    );
+  });
+
+  it("blurs when nudity detected at or above unsafe threshold (0.65)", async () => {
+    mockAnalyzeImage.mockResolvedValue({
+      response: {
+        category: "nudity",
+        detected: true,
+        confidence: 0.7,
+        action: "BLUR",
+        label: "NSFW",
+        model_loaded: true,
+      },
+      backendOnline: true,
+      fromFallback: false,
+    });
+
+    const { handleFrameSample, MESSAGE_ACTION_BLUR } = await import(
+      "../src/background/serviceWorker"
+    );
+
+    await handleFrameSample(framePayload, 7);
+
+    expect(tabsSendMessage).toHaveBeenCalledWith(
       7,
       expect.objectContaining({
         action: MESSAGE_ACTION_BLUR,
@@ -202,7 +267,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("sends CLEAR when backend is offline (fail open)", async () => {
+  it("keeps blur when backend is offline (fail closed)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -220,7 +285,7 @@ describe("serviceWorker", () => {
     );
     await handleFrameSample({ ...framePayload, videoId: 2 }, 5);
 
-    expect(tabsSendMessage).toHaveBeenCalledWith(
+    expect(tabsSendMessage).not.toHaveBeenCalledWith(
       5,
       expect.objectContaining({
         action: MESSAGE_ACTION_CLEAR,
