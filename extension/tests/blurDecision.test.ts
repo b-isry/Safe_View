@@ -13,37 +13,93 @@ const baseState = {
   currentGeneration: 3,
   analysisInFlight: false,
   lastUnsafe: false,
+  backendTrusted: true,
+  firstDecisionMade: false,
+  safeStreak: 0,
+  uncertainStreak: 0,
+  nudityDetected: false,
 };
 
 describe("blurDecision", () => {
-  it("BLUR only when label is NSFW and score meets threshold", () => {
+  it("BLUR when nudity detected and score meets unsafe threshold", () => {
     expect(
       evaluateBlurState({
         ...baseState,
         label: "NSFW",
         score: 0.82,
+        nudityDetected: true,
       })
-    ).toEqual({ action: "BLUR", reason: "NSFW_confirmed" });
+    ).toEqual({ action: "BLUR", reason: "unsafe" });
   });
 
-  it("CLEAR immediately for SFW regardless of score", () => {
-    expect(
-      evaluateBlurState({
-        ...baseState,
-        label: "SFW",
-        score: 0.95,
-      })
-    ).toEqual({ action: "CLEAR", reason: "SFW" });
-  });
-
-  it("CLEAR when NSFW score is below threshold", () => {
+  it("HOLD in uncertain band on first frame", () => {
     expect(
       evaluateBlurState({
         ...baseState,
         label: "NSFW",
-        score: 0.31,
+        score: 0.55,
+        nudityDetected: false,
       })
-    ).toEqual({ action: "CLEAR", reason: "NSFW_below_threshold" });
+    ).toEqual({ action: "HOLD", reason: "uncertain" });
+  });
+
+  it("CLEAR after uncertain band persists without high nudity", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        label: "NSFW",
+        score: 0.55,
+        uncertainStreak: 1,
+        nudityDetected: false,
+      })
+    ).toEqual({ action: "CLEAR", reason: "uncertain_cleared" });
+  });
+
+  it("CLEAR immediately on first safe frame", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        label: "SFW",
+        score: 0.4,
+      })
+    ).toEqual({ action: "CLEAR", reason: "safe" });
+  });
+
+  it("HOLD first safe frame after prior unsafe until streak met", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        label: "SFW",
+        score: 0.2,
+        lastUnsafe: true,
+        firstDecisionMade: true,
+        safeStreak: 0,
+      })
+    ).toEqual({ action: "HOLD", reason: "building_safe_streak" });
+  });
+
+  it("CLEAR after safe streak following unsafe", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        label: "SFW",
+        score: 0.2,
+        lastUnsafe: true,
+        firstDecisionMade: true,
+        safeStreak: 1,
+      })
+    ).toEqual({ action: "CLEAR", reason: "safe_after_unsafe" });
+  });
+
+  it("HOLD when backend is untrusted (fail closed)", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        label: "SFW",
+        score: 0.1,
+        backendTrusted: false,
+      })
+    ).toEqual({ action: "HOLD", reason: "backend_untrusted" });
   });
 
   it("DROP stale generation", () => {
@@ -52,22 +108,11 @@ describe("blurDecision", () => {
         ...baseState,
         label: "NSFW",
         score: 0.9,
+        nudityDetected: true,
         resultGeneration: 2,
         currentGeneration: 3,
       })
     ).toEqual({ action: "DROP", reason: "stale_gen" });
-  });
-
-  it("DROP stale frame sequence", () => {
-    expect(
-      evaluateBlurState({
-        ...baseState,
-        label: "SFW",
-        score: 0.1,
-        frameSeq: 5,
-        lastProcessedFrameSeq: 8,
-      })
-    ).toEqual({ action: "DROP", reason: "stale_frame" });
   });
 
   it("normalizes label from backend string", () => {

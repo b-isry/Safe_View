@@ -18,6 +18,7 @@ import {
   SETTINGS_STORAGE_KEY,
   type SafeViewSettings,
 } from "../background/businessRules";
+import { notifySettingsUpdated } from "../shared/settingsMessages";
 
 /** Visual status for the popup indicator dot. */
 type StatusDotState = "green" | "red" | "grey";
@@ -190,6 +191,7 @@ async function handleProtectionToggle(): Promise<void> {
     } else {
       settings.protectionEnabled = false;
       await saveSettings(settings);
+      await notifySettingsUpdated("protection_off");
     }
 
     await refreshPopup(false);

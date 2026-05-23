@@ -72,8 +72,6 @@ def _purge_tensor(tensor: torch.Tensor) -> None:
         tensor: Tensor to delete from memory.
     """
     del tensor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def _confidence_from_logits(logits: torch.Tensor) -> float:
@@ -127,7 +125,7 @@ def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
         model.eval()
 
         forward_started = time.perf_counter()
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = model(tensor)
             confidence = _confidence_from_logits(logits)
             label = (

@@ -5,26 +5,38 @@
 // CSP-safe: native DOM only — no injected <script> tags or page-context hooks.
 
 import {
+  isNudityProtectionActive,
+  loadSettings,
+  SETTINGS_STORAGE_KEY,
+  type SafeViewSettings,
+} from "../background/businessRules";
+import { MESSAGE_ACTION_SETTINGS_UPDATED } from "../shared/settingsMessages";
+import {
   onVideoTrackedForSpeakerSuppression,
   prepareVideoCrossOrigin,
   startSubtitleMonitor,
   stopSubtitleMonitor,
 } from "./audioMonitor";
 import {
+  applyImmediateLocalBlur,
+  clearAllFullVideoBlurs,
+} from "./fullVideoBlur";
+import {
   onYouTubeWatchIdBoundary,
   seedYouTubeWatchVideoId,
 } from "./pipelineNavigation";
-/** Active visible tab: ~10 FPS sampling gate. */
-export const SAMPLE_INTERVAL_ACTIVE_MS = 100;
+
+/** Active visible tab: ~25 FPS sampling gate. */
+export const SAMPLE_INTERVAL_MS = 40;
+
+/** @deprecated Alias for SAMPLE_INTERVAL_MS — kept for tests/imports. */
+export const SAMPLE_INTERVAL_ACTIVE_MS = SAMPLE_INTERVAL_MS;
 
 /** Paused video: lower sampling rate. */
 export const SAMPLE_INTERVAL_PAUSED_MS = 2000;
 
 /** Hidden document tab: lower sampling rate. */
 export const SAMPLE_INTERVAL_HIDDEN_MS = 2000;
-
-/** @deprecated Use SAMPLE_INTERVAL_ACTIVE_MS — kept for tests/imports. */
-export const SAMPLE_INTERVAL_MS = SAMPLE_INTERVAL_ACTIVE_MS;
 
 /** Warn when JPEG encode (or main-thread queue wait) exceeds this (ms). */
 export const ENCODE_STALL_WARN_MS = 200;
@@ -33,16 +45,31 @@ export const ENCODE_STALL_WARN_MS = 200;
 const JPEG_MIME_TYPE = "image/jpeg";
 
 /** JPEG quality for canvas.toBlob (model resizes to 224×224). */
-export const JPEG_QUALITY = 0.65;
+export const JPEG_QUALITY = 0.45;
 
 /** Max canvas width before JPEG encode (matches model input scale). */
-export const CAPTURE_MAX_WIDTH_PX = 256;
+export const CAPTURE_MAX_WIDTH_PX = 224;
+
+/** Delay before the first frame sample after registration (0 = immediate). */
+const FIRST_SAMPLE_DELAY_MS = 0;
+
+/** Retry interval when the first sample has no decoded frame yet (ms). */
+const FIRST_SAMPLE_RETRY_MS = 80;
+
+/** Mark in-flight analysis stale after this duration (ms). */
+const MAX_PENDING_ANALYSIS_MS = 1200;
+
+/** Keep blur when backend analysis exceeds this duration (ms). */
+const BACKEND_TIMEOUT_MS = 1000;
 
 /** Reject near-black frames (transitions, fades, failed decode). */
 const MIN_FRAME_LUMINANCE = 12;
 
 /** chrome.runtime message action sent to the service worker with a frame blob. */
 export const MESSAGE_ACTION_FRAME_SAMPLE = "FRAME_SAMPLE";
+
+/** Service worker → content script: one frame analysis cycle finished. */
+export const MESSAGE_ACTION_FRAME_ANALYSIS_DONE = "FRAME_ANALYSIS_DONE";
 
 /** Minimum layout size (px) for a video to count as the visible player. */
 const MIN_VISIBLE_LAYOUT_PX = 200;
@@ -58,6 +85,19 @@ let activeCaptureCount = 0;
 
 /** Video element currently allowed to run the capture loop (only one). */
 let primaryCaptureVideo: HTMLVideoElement | null = null;
+
+/**
+ * Per-video backend analysis tracking (frame queue protection).
+ */
+export type VideoAnalysisState = {
+  isAnalyzing: boolean;
+  lastAnalysisStartedAt: number;
+  requestId: number;
+  firstDecisionMade: boolean;
+  unsafeSeen: boolean;
+  safeStreak: number;
+  uncertainStreak: number;
+};
 
 /**
  * Per-video sampling state stored in the WeakMap.
@@ -83,6 +123,16 @@ export interface VideoTrackState {
   rvfcHandle: number | null;
   /** Reconcile capture target when decoded dimensions become available. */
   onMetadataLoaded: () => void;
+  /** Backend request gate and streak tracking. */
+  analysis: VideoAnalysisState;
+  /** True after first-sample listeners were attached. */
+  firstSampleScheduled: boolean;
+  /** Handler shared across first-sample media events. */
+  onFirstSampleReady: () => void;
+  /** Timeout handle for stale in-flight analysis. */
+  analysisTimeoutId: ReturnType<typeof setTimeout> | null;
+  /** Retry timer when the first sample has no frame data yet. */
+  firstSampleRetryId: ReturnType<typeof setTimeout> | null;
 }
 
 const trackedVideos = new WeakMap<HTMLVideoElement, VideoTrackState>();
@@ -91,6 +141,12 @@ const videoIdToElement = new Map<number, HTMLVideoElement>();
 let nextVideoId = 1;
 let observer: MutationObserver | null = null;
 let isMonitorRunning = false;
+let settingsStorageListenerRegistered = false;
+let runtimeMessageListenerRegistered = false;
+let spaNavigationHooked = false;
+
+/** Cached settings for synchronous gating in hot paths. */
+let cachedContentSettings: SafeViewSettings | null = null;
 
 /**
  * Diagnostic: count of in-flight canvas encodes (exported for tests).
@@ -134,6 +190,181 @@ export function getSampleIntervalMs(video: HTMLVideoElement): number {
 }
 
 /**
+ * Create default per-video backend analysis state.
+ */
+function createAnalysisState(): VideoAnalysisState {
+  return {
+    isAnalyzing: false,
+    lastAnalysisStartedAt: 0,
+    requestId: 0,
+    firstDecisionMade: false,
+    unsafeSeen: false,
+    safeStreak: 0,
+    uncertainStreak: 0,
+  };
+}
+
+/**
+ * True when the video element has decoded frame dimensions ready to capture.
+ */
+function canCaptureFrame(video: HTMLVideoElement): boolean {
+  return (
+    video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+    video.videoWidth > 0 &&
+    video.videoHeight > 0
+  );
+}
+
+/**
+ * True when the video is large enough and visibly on-screen (not a thumbnail/hidden ad).
+ */
+function isVideoVisibleInLayout(video: HTMLVideoElement): boolean {
+  if (!video.isConnected) {
+    return false;
+  }
+
+  const rect = video.getBoundingClientRect();
+  if (rect.width < MIN_VISIBLE_LAYOUT_PX || rect.height < MIN_VISIBLE_LAYOUT_PX) {
+    return false;
+  }
+
+  const style = window.getComputedStyle(video);
+  if (style.display === "none" || style.visibility === "hidden") {
+    return false;
+  }
+
+  if (parseFloat(style.opacity) <= 0) {
+    return false;
+  }
+
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  if (
+    rect.bottom <= 0 ||
+    rect.right <= 0 ||
+    rect.top >= viewportHeight ||
+    rect.left >= viewportWidth
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Clear the backend timeout timer for one tracked video.
+ */
+function clearAnalysisTimeout(state: VideoTrackState): void {
+  if (state.analysisTimeoutId !== null) {
+    clearTimeout(state.analysisTimeoutId);
+    state.analysisTimeoutId = null;
+  }
+}
+
+/**
+ * Mark backend analysis complete when the matching requestId finishes.
+ */
+function markAnalysisComplete(state: VideoTrackState, requestId: number): void {
+  if (requestId > 0 && requestId < state.analysis.requestId) {
+    return;
+  }
+
+  clearAnalysisTimeout(state);
+  state.analysis.isAnalyzing = false;
+}
+
+/**
+ * Handle FRAME_ANALYSIS_DONE from the service worker.
+ */
+function handleFrameAnalysisDone(videoId: number, requestId?: number): void {
+  const video = videoIdToElement.get(videoId);
+  if (!video) {
+    return;
+  }
+
+  const state = trackedVideos.get(video);
+  if (!state) {
+    return;
+  }
+
+  markAnalysisComplete(state, requestId ?? state.analysis.requestId);
+}
+
+/**
+ * Attach first-sample listeners and fire the first capture as soon as frame data exists.
+ */
+function scheduleFirstSample(video: HTMLVideoElement, state: VideoTrackState): void {
+  if (state.firstSampleScheduled) {
+    return;
+  }
+
+  state.firstSampleScheduled = true;
+
+  const tryFirstSample = (): void => {
+    if (findPrimaryVisibleVideo() !== video) {
+      return;
+    }
+
+    if (!canCaptureFrame(video)) {
+      if (state.firstSampleRetryId === null) {
+        state.firstSampleRetryId = window.setTimeout(() => {
+          state.firstSampleRetryId = null;
+          tryFirstSample();
+        }, FIRST_SAMPLE_RETRY_MS);
+      }
+      return;
+    }
+
+    void sampleFrame(video, state.captureSession, true);
+  };
+
+  const eventNames = [
+    "loadedmetadata",
+    "loadeddata",
+    "canplay",
+    "playing",
+    "timeupdate",
+  ] as const;
+
+  for (const eventName of eventNames) {
+    video.addEventListener(eventName, state.onFirstSampleReady, { passive: true });
+  }
+
+  if (FIRST_SAMPLE_DELAY_MS === 0) {
+    tryFirstSample();
+  } else {
+    window.setTimeout(tryFirstSample, FIRST_SAMPLE_DELAY_MS);
+  }
+}
+
+/**
+ * Detach first-sample listeners and timers for one video.
+ */
+function teardownFirstSampleListeners(
+  video: HTMLVideoElement,
+  state: VideoTrackState
+): void {
+  const eventNames = [
+    "loadedmetadata",
+    "loadeddata",
+    "canplay",
+    "playing",
+    "timeupdate",
+  ] as const;
+
+  for (const eventName of eventNames) {
+    video.removeEventListener(eventName, state.onFirstSampleReady);
+  }
+
+  if (state.firstSampleRetryId !== null) {
+    clearTimeout(state.firstSampleRetryId);
+    state.firstSampleRetryId = null;
+  }
+
+  clearAnalysisTimeout(state);
+}
+
+/**
  * True when the browser supports requestVideoFrameCallback on video elements.
  */
 function supportsVideoFrameCallback(video: HTMLVideoElement): boolean {
@@ -153,7 +384,91 @@ function supportsCancelVideoFrameCallback(video: HTMLVideoElement): boolean {
  * @param video - HTMLVideoElement discovered on the page.
  */
 export function initAudioCaptureForElement(video: HTMLVideoElement): void {
+  if (!isNudityProtectionActiveCached()) {
+    return;
+  }
+
+  ensureVideoRegistered(video);
+}
+
+/**
+ * True when protection and nudity are enabled (uses cached content settings).
+ */
+function isNudityProtectionActiveCached(): boolean {
+  if (!cachedContentSettings) {
+    return true;
+  }
+
+  return isNudityProtectionActive(cachedContentSettings);
+}
+
+/**
+ * Reset per-video analysis counters after settings change or nudity off.
+ */
+function resetVideoAnalysisState(state: VideoTrackState): void {
+  state.analysis = createAnalysisState();
+  clearAnalysisTimeout(state);
+}
+
+/**
+ * Reset analysis state on every tracked video.
+ */
+function resetAllAnalysisStates(): void {
+  for (const video of videoIdToElement.values()) {
+    const state = trackedVideos.get(video);
+    if (state) {
+      resetVideoAnalysisState(state);
+    }
+  }
+}
+
+/**
+ * Stop capture loops for all tracked videos without unregistering them.
+ */
+export function stopAllSampling(): void {
+  for (const video of [...videoIdToElement.values()]) {
+    const state = trackedVideos.get(video);
+    if (state) {
+      stopSampling(video, state, "settings-off");
+    }
+  }
+
+  primaryCaptureVideo = null;
+}
+
+/**
+ * Fire an immediate first frame sample when frame data is ready.
+ */
+export function triggerImmediateFirstSample(video: HTMLVideoElement): void {
+  const state = trackedVideos.get(video);
+  if (!state) {
+    return;
+  }
+
+  if (canCaptureFrame(video)) {
+    void sampleFrame(video, state.captureSession, true);
+    return;
+  }
+
+  if (!state.firstSampleScheduled) {
+    scheduleFirstSample(video, state);
+  }
+}
+
+/**
+ * Register a video or re-activate an already-registered video after settings change.
+ */
+function ensureVideoRegistered(video: HTMLVideoElement): void {
   if (video.dataset[SAFE_VIEW_TRACKED_DATASET] === "true") {
+    const state = trackedVideos.get(video);
+    if (!state) {
+      return;
+    }
+
+    resetVideoAnalysisState(state);
+    applyImmediateLocalBlur(video);
+    triggerImmediateFirstSample(video);
+    reconcilePrimaryCaptureLoop("settings-rescan");
     return;
   }
 
@@ -302,7 +617,13 @@ function reconcilePrimaryCaptureLoop(reason: string): void {
     return;
   }
 
-  const state = trackedVideos.get(primary);
+  applyImmediateLocalBlur(primary);
+  const primaryState = trackedVideos.get(primary);
+  if (primaryState) {
+    scheduleFirstSample(primary, primaryState);
+  }
+
+  const state = primaryState;
   if (!state) {
     primaryCaptureVideo = null;
     return;
@@ -334,6 +655,17 @@ function registerVideo(video: HTMLVideoElement): void {
   prepareVideoCrossOrigin(video);
 
   const videoId = nextVideoId++;
+  const onFirstSampleReady = (): void => {
+    const current = trackedVideos.get(video);
+    if (!current || findPrimaryVisibleVideo() !== video) {
+      return;
+    }
+
+    if (canCaptureFrame(video)) {
+      void sampleFrame(video, current.captureSession, true);
+    }
+  };
+
   const state: VideoTrackState = {
     videoId,
     lastSampleAt: 0,
@@ -347,6 +679,11 @@ function registerVideo(video: HTMLVideoElement): void {
     onMetadataLoaded: () => {
       reconcilePrimaryCaptureLoop("loadedmetadata");
     },
+    analysis: createAnalysisState(),
+    firstSampleScheduled: false,
+    onFirstSampleReady,
+    analysisTimeoutId: null,
+    firstSampleRetryId: null,
   };
 
   trackedVideos.set(video, state);
@@ -355,6 +692,9 @@ function registerVideo(video: HTMLVideoElement): void {
   onYouTubeWatchIdBoundary("new-video-registered");
   startSubtitleMonitor(video);
   onVideoTrackedForSpeakerSuppression(video);
+
+  applyImmediateLocalBlur(video);
+  scheduleFirstSample(video, state);
 
   console.info(
     "[SafeView][Capture] REGISTER video=%s session=0 tracked=%s",
@@ -379,6 +719,7 @@ function unregisterVideo(video: HTMLVideoElement, reason = "unregister"): void {
 
   stopSampling(video, state, reason);
   video.removeEventListener("loadedmetadata", state.onMetadataLoaded);
+  teardownFirstSampleListeners(video, state);
   stopSubtitleMonitor(video);
   videoIdToElement.delete(state.videoId);
   trackedVideos.delete(video);
@@ -498,13 +839,13 @@ function startSampling(
       session
     );
     void sampleFrame(video, session);
-  }, SAMPLE_INTERVAL_ACTIVE_MS);
+  }, SAMPLE_INTERVAL_MS);
 
   console.info(
     "[SafeView][Capture] INTERVAL START video=%s session=%s ms=%s",
     state.videoId,
     session,
-    SAMPLE_INTERVAL_ACTIVE_MS
+    SAMPLE_INTERVAL_MS
   );
 }
 
@@ -638,7 +979,8 @@ function purgeCanvas(canvas: HTMLCanvasElement): void {
  */
 async function sampleFrame(
   video: HTMLVideoElement,
-  captureSession: number
+  captureSession: number,
+  immediate = false
 ): Promise<void> {
   const state = trackedVideos.get(video);
   if (!state || state.captureSession !== captureSession) {
@@ -658,9 +1000,32 @@ async function sampleFrame(
     return;
   }
 
-  const intervalMs = getSampleIntervalMs(video);
   const now = performance.now();
-  if (now - state.lastSampleAt < intervalMs) {
+
+  if (state.analysis.isAnalyzing) {
+    const pendingMs = now - state.analysis.lastAnalysisStartedAt;
+    if (pendingMs < MAX_PENDING_ANALYSIS_MS) {
+      console.debug(
+        "[SafeView][Capture] SKIP pending analysis video=%s request=%s pendingMs=%s",
+        state.videoId,
+        state.analysis.requestId,
+        Math.round(pendingMs)
+      );
+      return;
+    }
+
+    console.info(
+      "[SafeView][Capture] STALE analysis video=%s request=%s pendingMs=%s",
+      state.videoId,
+      state.analysis.requestId,
+      Math.round(pendingMs)
+    );
+    state.analysis.isAnalyzing = false;
+    clearAnalysisTimeout(state);
+  }
+
+  const intervalMs = getSampleIntervalMs(video);
+  if (!immediate && now - state.lastSampleAt < intervalMs) {
     return;
   }
 
@@ -739,6 +1104,22 @@ async function sampleFrame(
     after.lastSampleAt = now;
     after.lastSampledTime = video.currentTime;
 
+    after.analysis.requestId += 1;
+    const requestId = after.analysis.requestId;
+    after.analysis.isAnalyzing = true;
+    after.analysis.lastAnalysisStartedAt = now;
+    clearAnalysisTimeout(after);
+    after.analysisTimeoutId = window.setTimeout(() => {
+      if (after.analysis.requestId === requestId && after.analysis.isAnalyzing) {
+        after.analysis.isAnalyzing = false;
+        console.warn(
+          "[SafeView][Capture] BACKEND TIMEOUT video=%s request=%s — keeping blur",
+          after.videoId,
+          requestId
+        );
+      }
+    }, BACKEND_TIMEOUT_MS);
+
     await sendFrameToServiceWorker(
       after.videoId,
       result.blob,
@@ -747,7 +1128,8 @@ async function sampleFrame(
       result.captureMs,
       result.encodeMs,
       captureSession,
-      seq
+      seq,
+      requestId
     );
   } catch (error) {
     console.error("[SafeView] Frame sampling failed:", error);
@@ -802,7 +1184,8 @@ async function sendFrameToServiceWorker(
   captureMs: number,
   encodeMs: number,
   captureSession: number,
-  captureSeq: number
+  captureSeq: number,
+  requestId: number
 ): Promise<void> {
   try {
     const transferStarted = performance.now();
@@ -835,6 +1218,7 @@ async function sendFrameToServiceWorker(
         capturedAt,
         sentAt,
         frameSeq,
+        requestId,
         captureMs,
         encodeMs,
       })
@@ -888,7 +1272,7 @@ function handleYouTubeNavigation(): void {
   onYouTubeWatchIdBoundary("yt-navigate-finish");
   pruneStaleTrackedVideos();
   resetVideoCaptureForNavigation("yt-navigate-finish");
-  monitorVideos();
+  void handleSettingsUpdated("yt-navigate-finish");
 }
 
 /**
@@ -903,6 +1287,137 @@ function setupYouTubeNavigationListener(): void {
  */
 function teardownYouTubeNavigationListener(): void {
   document.removeEventListener("yt-navigate-finish", handleYouTubeNavigation);
+}
+
+/**
+ * Re-scan existing videos and apply blur/sampling per current settings.
+ */
+export async function rescanAndApplyCurrentSettings(): Promise<void> {
+  cachedContentSettings = await loadSettings();
+
+  if (!isNudityProtectionActive(cachedContentSettings)) {
+    stopAllSampling();
+    clearAllFullVideoBlurs();
+    resetAllAnalysisStates();
+    console.info("[SafeView] Nudity protection off — sampling stopped, blur cleared.");
+    return;
+  }
+
+  if (!isMonitorRunning) {
+    startVideoMonitor();
+  }
+
+  const videos = Array.from(document.querySelectorAll("video"));
+  for (const video of videos) {
+    if (!isVideoVisibleInLayout(video)) {
+      continue;
+    }
+
+    ensureVideoRegistered(video);
+  }
+
+  reconcilePrimaryCaptureLoop("settings-rescan");
+  console.info(
+    "[SafeView] Settings rescan complete — %s visible video(s), primary=%s",
+    videos.length,
+    primaryCaptureVideo ? "yes" : "no"
+  );
+}
+
+/**
+ * Apply latest settings immediately (no page refresh).
+ *
+ * @param reason - Diagnostic label from popup, storage, or navigation.
+ */
+export async function handleSettingsUpdated(reason: string): Promise<void> {
+  console.info("[SafeView] SETTINGS_UPDATED in content script (%s)", reason);
+  await rescanAndApplyCurrentSettings();
+}
+
+/**
+ * Listen for chrome.storage settings changes (backup when tab message fails).
+ */
+function setupSettingsStorageListener(): void {
+  if (settingsStorageListenerRegistered) {
+    return;
+  }
+
+  settingsStorageListenerRegistered = true;
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") {
+      return;
+    }
+
+    if (changes[SETTINGS_STORAGE_KEY] === undefined) {
+      return;
+    }
+
+    void handleSettingsUpdated("storage");
+  });
+}
+
+/**
+ * Route runtime messages (frame analysis done, settings updated).
+ */
+function setupRuntimeMessageListener(): void {
+  if (runtimeMessageListenerRegistered) {
+    return;
+  }
+
+  runtimeMessageListenerRegistered = true;
+
+  chrome.runtime.onMessage?.addListener((message) => {
+    if (!message || typeof message !== "object") {
+      return;
+    }
+
+    const payload = message as {
+      action?: string;
+      videoId?: number;
+      requestId?: number;
+      reason?: string;
+    };
+
+    if (payload.action === MESSAGE_ACTION_FRAME_ANALYSIS_DONE) {
+      if (typeof payload.videoId === "number") {
+        handleFrameAnalysisDone(payload.videoId, payload.requestId);
+      }
+      return;
+    }
+
+    if (payload.action === MESSAGE_ACTION_SETTINGS_UPDATED) {
+      void handleSettingsUpdated(payload.reason ?? "message");
+    }
+  });
+}
+
+/**
+ * Re-scan videos on SPA route changes (YouTube, TikTok, Netflix-like apps).
+ */
+function setupSpaNavigationListener(): void {
+  if (spaNavigationHooked) {
+    return;
+  }
+
+  spaNavigationHooked = true;
+
+  const onRouteChange = (): void => {
+    void handleSettingsUpdated("spa-navigation");
+  };
+
+  window.addEventListener("popstate", onRouteChange);
+
+  const wrapHistoryMethod = (method: "pushState" | "replaceState"): void => {
+    const original = history[method].bind(history);
+    history[method] = (...args: Parameters<History["pushState"]>) => {
+      original(...args);
+      onRouteChange();
+    };
+  };
+
+  wrapHistoryMethod("pushState");
+  wrapHistoryMethod("replaceState");
 }
 
 /**
@@ -924,7 +1439,16 @@ export function startVideoMonitor(): void {
   });
 
   setupYouTubeNavigationListener();
+  setupSpaNavigationListener();
+  setupSettingsStorageListener();
+  setupRuntimeMessageListener();
   seedYouTubeWatchVideoId();
+
+  void loadSettings().then((settings) => {
+    cachedContentSettings = settings;
+    void rescanAndApplyCurrentSettings();
+  });
+
   reconcilePrimaryCaptureLoop("monitor-start");
   console.info("[SafeView] Video monitor started.");
 }
@@ -968,21 +1492,28 @@ export function getVideoById(videoId: number): HTMLVideoElement | undefined {
 export function findPrimaryVisibleVideo(): HTMLVideoElement | undefined {
   let bestVideo: HTMLVideoElement | undefined;
   let bestArea = 0;
+  let bestPlaying = false;
 
   for (const video of videoIdToElement.values()) {
-    if (!video.isConnected) {
+    if (!isVideoVisibleInLayout(video)) {
       continue;
     }
 
     const rect = video.getBoundingClientRect();
-    if (rect.width < MIN_VISIBLE_LAYOUT_PX || rect.height < MIN_VISIBLE_LAYOUT_PX) {
-      continue;
-    }
-
     const area = rect.width * rect.height;
-    if (area > bestArea) {
+    const isPlaying = !video.paused && !video.ended;
+
+    if (
+      area > bestArea ||
+      (area === bestArea && isPlaying && !bestPlaying)
+    ) {
       bestArea = area;
       bestVideo = video;
+      bestPlaying = isPlaying;
+    } else if (isPlaying && !bestPlaying && area >= bestArea * 0.85) {
+      bestArea = area;
+      bestVideo = video;
+      bestPlaying = true;
     }
   }
 

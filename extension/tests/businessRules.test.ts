@@ -37,13 +37,19 @@ describe("businessRules BR-01", () => {
     expect(shouldBlur(0.75, 0.75)).toBe(true);
   });
 
-  it("always enables nudity model when protection is on (strict mode)", () => {
-    const settings = {
+  it("respects nudity toggle when protection is on", () => {
+    const settingsOn = {
+      ...DEFAULT_SETTINGS,
+      protectionEnabled: true,
+      categories: { ...DEFAULT_SETTINGS.categories, nudity: true },
+    };
+    const settingsOff = {
       ...DEFAULT_SETTINGS,
       protectionEnabled: true,
       categories: { ...DEFAULT_SETTINGS.categories, nudity: false },
     };
-    expect(getEnabledCategories(settings)).toEqual(["nudity"]);
+    expect(getEnabledCategories(settingsOn)).toEqual(["nudity"]);
+    expect(getEnabledCategories(settingsOff)).toEqual([]);
   });
 
   it("returns no categories when protection is off", () => {
