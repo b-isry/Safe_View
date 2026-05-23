@@ -10,3 +10,4 @@ pytest>=8.0.0,<9.0.0
 httpx>=0.27.0,<1.0.0
 # whisper (import) + openai-whisper (pip) — install openai-whisper only; do not use PyPI whisper==1.1.10
 openai-whisper>=20231117,<20260000
+pydub>=0.25.1,<1.0.0

@@ -1,0 +1,573 @@
+# SafeView — Cursor Master Prompt
+# Read every section before writing a single line of code.
+
+---
+
+## 0. Context & Your Role
+
+You are a senior full-stack engineer building **SafeView**, a real-time AI-powered content moderation system. The project is a final-year Software Engineering capstone at Bahir Dar University (Bahir Dar Institute of Technology, Faculty of Computing).
+
+SafeView has **two separate deliverables** that share a common FastAPI AI backend:
+
+| Deliverable | Platform | What it does |
+|---|---|---|
+| **Browser Extension** | Chrome/Chromium (desktop) | Detects video elements on any web page and blurs the full video when restricted content is found |
+| **Android App** | Android 10+ (Flutter) | (a) In-app browser that filters web video, AND (b) Screen-capture overlay that blurs third-party apps (YouTube, TikTok, etc.) system-wide |
+
+The reference design is the RAD/RDD on file. **Section 2 of this prompt overrides anything in those documents.** When in doubt, this prompt wins.
+
+---
+
+## 1. Project Scope
+
+### 1.1 Shared AI Backend (FastAPI + PyTorch)
+
+One backend serves both the extension and the Android app.
+
+- **Nudity detection** → powered by `dino_v3_linear.pth`, a custom-trained model the team provides. Cursor's job is only to **load the weights and run inference correctly** — do not attempt to train, modify, or replace this model.
+- **All other categories** (Violence, Kissing/Romantic, Profanity, LGBTQ+ Symbols) → **stub implementations** that always return `{ detected: false, confidence: 0.0 }`. Each stub must be clearly marked `# TODO: replace with real model` and must implement the same interface as the nudity module so swapping is trivial later.
+
+### 1.2 Browser Extension (Chrome MV3)
+
+**In scope:**
+- Detect every `<video>` element on any tab (including common player wrappers on YouTube, TikTok web, Netflix, etc.)
+- Sample frames at ≤ 2 FPS (500 ms gate)
+- Send frames to the local FastAPI backend for inference
+- On detection: apply `filter: blur(24px)` to the **entire `<video>` element** — no coordinate-based masking
+- Remove blur when detection clears
+- Audio monitoring stub: scan `<track>` subtitles for profanity → `video.muted = true` for 1.5 s
+- Metadata filter stub: TMDb lookup, always returns ALLOW until API key is configured
+- Popup UI: protection toggle, status indicator, link to options
+- Options page: per-category toggles, sensitivity slider (Low/Medium/High), backend URL field, profanity word list editor
+
+**Out of scope for the extension:**
+- Surgical / coordinate-based masking
+- iOS support
+- Any cloud AI API calls
+- Any remote data storage
+
+### 1.3 Android App (Flutter)
+
+**In scope:**
+
+**A. In-App Browser (WebView-based)**
+- A Flutter WebView that loads any URL the user types
+- Intercepts rendered video frames via a JavaScript bridge injected into the WebView
+- Sends frames to the FastAPI backend (same endpoint as the extension)
+- On detection: calls back into Flutter to apply a full-screen blur overlay (`BackdropFilter` widget) over the entire WebView
+- Removes the overlay when detection clears
+- Works without any special OS permissions beyond internet access
+
+**B. Screen Capture Overlay (System-Wide)**
+- Uses `MediaProjection` API to capture the screen at ≤ 2 FPS
+- Frames are sent to the FastAPI backend for inference
+- On detection: draws a `WindowManager` full-screen overlay (a solid dark layer or heavy blur effect) over whatever app is in the foreground
+- Requires the user to grant:
+  - `FOREGROUND_SERVICE` permission
+  - `SYSTEM_ALERT_WINDOW` ("Display over other apps") permission
+  - MediaProjection runtime consent dialog
+- The overlay service runs as a foreground service with a persistent notification
+- Overlay is removed when detection clears or user taps the notification to stop
+
+**C. Shared App Features**
+- Dashboard: protection ON/OFF toggle, active mode indicator (browser vs overlay), live status feed
+- Settings: per-category filter toggles, sensitivity slider, backend URL configuration
+- All settings persisted in `SharedPreferences`
+- Privacy: captured frames live only in RAM; never written to disk or sent anywhere except `localhost`
+
+**Out of scope for Android:**
+- iOS build
+- Surgical masking (always full-screen blur/overlay)
+- Cloud inference
+- Root-level hooks or accessibility service hacks beyond standard `MediaProjection`
+
+---
+
+## 2. Authoritative Overrides (These Beat the RAD/RDD)
+
+| RAD/RDD Says | Build This Instead |
+|---|---|
+| YOLOv8 for visual detection | `dino_v3_linear.pth` — team-provided custom weights, loaded with PyTorch |
+| "The team will train a custom model" | The model file is provided. Just load it. Do not retrain. |
+| Surgical Gaussian blur over detected coordinates | Full `filter: blur(24px)` on entire `<video>` (extension) / full-screen `BackdropFilter` overlay (Android) |
+| iOS custom browser + Network Extension | Not implemented — Android only |
+| Flutter for both Android and iOS | Flutter for Android only |
+| TMDb API live integration | Stub only — returns ALLOW until API key is set |
+| Cloud deployment of backend | `localhost:8000` only during development |
+| Violence / Kissing / Profanity / LGBTQ models | Stubs returning `detected: false` — same interface as nudity module |
+
+---
+
+## 3. Technology Stack
+
+### Backend
+- Python 3.10+, FastAPI, Uvicorn
+- PyTorch (CPU or CUDA) — for loading `dino_v3_linear.pth`
+- Pillow — image decoding and preprocessing
+- pytest — testing
+
+### Browser Extension
+- Manifest V3
+- TypeScript → compiled JS (Vite or Webpack — pick one, document it)
+- Vanilla JS/TS in content script (no React, no heavy frameworks — keep it lightweight)
+- HTML + CSS + vanilla JS for popup and options pages
+- Jest — unit testing
+
+### Android App
+- Flutter (Dart) — single codebase targeting Android only
+- `flutter_inappwebview` — WebView with JavaScript channel support
+- Kotlin via platform channel — for `MediaProjection`, `WindowManager`, foreground service
+- `shared_preferences` — settings storage
+- `http` package — sending frames to FastAPI backend
+
+---
+
+## 4. System Architecture
+
+### 4.1 Data Flow (Extension)
+
+```
+[Any Web Page]
+     │
+     ▼
+[Content Script]
+  • Finds <video> elements via MutationObserver
+  • Draws frame to offscreen <canvas> every 500ms
+  • canvas.toBlob(jpeg) → sends blob to service worker
+  • Immediately frees canvas memory
+     │
+     ▼  chrome.runtime.sendMessage
+[Service Worker (MV3)]
+  • Receives blob
+  • Applies BR-01 threshold
+  • POSTs to http://localhost:8000/analyze-image
+     │
+     ▼  JSON response
+[Service Worker]
+  • If detected=true → sendMessage back to content script: { action: 'BLUR' }
+  • If detected=false → sendMessage: { action: 'CLEAR' }
+     │
+     ▼  chrome.tabs.sendMessage
+[Content Script]
+  • BLUR  → videoElement.style.filter = 'blur(24px)'
+  • CLEAR → videoElement.style.filter = ''
+```
+
+**Rule: The content script NEVER calls the backend directly. All AI calls go through the service worker.**
+
+### 4.2 Data Flow (Android — In-App Browser)
+
+```
+[Flutter WebView]
+  • JS bridge injected on page load
+  • JS captures video frame to canvas → toDataURL(jpeg) → postMessage to Flutter
+     │
+     ▼  JavaScriptChannel callback
+[Flutter Dart Layer]
+  • Decodes base64 frame
+  • HTTP POST to http://<configured-ip>:8000/analyze-image
+     │
+     ▼  JSON response
+[Flutter Dart Layer]
+  • detected=true  → setState: show BackdropFilter overlay over WebView
+  • detected=false → setState: hide overlay
+```
+
+### 4.3 Data Flow (Android — Screen Capture Overlay)
+
+```
+[Kotlin Foreground Service]
+  • MediaProjection captures screen bitmap every 500ms
+  • Compresses to JPEG bytes
+  • Sends bytes to Flutter via MethodChannel (or calls backend directly from Kotlin)
+     │
+     ▼
+[FastAPI Backend]
+  • Runs inference on frame
+  • Returns { detected, confidence, action }
+     │
+     ▼
+[Kotlin Service]
+  • detected=true  → WindowManager adds full-screen overlay View
+  • detected=false → WindowManager removes overlay View
+  • Overlay is always rendered above all other apps (TYPE_APPLICATION_OVERLAY)
+```
+
+### 4.4 Business Rules (enforce exactly as written)
+
+| Rule ID | Rule | Where Enforced |
+|---|---|---|
+| BR-01 | Confidence threshold floor = 75% regardless of user sensitivity setting: `effective = max(0.75, userSensitivity)` | Backend `inference.py` AND service worker |
+| BR-02 | All frame data purged within 500ms of analysis — never written to disk | Content script (canvas reset), Kotlin service (bitmap.recycle()), backend (del tensor) |
+| BR-03 | Profanity blacklist is a static editable list; changes require no app restart | Extension options page / Android settings screen |
+| BR-04 | User settings always override defaults | `chrome.storage.local` / `SharedPreferences` read before every inference cycle |
+| BR-05 | Audio mute duration = exactly 1500 ms | `setTimeout` (extension) / `Future.delayed(Duration(milliseconds: 1500))` (Flutter) |
+| BR-06 | TMDb stub respects 3 req/min rate limit with a token bucket (ready to activate) | Backend `metadata.py` stub |
+| BR-07 | Blur/overlay layer must always render above video content | CSS `filter` on video element; `TYPE_APPLICATION_OVERLAY` for Android WindowManager |
+| BR-08 | Any PIN/password gate on settings: min 8 characters including 1 digit | Options page / Android settings if implemented |
+
+---
+
+## 5. Folder Structure
+
+Maintain this structure exactly. Do not reorganise without asking.
+
+```
+safeview/
+│
+├── backend/                          # Shared FastAPI AI server
+│   ├── main.py                       # FastAPI app, CORS, routes
+│   ├── model_loader.py               # Loads dino_v3_linear.pth ONCE at startup
+│   ├── inference.py                  # Preprocessing + forward pass + threshold
+│   ├── models/
+│   │   ├── nudity.py                 # REAL: uses dino_v3_linear.pth
+│   │   ├── violence.py               # STUB
+│   │   ├── kissing.py                # STUB
+│   │   ├── profanity.py              # STUB (subtitle text matching)
+│   │   └── lgbtq.py                  # STUB
+│   ├── metadata.py                   # TMDb stub with token-bucket rate limiter
+│   ├── requirements.txt
+│   └── README.md
+│
+├── extension/                        # Chrome MV3 extension
+│   ├── manifest.json
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── vite.config.ts
+│   ├── src/
+│   │   ├── content/
+│   │   │   ├── index.ts              # Injected into every page
+│   │   │   ├── videoMonitor.ts       # Finds <video> elements, MutationObserver
+│   │   │   └── blurManager.ts        # Applies / removes blur
+│   │   ├── background/
+│   │   │   ├── serviceWorker.ts      # MV3 service worker — owns all AI calls
+│   │   │   ├── aiClient.ts           # fetch() wrapper for localhost backend
+│   │   │   └── businessRules.ts      # BR-01 through BR-08
+│   │   ├── popup/
+│   │   │   ├── index.html
+│   │   │   ├── popup.ts
+│   │   │   └── popup.css
+│   │   └── options/
+│   │       ├── index.html
+│   │       ├── options.ts
+│   │       └── options.css
+│   ├── icons/
+│   │   ├── icon16.png
+│   │   ├── icon48.png
+│   │   └── icon128.png
+│   └── tests/
+│       └── *.test.ts
+│
+├── android/                          # Flutter Android app
+│   ├── pubspec.yaml
+│   ├── lib/
+│   │   ├── main.dart
+│   │   ├── app.dart                  # MaterialApp, routing
+│   │   ├── screens/
+│   │   │   ├── dashboard_screen.dart
+│   │   │   ├── browser_screen.dart   # In-app WebView browser
+│   │   │   ├── settings_screen.dart
+│   │   │   └── status_screen.dart
+│   │   ├── services/
+│   │   │   ├── ai_client.dart        # HTTP calls to FastAPI backend
+│   │   │   ├── settings_service.dart # SharedPreferences wrapper
+│   │   │   └── overlay_service.dart  # MethodChannel to Kotlin overlay service
+│   │   ├── widgets/
+│   │   │   ├── blur_overlay.dart     # BackdropFilter overlay widget
+│   │   │   ├── status_badge.dart
+│   │   │   └── category_toggle.dart
+│   │   └── constants.dart            # BLUR_SIGMA, SAMPLE_INTERVAL_MS, etc.
+│   ├── android/
+│   │   └── app/src/main/
+│   │       ├── kotlin/.../
+│   │       │   ├── MainActivity.kt
+│   │       │   ├── OverlayService.kt     # Foreground service + WindowManager
+│   │       │   ├── ScreenCaptureHelper.kt # MediaProjection setup
+│   │       │   └── OverlayView.kt        # The actual overlay View drawn on screen
+│   │       └── AndroidManifest.xml       # All required permissions declared
+│   └── test/
+│       └── *.dart
+│
+└── README.md                         # Project-level setup instructions
+```
+
+---
+
+## 6. Coding Standards
+
+### 6.1 General
+- Every file starts with a comment block: purpose, authors (Blen Bizuayehu, Lidiya Getale, Bisrat Teshome), date.
+- Every function has a JSDoc (TS/JS), Dartdoc (Dart), or docstring (Python) comment.
+- All magic numbers are named constants — never inline numbers for things like blur amount, sample rate, timeout duration.
+- `const`/`let` only in JS/TS, never `var`. `final`/`const` in Dart wherever possible.
+- `async/await` everywhere — no raw Promise chains or callback pyramids.
+
+### 6.2 Error Handling
+- Every network call, every `chrome.runtime.sendMessage`, every `MethodChannel` invoke: wrapped in try/catch.
+- **Fail open on inference error** — if the backend is unreachable or throws, do NOT blur. Log the error and show a warning badge. Never crash silently.
+- All extension logs prefixed with `[SafeView]`. All Kotlin logs use tag `"SafeView"`. All Flutter logs use `debugPrint('[SafeView] ...')`.
+
+### 6.3 Privacy (Non-Negotiable)
+- NEVER log pixel data, image bytes, or frame content anywhere.
+- NEVER write frame data to disk, localStorage, IndexedDB, SharedPreferences, or any file.
+- NEVER send frames to any endpoint other than the user-configured backend URL (default `localhost:8000`).
+- In Kotlin: call `bitmap.recycle()` immediately after JPEG compression.
+- In Python: `del tensor` and `torch.cuda.empty_cache()` after every inference call.
+- In TypeScript: `canvas.width = 0` immediately after `toBlob()` resolves.
+
+### 6.4 Performance
+- Frame sampling: 500 ms minimum gate everywhere — no faster.
+- Content script heap budget: < 5 MB during monitoring.
+- Android overlay service: release `ImageReader` buffers immediately after use.
+- Do not accumulate frames in any queue or array — process one, discard, wait.
+
+### 6.5 Model Loading
+- `dino_v3_linear.pth` is loaded **once** when the FastAPI server starts, stored in a module-level variable.
+- It is NOT reloaded per request.
+- If the file is missing at startup: log a clear error, start the server anyway, and return `{ detected: false, confidence: 0.0 }` for all nudity requests with a `model_loaded: false` flag in the response.
+- Do not attempt to modify, retrain, or inspect the model architecture beyond what is needed to run a forward pass.
+
+### 6.6 Stubs
+Every stub model module must:
+1. Implement the same function signature as the real nudity module.
+2. Log a warning: `console.warn('[SafeView][StubModel] returning no detection')` / Python equivalent.
+3. Return `{ category, detected: False, confidence: 0.0, action: 'ALLOW' }`.
+4. Include this comment block at the top:
+```
+# TODO: Replace this stub with a real trained model.
+# Interface contract:
+#   Input:  PIL Image, sensitivity: float (0.0–1.0)
+#   Output: { "category": str, "detected": bool, "confidence": float, "action": "BLUR"|"ALLOW" }
+```
+
+---
+
+## 7. API Contract (Backend)
+
+All clients (extension and Android app) use the same endpoints.
+
+### POST `/analyze-image`
+```
+Request:  multipart/form-data
+  frame       : JPEG image bytes
+  sensitivity : float  (0.0 – 1.0, from user settings)
+  category    : string ("nudity" | "violence" | "kissing" | "profanity" | "lgbtq")
+
+Response: application/json
+{
+  "category":     "nudity",
+  "detected":     true,
+  "confidence":   0.87,
+  "action":       "BLUR",        // "BLUR" | "ALLOW"
+  "model_loaded": true           // false if .pth file was missing at startup
+}
+```
+
+### GET `/health`
+```
+Response: { "status": "ok", "model": "dino_v3_linear", "model_loaded": true }
+```
+
+### CORS Policy
+- Allow origins: `chrome-extension://*` and `http://localhost:*` and `http://10.0.2.2:*` (Android emulator loopback).
+- No wildcard `*` origin.
+
+---
+
+## 8. Inference Pipeline (Backend)
+
+```python
+# inference.py — implement exactly as described
+
+def preprocess(pil_image: Image) -> torch.Tensor:
+    # 1. Resize to 224x224
+    # 2. Convert to RGB if not already
+    # 3. ToTensor()
+    # 4. Normalize with ImageNet mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
+    # 5. Add batch dimension: unsqueeze(0)
+    # 6. Move to model device
+
+def run_inference(tensor: torch.Tensor, sensitivity: float) -> dict:
+    # 1. model.eval() — already set at load time, but assert it
+    # 2. with torch.no_grad(): output = model(tensor)
+    # 3. confidence = torch.sigmoid(output).item()  (assumes binary linear head)
+    # 4. effective_threshold = max(0.75, sensitivity)  # BR-01
+    # 5. detected = confidence >= effective_threshold
+    # 6. del tensor  # BR-02
+    # 7. if cuda: torch.cuda.empty_cache()
+    # 8. return { detected, confidence, action }
+```
+
+---
+
+## 9. Android Implementation Details
+
+### AndroidManifest.xml — Required Permissions
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+<service
+    android:name=".OverlayService"
+    android:foregroundServiceType="mediaProjection"
+    android:exported="false" />
+```
+
+### OverlayService.kt — Key Implementation Rules
+- Start as a foreground service with an ongoing notification immediately on `onCreate()`.
+- Use `ImageReader` + `VirtualDisplay` from MediaProjection to receive frames.
+- On each frame: compress to JPEG (quality 70), send to backend, call `image.close()` immediately.
+- Add/remove overlay via `WindowManager` with `LayoutParams.TYPE_APPLICATION_OVERLAY`.
+- The overlay view must have `LayoutParams.FLAG_NOT_TOUCHABLE or LayoutParams.FLAG_NOT_FOCUSABLE` so the user can still interact with the underlying app.
+- Stop the service cleanly on notification action "Stop Protection" — release `VirtualDisplay`, `ImageReader`, `MediaProjection`.
+
+### Flutter ↔ Kotlin Communication
+- Use a single `MethodChannel` named `"com.safeview/overlay"`.
+- Flutter calls: `startCapture(sensitivity, categories)`, `stopCapture()`
+- Kotlin calls back to Flutter via `EventChannel` named `"com.safeview/status"` to stream detection events and service status updates.
+
+### In-App Browser (Flutter)
+- Use `flutter_inappwebview` package.
+- On `onLoadStop`: inject a JavaScript snippet that:
+  1. Finds all `<video>` elements
+  2. Sets up a `requestAnimationFrame` loop gated at 500 ms
+  3. Draws each video frame to an offscreen canvas
+  4. Calls `canvas.toDataURL('image/jpeg', 0.7)`
+  5. Posts the base64 string to Flutter via `JavaScriptChannel` named `"SafeViewBridge"`
+- Flutter receives the base64 string, decodes it, POSTs to backend, and on detection sets overlay state.
+- The overlay is a `Stack` with the `InAppWebView` underneath and a `BackdropFilter(filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24))` on top, toggled by a state boolean.
+
+---
+
+## 10. UI/UX Requirements
+
+### Brand
+- Primary background: `#0D1B2A` (deep navy)
+- Accent: `#00B4D8` (teal)
+- Text: `#FFFFFF`
+- Warning/offline: `#FF6B6B` (red)
+- Active indicator: `#2ECC71` (green), pulsing animation
+- Font: IBM Plex Sans (bundle locally — no Google Fonts CDN call at runtime)
+
+### Extension Popup
+- Protection ON/OFF toggle (persists to `chrome.storage.local`)
+- Status dot: green (monitoring) / red (backend offline) / grey (idle)
+- Count of active filters
+- "Open Settings" link
+- No raw confidence numbers shown to user
+
+### Extension Options
+- Per-category toggles: Nudity, Violence, Kissing, Profanity, LGBTQ+ Themes
+- Sensitivity slider with three labelled stops: Low (0.60) / Medium (0.75) / High (0.90)
+- Backend URL input + "Test Connection" button
+- Profanity word list: add/remove entries, saved immediately on change
+- "Reset to defaults" button
+
+### Android Dashboard
+- Two-mode toggle: "Browser Mode" vs "Screen Overlay Mode"
+- Protection ON/OFF for each mode
+- Live status feed (scrolling log of AI detections — category and timestamp only, no pixel data)
+- Link to Settings
+
+### Android Settings
+- Same category toggles and sensitivity slider as extension
+- Backend IP/URL field (default: `http://10.0.2.2:8000` for emulator, `http://192.168.x.x:8000` for real device)
+- "Test Connection" button
+- Permissions status section: shows which permissions are granted/missing with deep-link buttons to OS settings
+
+---
+
+## 11. Testing Requirements
+
+### Backend (pytest)
+- Test `/health` returns 200 and correct JSON shape
+- Test `/analyze-image` with a blank white JPEG returns valid response shape
+- Test BR-01: sensitivity=0.1 still results in effective_threshold=0.75
+- Test stub modules return `detected: false` always
+
+### Extension (Jest)
+- `videoMonitor`: confirms `<video>` elements are found after DOM insertion
+- `blurManager`: confirms `filter: blur(24px)` is applied and removed correctly
+- `serviceWorker`: mock fetch, confirm BLUR message is sent on `detected: true`
+- `businessRules`: confirm BR-01 threshold floor
+
+### Android (Flutter test)
+- `SettingsService`: write and read back all settings correctly
+- `AiClient`: mock HTTP, confirm correct request shape and response parsing
+- `BlurOverlay` widget: renders when `isBlurred=true`, hidden when `false`
+
+---
+
+## 12. Documentation Requirements
+
+Every file must include a header comment:
+```
+// SafeView — [filename]
+// Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
+// Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
+// Purpose: [one sentence]
+```
+
+Root `README.md` must cover:
+1. Project overview
+2. Prerequisites (Node version, Python version, Flutter version, Android SDK version)
+3. Backend setup and how to place `dino_v3_linear.pth`
+4. Extension: build steps + how to load as unpacked extension in Chrome
+5. Android: build steps + how to connect to the backend from a real device
+6. Known limitations
+
+---
+
+## 13. Hard Prohibitions — Never Do These
+
+- ❌ Do not use Manifest V2 (`browser_action`, `persistent: true`, `background.scripts`).
+- ❌ Do not apply coordinate-based / surgical masking — always full video/screen blur.
+- ❌ Do not call any remote AI API (OpenAI, Google Vision, AWS Rekognition, etc.).
+- ❌ Do not store frame data anywhere (disk, localStorage, IndexedDB, SharedPreferences, files).
+- ❌ Do not log pixel data or image bytes to any console or log system.
+- ❌ Do not build an iOS target — Android only.
+- ❌ Do not use `eval()` or `new Function()` — MV3 CSP violation.
+- ❌ Do not fetch remote scripts at runtime — all assets must be bundled.
+- ❌ Do not let the content script call the backend directly — always via service worker.
+- ❌ Do not reload `dino_v3_linear.pth` per request — load once at startup, cache in memory.
+- ❌ Do not modify or attempt to retrain the `.pth` model file.
+- ❌ Do not use wildcard `*` as CORS origin.
+- ❌ Do not add any analytics, telemetry, crash reporting, or usage tracking.
+- ❌ Do not silently catch errors — always log them with the `[SafeView]` prefix.
+
+---
+
+## 14. When You Are Unsure
+
+- If a requirement in the RAD/RDD conflicts with this prompt → **this prompt wins**.
+- If a third-party library is tempting → ask: (a) MV3 compatible? (b) makes network calls? (c) under 100 KB? If any answer is wrong, implement it inline or find an alternative.
+- If `dino_v3_linear.pth` is not yet available → implement the loader with a clear placeholder that returns dummy results and documents exactly where to place the file and what filename is expected.
+- If unsure about scope → ask before implementing. Do not build things not listed in Section 1.
+
+---
+
+## 15. Quick Reference Card
+
+| Parameter | Value |
+|---|---|
+| Frame sample rate | ≤ 2 FPS (500 ms gate) |
+| Blur amount (extension) | `filter: blur(24px)` on `<video>` element |
+| Blur amount (Android WebView) | `BackdropFilter` sigma = 24 |
+| Blur amount (Android overlay) | Full-screen `WindowManager` overlay, `TYPE_APPLICATION_OVERLAY` |
+| Confidence floor (BR-01) | `max(0.75, userSensitivity)` |
+| Mute duration (BR-05) | 1500 ms exactly |
+| Frame purge deadline (BR-02) | Within 500 ms of inference |
+| Backend default URL (desktop) | `http://localhost:8000` |
+| Backend default URL (Android emulator) | `http://10.0.2.2:8000` |
+| Model file name | `dino_v3_linear.pth` |
+| Model loaded | Once at FastAPI startup, module-level variable |
+| Settings storage (extension) | `chrome.storage.local` |
+| Settings storage (Android) | `SharedPreferences` |
+| Log prefix | `[SafeView]` everywhere |
+
+---
+
+*End of master prompt. Before writing any code, confirm you have read all 15 sections. Then ask for the first task.*

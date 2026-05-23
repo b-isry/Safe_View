@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import tempfile
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -47,12 +49,50 @@ def load_whisper() -> None:
         WHISPER_LOADED = False
 
 
+def is_silent(audio_bytes: bytes) -> bool:
+    """
+    Skip tiny or near-zero-energy chunks before decode/transcribe.
+
+    Args:
+        audio_bytes: Raw WebM fragment from the browser.
+
+    Returns:
+        bool: True when the chunk should not be sent to Whisper.
+    """
+    if len(audio_bytes) < 1000:
+        return True
+
+    sample_len = min(len(audio_bytes), 4096)
+    mean_square = sum(b * b for b in audio_bytes[:sample_len]) / sample_len
+    rms_value = mean_square**0.5 / 255.0
+    return rms_value < 0.01
+
+
+def webm_to_wav_bytes(audio_bytes: bytes) -> bytes | None:
+    """
+    Extract PCM audio from standalone WebM/Opus bytes using pydub.
+
+    Args:
+        audio_bytes: Raw WebM chunk from MediaRecorder stop/restart loop.
+
+    Returns:
+        bytes | None: WAV file bytes, or None when conversion fails.
+    """
+    try:
+        from pydub import AudioSegment
+
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="webm")
+        wav_buffer = io.BytesIO()
+        audio.export(wav_buffer, format="wav")
+        return wav_buffer.getvalue()
+    except Exception as exc:
+        logger.error("[SafeView] Pydub Error: %s", str(exc))
+        return None
+
+
 def transcribe_audio(audio_bytes: bytes, language: str) -> str:
     """
-    Transcribe WebM audio bytes with the cached Whisper model.
-
-    Writes input to a temporary .webm file, runs transcribe(), and returns
-    lowercased stripped text. Temp file is removed in a finally block (BR-02).
+    Transcribe audio bytes using Whisper. Converts WebM to WAV first when possible.
 
     Args:
         audio_bytes: Raw WebM audio from the client.
@@ -61,6 +101,16 @@ def transcribe_audio(audio_bytes: bytes, language: str) -> str:
     Returns:
         str: Transcribed text, or empty string on error or if Whisper is not loaded.
     """
+    logger.info(
+        "[SafeView][Audio-B1] Processing standalone file: %s bytes",
+        len(audio_bytes),
+    )
+    logger.info(
+        "[SafeView][Audio-B1] Received audio chunk, size=%s bytes, language=%s",
+        len(audio_bytes),
+        language,
+    )
+
     if not WHISPER_LOADED or _whisper_model is None:
         logger.error(
             "[SafeView] transcribe_audio called but whisper-%s is not loaded.",
@@ -68,21 +118,42 @@ def transcribe_audio(audio_bytes: bytes, language: str) -> str:
         )
         return ""
 
-    temp_path: Optional[str] = None
+    if is_silent(audio_bytes):
+        logger.debug("[SafeView][Audio-B2] Silent chunk skipped")
+        return ""
+
+    wav_bytes = webm_to_wav_bytes(audio_bytes)
+    if not wav_bytes:
+        logger.warning(
+            "[SafeView][Audio-B2] WebM to WAV conversion failed — chunk skipped (size=%s)",
+            len(audio_bytes),
+        )
+        return ""
+
+    tmp_path: Optional[str] = None
+    transcribe_started = time.perf_counter()
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".webm", delete=False
-        ) as temp_file:
-            temp_file.write(audio_bytes)
-            temp_path = temp_file.name
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(wav_bytes)
+            tmp_path = tmp.name
 
         result = _whisper_model.transcribe(
-            temp_path,
+            tmp_path,
             language=language,
+            beam_size=1,
+            best_of=1,
+            temperature=0,
             fp16=False,
+            condition_on_previous_text=False,
         )
-        text = result.get("text", "") if isinstance(result, dict) else ""
-        return str(text).lower().strip()
+        text = result.get("text", "").strip().lower()
+        elapsed_ms = (time.perf_counter() - transcribe_started) * 1000
+        logger.info(
+            "[SafeView][Audio-B3] Transcription: '%s' (processed in %.0fms)",
+            text[:100],
+            elapsed_ms,
+        )
+        return text
     except Exception as exc:
         logger.error(
             "[SafeView] transcribe_audio failed (language=%s): %s",
@@ -91,15 +162,11 @@ def transcribe_audio(audio_bytes: bytes, language: str) -> str:
         )
         return ""
     finally:
-        if temp_path is not None:
+        if tmp_path is not None:
             try:
-                os.unlink(temp_path)
-            except OSError as exc:
-                logger.warning(
-                    "[SafeView] Failed to delete temp audio file %s: %s",
-                    temp_path,
-                    exc,
-                )
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 load_whisper()

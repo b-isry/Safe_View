@@ -54,6 +54,7 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             "detected": result["detected"],
             "confidence": result["confidence"],
             "action": result["action"],
+            "label": result.get("label", "SFW"),
             "model_loaded": True,
         }
     except Exception as exc:
@@ -73,5 +74,6 @@ def _fail_open_response() -> Dict[str, Any]:
         "detected": False,
         "confidence": 0.0,
         "action": inference.ACTION_ALLOW,
+        "label": "SFW",
         "model_loaded": model_loader.MODEL_LOADED,
     }

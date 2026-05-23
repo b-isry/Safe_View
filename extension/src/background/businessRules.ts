@@ -26,6 +26,12 @@ export const ACTIVE_MODEL_CATEGORIES: readonly string[] = ["nudity"];
 /** BR-05: audio mute duration in milliseconds. */
 export const MUTE_DURATION_MS = 1500;
 
+/** Whisper language codes supported for audio profanity detection. */
+export type AudioLanguage = "en" | "am";
+
+/** Default transcription language when not set in storage. */
+export const DEFAULT_AUDIO_LANGUAGE: AudioLanguage = "en";
+
 /** Per-category filter toggles stored in chrome.storage.local. */
 export interface CategoryToggles {
   nudity: boolean;
@@ -45,6 +51,8 @@ export interface SafeViewSettings {
   categories: CategoryToggles;
   /** BR-03: editable profanity blacklist (subtitle / audio stub). */
   profanityWords: string[];
+  /** Whisper language for POST /analyze-audio (en | am). */
+  language: AudioLanguage;
 }
 
 /** Storage keys for SafeView settings. */
@@ -63,7 +71,13 @@ export const DEFAULT_SETTINGS: SafeViewSettings = {
     lgbtq: true,
   },
   profanityWords: [...DEFAULT_PROFANITY_WORDS],
+  language: DEFAULT_AUDIO_LANGUAGE,
 };
+
+/** In-memory settings cache (updated via initSettingsCache / storage.onChanged). */
+let cachedSettings: SafeViewSettings = { ...DEFAULT_SETTINGS };
+
+let settingsCacheListenerRegistered = false;
 
 /**
  * Compute BR-01 effective detection threshold.
@@ -94,34 +108,89 @@ export function shouldBlur(
  *
  * @returns SafeViewSettings merged with defaults.
  */
+/**
+ * Merge a partial stored settings object with defaults.
+ *
+ * @param raw - Partial settings from chrome.storage.local.
+ * @returns Resolved SafeViewSettings.
+ */
+function mergeSettings(raw: Partial<SafeViewSettings> | undefined): SafeViewSettings {
+  if (!raw) {
+    return { ...DEFAULT_SETTINGS };
+  }
+
+  return {
+    protectionEnabled:
+      raw.protectionEnabled ?? DEFAULT_SETTINGS.protectionEnabled,
+    backendUrl: raw.backendUrl ?? DEFAULT_SETTINGS.backendUrl,
+    sensitivity: raw.sensitivity ?? DEFAULT_SETTINGS.sensitivity,
+    categories: {
+      ...DEFAULT_SETTINGS.categories,
+      ...raw.categories,
+    },
+    profanityWords: Array.isArray(raw.profanityWords)
+      ? raw.profanityWords.filter(
+          (word): word is string =>
+            typeof word === "string" && word.trim().length > 0
+        )
+      : [...DEFAULT_SETTINGS.profanityWords],
+    language: raw.language === "am" ? "am" : DEFAULT_AUDIO_LANGUAGE,
+  };
+}
+
+/**
+ * Synchronous read of cached settings (no storage I/O per frame).
+ *
+ * @returns Latest in-memory SafeViewSettings.
+ */
+export function getCachedSettings(): SafeViewSettings {
+  return cachedSettings;
+}
+
+/**
+ * Hydrate settings cache and listen for options-page updates.
+ */
+export async function initSettingsCache(): Promise<void> {
+  cachedSettings = await loadSettings();
+
+  if (settingsCacheListenerRegistered) {
+    return;
+  }
+
+  settingsCacheListenerRegistered = true;
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") {
+      return;
+    }
+
+    const settingsChange = changes[SETTINGS_STORAGE_KEY];
+    if (settingsChange === undefined) {
+      return;
+    }
+
+    cachedSettings = mergeSettings(
+      settingsChange.newValue as Partial<SafeViewSettings> | undefined
+    );
+  });
+}
+
+/**
+ * Load user settings from chrome.storage.local, falling back to defaults (BR-04).
+ *
+ * @returns SafeViewSettings merged with defaults.
+ */
 export async function loadSettings(): Promise<SafeViewSettings> {
   try {
     const stored = await chrome.storage.local.get(SETTINGS_STORAGE_KEY);
     const raw = stored[SETTINGS_STORAGE_KEY] as Partial<SafeViewSettings> | undefined;
-
-    if (!raw) {
-      return { ...DEFAULT_SETTINGS };
-    }
-
-    return {
-      protectionEnabled:
-        raw.protectionEnabled ?? DEFAULT_SETTINGS.protectionEnabled,
-      backendUrl: raw.backendUrl ?? DEFAULT_SETTINGS.backendUrl,
-      sensitivity: raw.sensitivity ?? DEFAULT_SETTINGS.sensitivity,
-      categories: {
-        ...DEFAULT_SETTINGS.categories,
-        ...raw.categories,
-      },
-      profanityWords: Array.isArray(raw.profanityWords)
-        ? raw.profanityWords.filter(
-            (word): word is string =>
-              typeof word === "string" && word.trim().length > 0
-          )
-        : [...DEFAULT_SETTINGS.profanityWords],
-    };
+    const merged = mergeSettings(raw);
+    cachedSettings = merged;
+    return merged;
   } catch (error) {
     console.error("[SafeView] Failed to load settings:", error);
-    return { ...DEFAULT_SETTINGS };
+    cachedSettings = { ...DEFAULT_SETTINGS };
+    return cachedSettings;
   }
 }
 
@@ -132,10 +201,25 @@ export async function loadSettings(): Promise<SafeViewSettings> {
  * @returns List of enabled category names for /analyze-image.
  */
 export function getEnabledCategories(settings: SafeViewSettings): string[] {
+  if (!settings.protectionEnabled) {
+    return [];
+  }
+
   const activeSet = new Set<string>(ACTIVE_MODEL_CATEGORIES);
-  return (Object.keys(settings.categories) as (keyof CategoryToggles)[]).filter(
+  const enabled = (Object.keys(settings.categories) as (keyof CategoryToggles)[]).filter(
     (key) => settings.categories[key] && activeSet.has(key)
   );
+
+  if (enabled.length > 0) {
+    return enabled;
+  }
+
+  // Strict mode: nudity inference stays on while protection is enabled.
+  if (activeSet.has("nudity")) {
+    return ["nudity"];
+  }
+
+  return enabled;
 }
 
 /**
@@ -145,6 +229,7 @@ export function getEnabledCategories(settings: SafeViewSettings): string[] {
  */
 export async function saveSettings(settings: SafeViewSettings): Promise<void> {
   try {
+    cachedSettings = settings;
     await chrome.storage.local.set({
       [SETTINGS_STORAGE_KEY]: settings,
     });

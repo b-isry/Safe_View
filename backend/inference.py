@@ -14,11 +14,12 @@ from PIL import Image
 from torchvision import transforms
 
 import model_loader
+import vision_service
 
 logger = logging.getLogger(__name__)
 
 # BR-01: confidence floor regardless of user sensitivity setting
-CONFIDENCE_FLOOR = 0.75
+CONFIDENCE_FLOOR = vision_service.VISION_THRESHOLD
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -112,12 +113,14 @@ def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
             "detected": False,
             "confidence": 0.0,
             "action": ACTION_ALLOW,
+            "label": "SFW",
         }
 
     effective_threshold = max(CONFIDENCE_FLOOR, sensitivity)
     detected = False
     confidence = 0.0
     action = ACTION_ALLOW
+    label = "SFW"
 
     try:
         assert not model.training
@@ -127,6 +130,12 @@ def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
         with torch.no_grad():
             logits = model(tensor)
             confidence = _confidence_from_logits(logits)
+            label = (
+                "NSFW"
+                if logits[0, POSITIVE_CLASS_INDEX].item()
+                > logits[0, NEGATIVE_CLASS_INDEX].item()
+                else "SFW"
+            )
             detected = confidence >= effective_threshold
             action = ACTION_BLUR if detected else ACTION_ALLOW
             del logits
@@ -152,6 +161,7 @@ def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
         detected = False
         confidence = 0.0
         action = ACTION_ALLOW
+        label = "SFW"
     finally:
         _purge_tensor(tensor)
 
@@ -159,4 +169,5 @@ def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
         "detected": detected,
         "confidence": confidence,
         "action": action,
+        "label": label,
     }

@@ -7,6 +7,13 @@
  * @jest-environment jsdom
  */
 
+jest.mock("../src/content/audioMonitor", () => ({
+  prepareVideoCrossOrigin: jest.fn(),
+  startSubtitleMonitor: jest.fn(),
+  stopSubtitleMonitor: jest.fn(),
+  onVideoTrackedForSpeakerSuppression: jest.fn(),
+}));
+
 import {
   BLUR_FILTER,
   BLUR_RADIUS_PX,
@@ -89,7 +96,7 @@ describe("blurManager", () => {
     expect(BLUR_FILTER).toBe("blur(24px)");
   });
 
-  it("applies blur(24px) with 0.15s transition on BLUR", () => {
+  it("applies blur(24px) instantly on BLUR (no transition)", () => {
     const video = document.createElement("video");
     mockVideoLayout(video, 640, 360);
     document.body.appendChild(video);
@@ -99,7 +106,7 @@ describe("blurManager", () => {
     applyBlur(videoId!);
 
     expect(readVideoFilter(video)).toBe(BLUR_FILTER);
-    expect(video.style.transition).toBe(BLUR_TRANSITION);
+    expect(video.style.transition).toBe("none");
     expect(isVideoBlurred(video)).toBe(true);
 
     stopVideoMonitor();
@@ -116,10 +123,8 @@ describe("blurManager", () => {
 
     const videoId = getVideoTrackState(video)?.videoId;
     applyBlur(videoId!);
-    jest.advanceTimersByTime(MIN_BLUR_HOLD_MS + 1);
-    for (let i = 0; i < CLEAR_STREAK_REQUIRED; i += 1) {
-      clearBlur(videoId!);
-    }
+    clearBlur(videoId!);
+    jest.advanceTimersByTime(200);
     jest.useRealTimers();
 
     expect(video.style.filter).toBe("brightness(1.1)");
@@ -150,7 +155,6 @@ describe("blurManager", () => {
   });
 
   it("removes blur when service worker sends CLEAR message", () => {
-    jest.useFakeTimers();
     const video = document.createElement("video");
     mockVideoLayout(video, 640, 360);
     document.body.appendChild(video);
@@ -160,11 +164,7 @@ describe("blurManager", () => {
     const videoId = getVideoTrackState(video)?.videoId;
 
     messageListener({ action: MESSAGE_ACTION_BLUR, videoId });
-    jest.advanceTimersByTime(MIN_BLUR_HOLD_MS + 1);
-    for (let i = 0; i < CLEAR_STREAK_REQUIRED; i += 1) {
-      messageListener({ action: MESSAGE_ACTION_CLEAR, videoId });
-    }
-    jest.useRealTimers();
+    messageListener({ action: MESSAGE_ACTION_CLEAR, videoId });
 
     expect(readVideoFilter(video)).toBe("");
     expect(isVideoBlurred(video)).toBe(false);
@@ -189,14 +189,49 @@ describe("blurManager", () => {
     expect(readVideoFilter(videoA)).toBe(BLUR_FILTER);
     expect(readVideoFilter(videoB)).toBe("");
 
-    jest.advanceTimersByTime(MIN_BLUR_HOLD_MS + 1);
-    for (let i = 0; i < CLEAR_STREAK_REQUIRED; i += 1) {
-      clearBlur(idB!);
-    }
+    clearBlur(idB!);
     jest.useRealTimers();
 
     expect(readVideoFilter(videoA)).toBe("");
 
+    stopVideoMonitor();
+  });
+
+  it("does not blur YouTube player chrome outside the video surface", () => {
+    const locationSpy = jest
+      .spyOn(window, "location", "get")
+      .mockReturnValue({ hostname: "www.youtube.com" } as Location);
+
+    const player = document.createElement("div");
+    player.id = "movie_player";
+
+    const surface = document.createElement("div");
+    surface.className = "html5-video-container";
+
+    const video = document.createElement("video");
+    mockVideoLayout(video, 640, 360);
+
+    const controls = document.createElement("div");
+    controls.className = "ytp-chrome-bottom";
+
+    surface.appendChild(video);
+    player.appendChild(surface);
+    player.appendChild(controls);
+    document.body.appendChild(player);
+    startVideoMonitor();
+
+    const videoId = getVideoTrackState(video)?.videoId;
+    applyBlur(videoId!);
+
+    expect(readVideoFilter(video)).toBe(BLUR_FILTER);
+    expect(player.style.filter).toBe("");
+    expect(controls.style.filter).toBe("");
+
+    const overlay = document.querySelector(".safeview-blur-overlay");
+    expect(overlay?.parentElement).toBe(surface);
+    expect(overlay?.parentElement).not.toBe(player);
+
+    locationSpy.mockRestore();
     stopVideoMonitor();
   });
 

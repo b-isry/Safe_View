@@ -7,6 +7,7 @@ import {
   BACKEND_STATUS_STORAGE_KEY,
   analyzeImage,
   getBackendStatus,
+  parseAnalyzeImageResponseText,
 } from "../src/background/aiClient";
 import { SETTINGS_STORAGE_KEY } from "../src/background/businessRules";
 
@@ -79,13 +80,14 @@ describe("aiClient", () => {
   it("returns parsed response and sets online flag on success", async () => {
     (global.fetch as jest.Mock).mockResolvedValue({
       ok: true,
-      json: async () => ({
-        category: "nudity",
-        detected: true,
-        confidence: 0.9,
-        action: "BLUR",
-        model_loaded: true,
-      }),
+      text: async () =>
+        JSON.stringify({
+          category: "nudity",
+          detected: true,
+          confidence: 0.9,
+          action: "BLUR",
+          model_loaded: true,
+        }),
     });
 
     const result = await analyzeImage(
@@ -98,6 +100,29 @@ describe("aiClient", () => {
     expect(result.backendOnline).toBe(true);
     expect(result.response.confidence).toBe(0.9);
     expect(getBackendStatus().online).toBe(true);
+  });
+
+  it("returns null when response JSON is unparseable", async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      text: async () => "not json at all",
+    });
+
+    const result = await analyzeImage(
+      new Blob(["jpeg"], { type: "image/jpeg" }),
+      0.75,
+      "nudity"
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it("parses JSON wrapped in markdown fences", () => {
+    const parsed = parseAnalyzeImageResponseText(
+      '```json\n{"label":"NSFW","score":0.88,"detected":true,"action":"BLUR"}\n```'
+    );
+
+    expect(parsed).toMatchObject({ label: "NSFW", score: 0.88 });
   });
 
   it("never throws on HTTP error responses", async () => {

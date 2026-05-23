@@ -23,6 +23,7 @@ ANALYZE_RESPONSE_KEYS = {
     "confidence",
     "action",
     "model_loaded",
+    "label",
 }
 HEALTH_RESPONSE_KEYS = {"status", "model", "model_loaded", "whisper_loaded"}
 
@@ -66,7 +67,7 @@ def test_analyze_image_blank_jpeg_response_shape(
 
 def test_br01_threshold_floor_low_sensitivity() -> None:
     """
-    BR-01: sensitivity=0.1 still uses effective threshold 0.75 (not 0.1).
+    BR-01: sensitivity=0.1 still uses effective threshold floor (not 0.1).
     """
     low_sensitivity = 0.1
     effective = max(inference.CONFIDENCE_FLOOR, low_sensitivity)
@@ -75,8 +76,8 @@ def test_br01_threshold_floor_low_sensitivity() -> None:
     mock_model = MagicMock()
     mock_model.training = False
     mock_model.eval = MagicMock()
-    # confidence 0.72 after sigmoid — above 0.1 but below BR-01 floor 0.75
-    mock_model.return_value = __import__("torch").tensor([[0.0, 0.97]])
+    # confidence ~0.38 after sigmoid — above 0.1 but below BR-01 floor
+    mock_model.return_value = __import__("torch").tensor([[0.0, -0.5]])
 
     tensor = __import__("torch").zeros(1, 3, 224, 224)
 
@@ -87,7 +88,7 @@ def test_br01_threshold_floor_low_sensitivity() -> None:
 
     assert result["detected"] is False
     assert result["action"] == inference.ACTION_ALLOW
-    assert result["confidence"] == pytest.approx(0.7253, rel=1e-2)
+    assert result["confidence"] == pytest.approx(0.3775, rel=1e-2)
 
 
 @pytest.mark.parametrize(

@@ -1,47 +1,18 @@
 // SafeView — audioMonitor.ts
 // Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
 // Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
-// Purpose: Record WebM audio chunks from <video> and mute on profanity (BR-05).
+// Purpose: Subtitle cue profanity (instant mute) and MUTE commands from the service worker.
+// Tab-capture audio runs in the offscreen document — not in this content script.
 
-import {
-  DEFAULT_AUDIO_LANGUAGE,
-  loadSettings,
-  MUTE_DURATION_MS,
-  SETTINGS_STORAGE_KEY,
-  type AudioLanguage,
-} from "../background/businessRules";
-import {
-  findPrimaryVisibleVideo,
-  getVideoById,
-  getVideoTrackState,
-} from "./videoMonitor";
+import { loadSettings, MUTE_DURATION_MS } from "../background/businessRules";
+import { getVideoById } from "./videoMonitor";
 
-/** Content script → service worker: WebM/Opus audio chunk. */
-export const MESSAGE_ACTION_AUDIO_CHUNK = "AUDIO_CHUNK";
-
-/** Service worker → content script: mute video for BR-05 duration. */
+/** Service worker → content script: mute video element (BR-05). */
 export const MESSAGE_ACTION_MUTE = "MUTE";
 
-/** MediaRecorder timeslice / chunk length (ms). */
-export const AUDIO_CHUNK_MS = 2000;
-
-/** Preferred Opus-in-WebM MIME type for MediaRecorder. */
-export const AUDIO_WEBM_OPUS_MIME = "audio/webm;codecs=opus";
-
-/** Chunk size for base64 encoding (avoids spread-arg limits on large buffers). */
-const BASE64_CHUNK_SIZE = 0x8000;
-
-/**
- * Per-video MediaRecorder state.
- */
-interface AudioMonitorState {
-  videoId: number;
-  stream: MediaStream;
-  recorder: MediaRecorder;
-  muteTimeoutId: ReturnType<typeof setTimeout> | null;
-}
-
-const audioMonitors = new WeakMap<HTMLVideoElement, AudioMonitorState>();
+/** Service worker → content script: suppress native page video speakers (H5). */
+export const MESSAGE_ACTION_SET_TAB_SPEAKER_SUPPRESSED =
+  "SET_TAB_SPEAKER_SUPPRESSED";
 
 /**
  * Incoming mute command from the service worker.
@@ -53,111 +24,62 @@ export interface MuteCommandMessage {
 }
 
 /**
- * Resolve MediaRecorder MIME type supported by the browser.
- *
- * @returns audio/webm;codecs=opus when supported, else audio/webm.
+ * Per-video subtitle monitor state (mute timeouts and cue listeners).
  */
-function resolveRecorderMimeType(): string {
-  if (
-    typeof MediaRecorder !== "undefined" &&
-    MediaRecorder.isTypeSupported(AUDIO_WEBM_OPUS_MIME)
-  ) {
-    return AUDIO_WEBM_OPUS_MIME;
-  }
+interface SubtitleMonitorState {
+  muteTimeoutId: ReturnType<typeof setTimeout> | null;
+  cueHandlers: Array<{ track: TextTrack; handler: () => void }>;
+  addTrackHandler: ((event: Event) => void) | null;
+}
 
-  return "audio/webm";
+const subtitleMonitors = new WeakMap<HTMLVideoElement, SubtitleMonitorState>();
+
+let tabSpeakerSuppressed = false;
+
+/**
+ * Set crossOrigin for CORS-safe Web Audio / analyzer access on media elements.
+ *
+ * @param video - HTMLVideoElement to prepare.
+ */
+export function prepareVideoCrossOrigin(video: HTMLVideoElement): void {
+  if (video.crossOrigin !== "anonymous") {
+    video.crossOrigin = "anonymous";
+  }
 }
 
 /**
- * Encode audio bytes as base64 for chrome.runtime.sendMessage.
+ * Return true when text contains any blacklist term (substring match).
  *
- * @param buffer - Raw chunk bytes from MediaRecorder.
- * @returns Base64 string safe for message passing.
+ * @param text - Subtitle cue text.
+ * @param words - User profanity list from settings (BR-03).
  */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-
-  for (let offset = 0; offset < bytes.length; offset += BASE64_CHUNK_SIZE) {
-    const chunk = bytes.subarray(offset, offset + BASE64_CHUNK_SIZE);
-    binary += String.fromCharCode(...chunk);
+function subtitleTextMatchesProfanity(text: string, words: string[]): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return false;
   }
 
-  return btoa(binary);
-}
-
-/**
- * Read Whisper language from chrome.storage.local settings (default en).
- *
- * @returns Audio language code for /analyze-audio.
- */
-export async function resolveAudioLanguage(): Promise<AudioLanguage> {
-  try {
-    const settings = await loadSettings();
-    return settings.language === "am" ? "am" : DEFAULT_AUDIO_LANGUAGE;
-  } catch {
-    try {
-      const stored = await chrome.storage.local.get(SETTINGS_STORAGE_KEY);
-      const raw = stored[SETTINGS_STORAGE_KEY] as { language?: string } | undefined;
-      return raw?.language === "am" ? "am" : DEFAULT_AUDIO_LANGUAGE;
-    } catch {
-      return DEFAULT_AUDIO_LANGUAGE;
+  for (const word of words) {
+    const term = word.trim().toLowerCase();
+    if (term.length > 0 && normalized.includes(term)) {
+      return true;
     }
   }
+
+  return false;
 }
 
 /**
- * Send one audio chunk to the service worker; discard blob after encoding (BR-02).
- *
- * @param chunk - WebM blob from MediaRecorder (not retained after send).
- * @param video - Source video element.
- * @param videoId - Stable id for this video.
- */
-async function sendAudioChunk(
-  chunk: Blob,
-  video: HTMLVideoElement,
-  videoId: number
-): Promise<void> {
-  const primaryVideo = findPrimaryVisibleVideo();
-  if (primaryVideo && primaryVideo !== video) {
-    return;
-  }
-
-  if (chunk.size === 0) {
-    return;
-  }
-
-  const language = await resolveAudioLanguage();
-
-  try {
-    const audioBase64 = arrayBufferToBase64(await chunk.arrayBuffer());
-
-    void chrome.runtime
-      .sendMessage({
-        action: MESSAGE_ACTION_AUDIO_CHUNK,
-        audioBase64,
-        language,
-        videoId,
-      })
-      .catch(() => {
-        /* Fire-and-forget; service worker acks immediately. */
-      });
-  } catch (error) {
-    console.warn("[SafeView] Could not send audio chunk:", error);
-  }
-}
-
-/**
- * Mute a video for exactly duration_ms (BR-05), then restore prior muted state.
+ * Mute a video for exactly duration_ms (BR-05), then unmute.
  *
  * @param video - Target HTMLVideoElement.
- * @param durationMs - Mute hold from backend (expected 1500).
- * @param state - Optional monitor state holding the active timeout id.
+ * @param durationMs - Mute hold (expected 1500).
+ * @param state - Optional monitor state for timeout cleanup.
  */
-function applyMute(
+export function applyMute(
   video: HTMLVideoElement,
   durationMs: number,
-  state?: AudioMonitorState
+  state?: SubtitleMonitorState
 ): void {
   if (state?.muteTimeoutId !== null && state?.muteTimeoutId !== undefined) {
     clearTimeout(state.muteTimeoutId);
@@ -178,91 +100,110 @@ function applyMute(
 }
 
 /**
- * Begin 2-second WebM/Opus recording on a tracked video element.
+ * Handle cuechange on a text track — instant mute when profanity appears in subtitles.
  *
- * @param video - HTMLVideoElement already registered in videoMonitor.
+ * @param video - Video element showing the track.
  */
-export function startAudioMonitor(video: HTMLVideoElement): void {
-  if (audioMonitors.has(video)) {
-    return;
-  }
-
-  const trackState = getVideoTrackState(video);
-  if (!trackState) {
-    return;
-  }
-
-  if (typeof video.captureStream !== "function") {
-    console.warn("[SafeView] Audio capture unavailable for this source");
-    return;
-  }
-
-  let stream: MediaStream;
-
-  try {
-    stream = video.captureStream();
-  } catch {
-    console.warn("[SafeView] Audio capture unavailable for this source");
-    return;
-  }
-
-  if (stream.getAudioTracks().length === 0) {
-    stream.getTracks().forEach((track) => track.stop());
-    return;
-  }
-
-  if (typeof MediaRecorder === "undefined") {
-    console.warn("[SafeView] Audio capture unavailable for this source");
-    stream.getTracks().forEach((track) => track.stop());
-    return;
-  }
-
-  let recorder: MediaRecorder;
-
-  try {
-    recorder = new MediaRecorder(stream, {
-      mimeType: resolveRecorderMimeType(),
-    });
-  } catch {
-    console.warn("[SafeView] Audio capture unavailable for this source");
-    stream.getTracks().forEach((track) => track.stop());
-    return;
-  }
-
-  const monitorState: AudioMonitorState = {
-    videoId: trackState.videoId,
-    stream,
-    recorder,
-    muteTimeoutId: null,
-  };
-
-  recorder.ondataavailable = (event: BlobEvent) => {
-    const chunk = event.data;
-    if (!chunk || chunk.size === 0) {
+function handleCueChange(video: HTMLVideoElement): void {
+  void (async () => {
+    const settings = await loadSettings();
+    if (!settings.protectionEnabled || !settings.categories.profanity) {
       return;
     }
 
-    void sendAudioChunk(chunk, video, trackState.videoId);
-  };
+    if (settings.profanityWords.length === 0) {
+      return;
+    }
 
-  try {
-    recorder.start(AUDIO_CHUNK_MS);
-  } catch {
-    console.warn("[SafeView] Audio capture unavailable for this source");
-    stream.getTracks().forEach((track) => track.stop());
-    return;
-  }
+    const tracks = video.textTracks;
+    let cueText = "";
 
-  audioMonitors.set(video, monitorState);
+    for (let i = 0; i < tracks.length; i += 1) {
+      const track = tracks[i];
+      if (!track.activeCues) {
+        continue;
+      }
+
+      for (let j = 0; j < track.activeCues.length; j += 1) {
+        const cue = track.activeCues[j];
+        if (cue && "text" in cue) {
+          cueText += `${(cue as VTTCue).text} `;
+        }
+      }
+    }
+
+    if (!subtitleTextMatchesProfanity(cueText, settings.profanityWords)) {
+      return;
+    }
+
+    const state = subtitleMonitors.get(video);
+    applyMute(video, MUTE_DURATION_MS, state);
+    console.info("[SafeView] Subtitle profanity detected — video muted.");
+  })();
 }
 
 /**
- * Stop MediaRecorder and release capture stream tracks for a video.
+ * Bind cuechange listeners on subtitle/caption tracks for one video.
+ *
+ * @param video - HTMLVideoElement to monitor.
+ */
+function bindTextTracks(video: HTMLVideoElement, state: SubtitleMonitorState): void {
+  const onCue = () => {
+    handleCueChange(video);
+  };
+
+  const enableTrack = (track: TextTrack) => {
+    if (track.kind !== "subtitles" && track.kind !== "captions") {
+      return;
+    }
+
+    track.mode = "hidden";
+    track.addEventListener("cuechange", onCue);
+    state.cueHandlers.push({ track, handler: onCue });
+  };
+
+  for (let i = 0; i < video.textTracks.length; i += 1) {
+    enableTrack(video.textTracks[i]!);
+  }
+
+  const onAddTrack = (event: Event) => {
+    const track = (event as TrackEvent).track;
+    if (track) {
+      enableTrack(track);
+    }
+  };
+
+  video.textTracks.addEventListener("addtrack", onAddTrack);
+  state.addTrackHandler = onAddTrack;
+}
+
+/**
+ * Start subtitle cue monitoring for instant profanity mute (no tab/audio capture here).
+ *
+ * @param video - HTMLVideoElement already registered in videoMonitor.
+ */
+export function startSubtitleMonitor(video: HTMLVideoElement): void {
+  if (subtitleMonitors.has(video)) {
+    return;
+  }
+
+  const state: SubtitleMonitorState = {
+    muteTimeoutId: null,
+    cueHandlers: [],
+    addTrackHandler: null,
+  };
+
+  bindTextTracks(video, state);
+  subtitleMonitors.set(video, state);
+}
+
+/**
+ * Stop subtitle monitoring and clear cue listeners for a video.
  *
  * @param video - HTMLVideoElement being unregistered.
  */
-export function stopAudioMonitor(video: HTMLVideoElement): void {
-  const state = audioMonitors.get(video);
+export function stopSubtitleMonitor(video: HTMLVideoElement): void {
+  const state = subtitleMonitors.get(video);
   if (!state) {
     return;
   }
@@ -272,28 +213,107 @@ export function stopAudioMonitor(video: HTMLVideoElement): void {
     state.muteTimeoutId = null;
   }
 
-  if (state.recorder.state !== "inactive") {
-    try {
-      state.recorder.stop();
-    } catch {
-      /* Recorder may already be stopped when the element is removed. */
-    }
+  for (const { track, handler } of state.cueHandlers) {
+    track.removeEventListener("cuechange", handler);
   }
 
-  state.stream.getTracks().forEach((track) => track.stop());
-  audioMonitors.delete(video);
+  if (state.addTrackHandler) {
+    video.textTracks.removeEventListener("addtrack", state.addTrackHandler);
+  }
+
+  subtitleMonitors.delete(video);
 }
 
 /**
- * Listen for MUTE commands from the service worker and apply BR-05 mute duration.
+ * Silence native <video> speaker output so only the offscreen delayed path is audible.
+ *
+ * @param video - Page video element.
+ */
+function applyTabSpeakerStateToVideo(video: HTMLVideoElement): void {
+  if (!tabSpeakerSuppressed) {
+    if (video.dataset.safeviewSpeakerHeld === "true") {
+      video.muted = video.dataset.safeviewPrevMuted === "true";
+      video.volume = Number(video.dataset.safeviewPrevVolume ?? "1");
+      delete video.dataset.safeviewSpeakerHeld;
+      delete video.dataset.safeviewPrevMuted;
+      delete video.dataset.safeviewPrevVolume;
+    }
+    return;
+  }
+
+  if (video.dataset.safeviewSpeakerHeld !== "true") {
+    video.dataset.safeviewPrevMuted = video.muted ? "true" : "false";
+    video.dataset.safeviewPrevVolume = String(video.volume);
+    video.dataset.safeviewSpeakerHeld = "true";
+  }
+
+  video.muted = true;
+  video.volume = 0;
+}
+
+/**
+ * Apply or release native speaker suppression on all page videos.
+ *
+ * @param suppress - When true, mute page videos so offscreen gain is the only output.
+ */
+export function setTabSpeakerSuppressed(suppress: boolean): void {
+  tabSpeakerSuppressed = suppress;
+  document.querySelectorAll("video").forEach((video) => {
+    applyTabSpeakerStateToVideo(video);
+  });
+  console.info(
+    "[SafeView] Tab native speaker suppression %s.",
+    suppress ? "enabled" : "disabled"
+  );
+}
+
+/**
+ * Cancel BR-05 subtitle mutes and restore native video mute state (not tab-speaker suppression).
+ */
+export function clearProcessingMutesOnNavigation(): void {
+  document.querySelectorAll("video").forEach((video) => {
+    const state = subtitleMonitors.get(video);
+    if (state?.muteTimeoutId !== null && state?.muteTimeoutId !== undefined) {
+      clearTimeout(state.muteTimeoutId);
+      state.muteTimeoutId = null;
+    }
+
+    if (video.dataset.safeviewSpeakerHeld === "true") {
+      return;
+    }
+
+    video.muted = false;
+  });
+}
+
+/**
+ * Called when a new video is tracked while suppression is active (SPA navigation).
+ *
+ * @param video - Newly registered HTMLVideoElement.
+ */
+export function onVideoTrackedForSpeakerSuppression(video: HTMLVideoElement): void {
+  if (tabSpeakerSuppressed) {
+    applyTabSpeakerStateToVideo(video);
+  }
+}
+
+/**
+ * Listen for MUTE and tab-speaker commands from the service worker.
  */
 export function initAudioMuteListener(): void {
   chrome.runtime.onMessage.addListener((message: unknown) => {
-    if (
-      !message ||
-      typeof message !== "object" ||
-      (message as MuteCommandMessage).action !== MESSAGE_ACTION_MUTE
-    ) {
+    if (!message || typeof message !== "object") {
+      return;
+    }
+
+    const payload = message as Record<string, unknown>;
+
+    if (payload.action === MESSAGE_ACTION_SET_TAB_SPEAKER_SUPPRESSED) {
+      setTabSpeakerSuppressed(Boolean(payload.suppress));
+      return;
+    }
+
+    if (payload.action !== MESSAGE_ACTION_MUTE) {
       return;
     }
 
@@ -312,7 +332,7 @@ export function initAudioMuteListener(): void {
         ? command.duration_ms
         : MUTE_DURATION_MS;
 
-    const state = audioMonitors.get(video);
+    const state = subtitleMonitors.get(video);
     applyMute(video, durationMs, state);
   });
 }

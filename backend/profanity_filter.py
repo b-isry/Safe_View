@@ -142,6 +142,11 @@ def detect_profanity(text: str, language: str) -> Dict[str, Optional[str] | bool
     """
     clean = text.strip().lower()
     if not clean:
+        logger.info(
+            "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
+            False,
+            len(text),
+        )
         return {
             "detected": False,
             "matched_word": None,
@@ -150,6 +155,11 @@ def detect_profanity(text: str, language: str) -> Dict[str, Optional[str] | bool
 
     blacklist = _blacklist_for_language(language)
     if not blacklist:
+        logger.info(
+            "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
+            False,
+            len(text),
+        )
         return {
             "detected": False,
             "matched_word": None,
@@ -161,12 +171,22 @@ def detect_profanity(text: str, language: str) -> Dict[str, Optional[str] | bool
             continue
         if _word_matches_blacklist(word, blacklist):
             logger.info("[SafeView] Profanity detected.")
+            logger.info(
+                "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
+                True,
+                len(text),
+            )
             return {
                 "detected": True,
                 "matched_word": word,
                 "action": ACTION_MUTE,
             }
 
+    logger.info(
+        "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
+        False,
+        len(text),
+    )
     return {
         "detected": False,
         "matched_word": None,
