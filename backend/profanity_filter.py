@@ -166,6 +166,20 @@ def detect_profanity(text: str, language: str) -> Dict[str, Optional[str] | bool
             "action": ACTION_ALLOW,
         }
 
+    for term in blacklist:
+        if term in clean:
+            logger.info("[SafeView] Profanity detected in transcript.")
+            logger.info(
+                "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
+                True,
+                len(text),
+            )
+            return {
+                "detected": True,
+                "matched_word": term,
+                "action": ACTION_MUTE,
+            }
+
     for word in _WORD_SPLIT_RE.split(clean):
         if not word:
             continue

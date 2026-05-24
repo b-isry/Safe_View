@@ -16,9 +16,13 @@ import {
   loadSettings,
   saveSettings,
   SETTINGS_STORAGE_KEY,
+  type CategoryToggles,
   type SafeViewSettings,
 } from "../background/businessRules";
-import { notifySettingsUpdated } from "../shared/settingsMessages";
+import {
+  isProfanityProtectionActive,
+  notifySettingsUpdated,
+} from "../shared/settingsMessages";
 
 /** Visual status for the popup indicator dot. */
 type StatusDotState = "green" | "red" | "grey";
@@ -32,9 +36,22 @@ const filterCountEl = document.getElementById("filterCount") as HTMLSpanElement;
 const backendStatusEl = document.getElementById(
   "backendStatus"
 ) as HTMLSpanElement;
+/** Category keys in popup order (must match popup HTML data-category). */
+const POPUP_CATEGORY_KEYS: (keyof CategoryToggles)[] = [
+  "nudity",
+  "violence",
+  "kissing",
+  "profanity",
+  "lgbtq",
+];
+
 const openOptionsButton = document.getElementById(
   "openOptions"
 ) as HTMLButtonElement;
+
+const categoryCheckboxes: HTMLInputElement[] = POPUP_CATEGORY_KEYS.map((key) =>
+  document.querySelector(`[data-category="${key}"]`) as HTMLInputElement
+);
 
 /**
  * Count enabled category filters from settings.
@@ -44,6 +61,69 @@ const openOptionsButton = document.getElementById(
  */
 function countActiveFilters(settings: SafeViewSettings): number {
   return getEnabledCategories(settings).length;
+}
+
+/**
+ * Sync category checkbox checked state from persisted settings.
+ *
+ * @param settings - Current SafeView settings.
+ */
+function syncCategoryCheckboxes(settings: SafeViewSettings): void {
+  POPUP_CATEGORY_KEYS.forEach((key, index) => {
+    const checkbox = categoryCheckboxes[index];
+    if (checkbox) {
+      checkbox.checked = settings.categories[key];
+    }
+  });
+}
+
+/**
+ * Persist category toggles and notify content + service worker (immediate capture stop).
+ */
+async function handleCategoryTogglesChange(): Promise<void> {
+  try {
+    const settings = await loadSettings();
+    POPUP_CATEGORY_KEYS.forEach((key, index) => {
+      const checkbox = categoryCheckboxes[index];
+      if (checkbox) {
+        settings.categories[key] = checkbox.checked;
+      }
+    });
+
+    await saveSettings(settings);
+    await notifySettingsUpdated("popup_category_toggle");
+    filterCountEl.textContent = String(countActiveFilters(settings));
+
+    if (isProfanityProtectionActive(settings)) {
+      const [tab] = await chrome.tabs.query({
+        active: true,
+        currentWindow: true,
+      });
+      const tabId = tab?.id;
+      if (tabId !== undefined) {
+        try {
+          await chrome.runtime.sendMessage({
+            action: MESSAGE_ACTION_START_PIPELINE_WITH_STREAM,
+            tabId,
+          });
+        } catch (pipelineError) {
+          console.warn(
+            "[SafeView] Audio pipeline start after category change failed:",
+            pipelineError
+          );
+        }
+      }
+    }
+
+    const backendStatus = getBackendStatus();
+    const dotState = resolveStatusDotState(
+      settings.protectionEnabled,
+      backendStatus.online
+    );
+    renderStatusDot(dotState);
+  } catch (error) {
+    console.error("[SafeView] Category toggle save failed:", error);
+  }
 }
 
 /**
@@ -146,6 +226,7 @@ async function refreshPopup(runHealthCheck: boolean): Promise<void> {
     );
 
     protectionToggle.checked = settings.protectionEnabled;
+    syncCategoryCheckboxes(settings);
     filterCountEl.textContent = String(countActiveFilters(settings));
     renderStatusDot(dotState);
     renderBackendStatusText(backendStatus);
@@ -182,17 +263,20 @@ async function handleProtectionToggle(): Promise<void> {
 
       settings.protectionEnabled = true;
       await saveSettings(settings);
+      await notifySettingsUpdated("protection_on");
 
-      try {
-        await chrome.runtime.sendMessage({
-          action: MESSAGE_ACTION_START_PIPELINE_WITH_STREAM,
-          tabId,
-        });
-      } catch (pipelineError) {
-        console.warn(
-          "[SafeView] Audio pipeline start failed — visual moderation continues:",
-          pipelineError
-        );
+      if (isProfanityProtectionActive(settings)) {
+        try {
+          await chrome.runtime.sendMessage({
+            action: MESSAGE_ACTION_START_PIPELINE_WITH_STREAM,
+            tabId,
+          });
+        } catch (pipelineError) {
+          console.warn(
+            "[SafeView] Audio pipeline start failed — visual moderation continues:",
+            pipelineError
+          );
+        }
       }
     } else {
       settings.protectionEnabled = false;
@@ -242,6 +326,12 @@ function handleStorageChanged(
 function initPopup(): void {
   protectionToggle.addEventListener("change", () => {
     void handleProtectionToggle();
+  });
+
+  categoryCheckboxes.forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      void handleCategoryTogglesChange();
+    });
   });
 
   openOptionsButton.addEventListener("click", handleOpenOptions);

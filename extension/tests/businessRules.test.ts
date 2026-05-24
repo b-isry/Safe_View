@@ -46,9 +46,13 @@ describe("businessRules BR-01", () => {
     const settingsOff = {
       ...DEFAULT_SETTINGS,
       protectionEnabled: true,
-      categories: { ...DEFAULT_SETTINGS.categories, nudity: false },
+      categories: {
+        ...DEFAULT_SETTINGS.categories,
+        nudity: false,
+        violence: false,
+      },
     };
-    expect(getEnabledCategories(settingsOn)).toEqual(["nudity"]);
+    expect(getEnabledCategories(settingsOn)).toEqual(["nudity", "violence"]);
     expect(getEnabledCategories(settingsOff)).toEqual([]);
   });
 

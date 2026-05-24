@@ -1,6 +1,11 @@
 // SafeView — elementAudioPipeline.ts
 // Primary audio path: route native <video> through Web Audio delay vault + scout recorder.
 
+import { loadSettings, SETTINGS_STORAGE_KEY } from "../background/businessRules";
+import {
+  isProfanityProtectionActive,
+  MESSAGE_ACTION_SETTINGS_UPDATED,
+} from "../shared/settingsMessages";
 import { findPrimaryVisibleVideo } from "./videoMonitor";
 
 /** Service worker → content: start native video element audio graph. */
@@ -21,10 +26,12 @@ export const MESSAGE_ACTION_RESET_PIPELINE_GAIN = "RESET_PIPELINE_GAIN";
 const MESSAGE_ACTION_AUDIO_CHUNK_PIPELINE = "AUDIO_CHUNK_PIPELINE";
 
 const AUDIO_WEBM_OPUS_MIME = "audio/webm;codecs=opus";
-const DELAY_SECONDS = 1.5;
-const SCOUT_CHUNK_MS = 1000;
-const MIN_BLOB_BYTES = 500;
-const MUTE_HOLD_MS = 1500;
+const DELAY_SECONDS = 4.5;
+const SCOUT_CHUNK_MS = 3000;
+const SCOUT_REQUEST_DATA_MS = 1000;
+const MIN_BLOB_BYTES = 5000;
+const MUTE_HOLD_MS = 3500;
+const VOLUME_HAMMER_MS = 200;
 
 /** Matches videoMonitor.ts SAFE_VIEW_TRACKED_DATASET (data-safe-view-tracked). */
 const SAFE_VIEW_TRACKED_DATASET = "safeViewTracked";
@@ -36,8 +43,13 @@ let mediaElementSource: MediaElementAudioSourceNode | null = null;
 let boundVideo: HTMLVideoElement | null = null;
 let streamDestination: MediaStreamAudioDestinationNode | null = null;
 let scoutRecorder: MediaRecorder | null = null;
-let scoutRecorderIntervalId: ReturnType<typeof setInterval> | null = null;
+let scoutRequestDataIntervalId: ReturnType<typeof setInterval> | null = null;
+let scoutChunkStopIntervalId: ReturnType<typeof setInterval> | null = null;
 let gainRestoreTimeoutId: ReturnType<typeof setTimeout> | null = null;
+let volumeGuardVideo: HTMLVideoElement | null = null;
+let volumeChangeHandler: ((this: HTMLVideoElement, ev: Event) => void) | null = null;
+let volumeHammerIntervalId: ReturnType<typeof setInterval> | null = null;
+let nativeSilenceLockActive = false;
 
 /**
  * Set crossOrigin before routing media through Web Audio (CORS analyzer safety).
@@ -61,6 +73,66 @@ function resolveRecorderMimeType(): string {
 /**
  * Bind the video element to Web Audio once per element (MediaElementSource is single-use).
  */
+function forceNativeVideoSilent(video: HTMLVideoElement): void {
+  if (!video.muted || video.volume > 0) {
+    video.muted = true;
+    video.volume = 0;
+  }
+}
+
+/**
+ * Lock native <video> output silent so only the Web Audio vault path is audible.
+ *
+ * @param video - Primary video element tapped by MediaElementSource.
+ */
+function startNativeVideoSilenceLock(video: HTMLVideoElement): void {
+  stopNativeVideoSilenceLock();
+
+  volumeGuardVideo = video;
+  nativeSilenceLockActive = true;
+  forceNativeVideoSilent(video);
+
+  volumeChangeHandler = () => {
+    if (!nativeSilenceLockActive || volumeGuardVideo !== video) {
+      return;
+    }
+
+    if (!video.muted || video.volume > 0) {
+      video.muted = true;
+      video.volume = 0;
+    }
+  };
+
+  video.addEventListener("volumechange", volumeChangeHandler);
+
+  volumeHammerIntervalId = window.setInterval(() => {
+    if (!nativeSilenceLockActive || volumeGuardVideo !== video) {
+      return;
+    }
+
+    video.muted = true;
+    video.volume = 0;
+  }, VOLUME_HAMMER_MS);
+
+  console.info("[SafeView][Audio-Vault] Native video silence lock active (volume guard + hammer).");
+}
+
+function stopNativeVideoSilenceLock(): void {
+  nativeSilenceLockActive = false;
+
+  if (volumeHammerIntervalId !== null) {
+    clearInterval(volumeHammerIntervalId);
+    volumeHammerIntervalId = null;
+  }
+
+  if (volumeGuardVideo && volumeChangeHandler) {
+    volumeGuardVideo.removeEventListener("volumechange", volumeChangeHandler);
+  }
+
+  volumeGuardVideo = null;
+  volumeChangeHandler = null;
+}
+
 function bindVideoSource(
   video: HTMLVideoElement,
   context: AudioContext
@@ -82,9 +154,14 @@ function bindVideoSource(
 }
 
 function stopScoutRecorderLoop(): void {
-  if (scoutRecorderIntervalId !== null) {
-    clearInterval(scoutRecorderIntervalId);
-    scoutRecorderIntervalId = null;
+  if (scoutRequestDataIntervalId !== null) {
+    clearInterval(scoutRequestDataIntervalId);
+    scoutRequestDataIntervalId = null;
+  }
+
+  if (scoutChunkStopIntervalId !== null) {
+    clearInterval(scoutChunkStopIntervalId);
+    scoutChunkStopIntervalId = null;
   }
 }
 
@@ -110,7 +187,7 @@ function startScoutRecorder(stream: MediaStream, tabId: number): void {
   });
 
   scoutRecorder.ondataavailable = async (event: BlobEvent) => {
-    if (!event.data || event.data.size < MIN_BLOB_BYTES) {
+    if (!event.data || event.data.size < 5000) {
       return;
     }
 
@@ -148,14 +225,26 @@ function startScoutRecorder(stream: MediaStream, tabId: number): void {
   };
 
   scoutRecorder.start();
+  console.log(
+    "[SafeView] Audio Stream Tracks:",
+    stream.getAudioTracks().length
+  );
   console.info(
-    "[SafeView][Audio-5] Scout recorder started, mimeType=%s, intervalMs=%s, tracks=%s",
+    "[SafeView][Audio-5] Scout recorder started, mimeType=%s, chunkMs=%s, requestDataMs=%s, minBytes=%s, tracks=%s",
     scoutRecorder.mimeType,
     SCOUT_CHUNK_MS,
+    SCOUT_REQUEST_DATA_MS,
+    MIN_BLOB_BYTES,
     stream.getAudioTracks().length
   );
 
-  scoutRecorderIntervalId = setInterval(() => {
+  scoutRequestDataIntervalId = setInterval(() => {
+    if (scoutRecorder && scoutRecorder.state === "recording") {
+      scoutRecorder.requestData();
+    }
+  }, SCOUT_REQUEST_DATA_MS);
+
+  scoutChunkStopIntervalId = setInterval(() => {
     if (scoutRecorder && scoutRecorder.state === "recording") {
       scoutRecorder.stop();
       scoutRecorder.start();
@@ -208,6 +297,15 @@ export async function startElementAudioFallback(tabId: number): Promise<boolean>
     tabId
   );
 
+  const settings = await loadSettings();
+  if (!isProfanityProtectionActive(settings)) {
+    console.info(
+      "[SafeView][Audio-1] Profanity off — skipping element audio pipeline."
+    );
+    stopElementAudioFallback();
+    return false;
+  }
+
   teardownProcessingGraph();
 
   const video = findPrimaryVisibleVideo();
@@ -251,23 +349,25 @@ export async function startElementAudioFallback(tabId: number): Promise<boolean>
     streamDestination = streamDest;
     sourceNode.connect(streamDest);
 
-    const trackCount = streamDest.stream.getAudioTracks().length;
-    console.info(
-      "[SafeView][Audio-2] MediaStreamDestination created, audioTracks=%s",
-      trackCount
+    console.log(
+      "[SafeView] Audio Stream Tracks:",
+      streamDest.stream.getAudioTracks().length
     );
 
-    if (trackCount === 0) {
+    if (streamDest.stream.getAudioTracks().length === 0) {
       console.warn(
         "[SafeView] MediaStreamDestination has zero audio tracks — scout recording may be empty."
       );
     }
 
+    await audioContext.resume();
+
     startScoutRecorder(streamDest.stream, tabId);
+
+    startNativeVideoSilenceLock(video);
 
     console.info("[SafeView][Audio-4] Playback audio playing (element path)");
 
-    await audioContext.resume();
     pipelineTabId = tabId;
 
     console.info(
@@ -302,7 +402,7 @@ export function resetElementPipelineGain(): void {
  *
  * @param durationSeconds - Hold duration before smooth restore.
  */
-export function applyElementGainMute(durationSeconds: number = DELAY_SECONDS): void {
+export function applyElementGainMute(durationSeconds: number = MUTE_HOLD_MS / 1000): void {
   console.info(
     "[SafeView][Audio-7] applyElementGainMute called, gainNode exists=%s, audioContext exists=%s, durationSeconds=%s",
     !!gainNode,
@@ -310,7 +410,14 @@ export function applyElementGainMute(durationSeconds: number = DELAY_SECONDS): v
     durationSeconds
   );
 
+  const video = boundVideo ?? findPrimaryVisibleVideo();
+  if (video instanceof HTMLVideoElement) {
+    video.muted = true;
+    video.volume = 0;
+  }
+
   if (!gainNode || !audioContext) {
+    console.info("[SafeView][Audio-8] Vault gain mute skipped — no gain node.");
     return;
   }
 
@@ -335,6 +442,7 @@ export function applyElementGainMute(durationSeconds: number = DELAY_SECONDS): v
     }
 
     gainNode.gain.setTargetAtTime(1, audioContext.currentTime, 0.05);
+    console.info("[SafeView][Audio-10] Vault gain restored.");
   }, durationSeconds * 1000);
 
   console.info("[SafeView] Element-path gain muted.");
@@ -344,6 +452,7 @@ export function applyElementGainMute(durationSeconds: number = DELAY_SECONDS): v
  * Tear down element audio graph and release capture state.
  */
 export function stopElementAudioFallback(): void {
+  stopNativeVideoSilenceLock();
   teardownProcessingGraph();
 
   if (gainRestoreTimeoutId !== null) {
@@ -399,6 +508,14 @@ export function initElementAudioPipelineListener(): void {
   document.addEventListener("yt-navigate-finish", handleYouTubeNavigateFinishGainReset);
   setupTrackedVideoGainResetObserver();
 
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local" || changes[SETTINGS_STORAGE_KEY] === undefined) {
+      return;
+    }
+
+    void applyProfanityAudioSettings("storage");
+  });
+
   chrome.runtime.onMessage.addListener((message: unknown) => {
     if (!message || typeof message !== "object") {
       return;
@@ -409,7 +526,11 @@ export function initElementAudioPipelineListener(): void {
     if (payload.action === MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK) {
       const tabId = payload.tabId;
       if (typeof tabId === "number") {
-        void startElementAudioFallback(tabId);
+        void startElementAudioFallback(tabId).then((started) => {
+          if (!started) {
+            stopElementAudioFallback();
+          }
+        });
       }
       return;
     }
@@ -432,8 +553,29 @@ export function initElementAudioPipelineListener(): void {
 
     if (payload.action === MESSAGE_ACTION_RESET_PIPELINE_GAIN) {
       resetElementPipelineGain();
+      return;
+    }
+
+    if (payload.action === MESSAGE_ACTION_SETTINGS_UPDATED) {
+      const reason =
+        typeof payload.reason === "string" ? payload.reason : "message";
+      void applyProfanityAudioSettings(reason);
     }
   });
+}
+
+/**
+ * Stop the audio pipeline when profanity is disabled; no-op when still enabled.
+ */
+export async function applyProfanityAudioSettings(reason: string): Promise<void> {
+  const settings = await loadSettings();
+  if (!isProfanityProtectionActive(settings)) {
+    console.info(
+      "[SafeView][Audio] Profanity off (%s) — stopping element audio pipeline.",
+      reason
+    );
+    stopElementAudioFallback();
+  }
 }
 
 export function getElementPipelineTabId(): number | undefined {

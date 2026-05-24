@@ -1,12 +1,10 @@
 // SafeView — blurDecision.ts
 // Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
 // Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
-// Purpose: Nudity-only BLUR / CLEAR state machine (detected + confidence only).
+// Purpose: BLUR / CLEAR for nudity (gated) and violence (YOLO detections).
 
 import {
   AFTER_UNSAFE_SAFE_CLEAR_STREAK,
-  SAFE_THRESHOLD,
-  SUSPICIOUS_THRESHOLD,
   UNSAFE_LOCK_MS,
   UNSAFE_THRESHOLD,
 } from "./latencyPolicy";
@@ -20,28 +18,39 @@ export type BlurEvaluation =
   | { action: "HOLD"; reason: string }
   | { action: "DROP"; reason: string };
 
+/** Backend content gate from /analyze-image. */
+export interface ContentTypeGate {
+  is_animation?: boolean;
+  is_real_human?: boolean;
+  gate_reason?: string | null;
+}
+
 /**
  * Inputs for one frame's blur decision (after /analyze-image).
- * Uses only nudity model detected + confidence — not face/person/skin heuristics.
+ * Blur only on real human nudity — not animation, person, face, or skin color.
  */
 export interface FrameBlurState {
+  /** Nudity confidence from /analyze-image (category=nudity). */
   score: number;
+  /** Violence confidence from /analyze-image (category=violence). */
+  violenceScore?: number;
   nudityDetected: boolean;
+  violenceDetected?: boolean;
+  backendAction: "BLUR" | "ALLOW" | null;
+  violenceAction?: "BLUR" | "ALLOW" | null;
+  contentType: ContentTypeGate | null;
+  gateReason: string | null;
   frameSeq: number;
   lastProcessedFrameSeq: number;
   resultGeneration: number;
   currentGeneration: number;
-  /** False when backend is offline, timed out, or parse failed. */
   backendTrusted: boolean;
-  /** False when the nudity model is not loaded on the server. */
   modelLoaded: boolean;
   requestId: number;
   latestRequestId: number;
-  /** True after any confirmed unsafe nudity on this video. */
   unsafeSeen: boolean;
   firstDecisionMade: boolean;
   safeStreak: number;
-  /** Do not clear blur before this timestamp (ms). */
   unsafeLockUntil: number;
   nowMs: number;
 }
@@ -57,23 +66,81 @@ export function normalizeBlurLabel(
     return label;
   }
 
-  return confidence >= SAFE_THRESHOLD ? "NSFW" : "SFW";
+  return confidence >= 0.5 ? "NSFW" : "SFW";
 }
 
-function isClearlySafe(detected: boolean, score: number): boolean {
-  return !detected && score < SAFE_THRESHOLD;
+function isGateAllow(state: FrameBlurState): boolean {
+  const gate = state.contentType;
+  const reason = state.gateReason ?? gate?.gate_reason ?? null;
+
+  if (state.violenceDetected || state.violenceAction === "BLUR") {
+    return false;
+  }
+
+  if (state.backendAction === "ALLOW") {
+    return true;
+  }
+
+  if (!state.nudityDetected) {
+    return true;
+  }
+
+  if (gate?.is_animation === true) {
+    return true;
+  }
+
+  if (reason === "animation_skip" || reason === "no_real_human") {
+    return true;
+  }
+
+  if (gate?.is_real_human === false) {
+    return true;
+  }
+
+  return false;
 }
 
-function isClearlyUnsafe(detected: boolean, score: number): boolean {
-  return detected && score >= UNSAFE_THRESHOLD;
+function isRealHumanNudityBlur(state: FrameBlurState): boolean {
+  const gate = state.contentType;
+
+  if (state.backendAction !== "BLUR") {
+    return false;
+  }
+
+  if (!state.nudityDetected) {
+    return false;
+  }
+
+  if (state.score < UNSAFE_THRESHOLD) {
+    return false;
+  }
+
+  if (gate?.is_animation === true) {
+    return false;
+  }
+
+  if (gate?.is_real_human !== true) {
+    return false;
+  }
+
+  return true;
 }
 
-function isSuspicious(score: number): boolean {
-  return score >= SUSPICIOUS_THRESHOLD;
+function isViolenceBlur(state: FrameBlurState): boolean {
+  if (state.violenceAction !== "BLUR") {
+    return false;
+  }
+
+  if (!state.violenceDetected) {
+    return false;
+  }
+
+  const violenceScore = state.violenceScore ?? 0;
+  return violenceScore >= UNSAFE_THRESHOLD;
 }
 
-function isUncertainBand(score: number): boolean {
-  return score >= SAFE_THRESHOLD && score < UNSAFE_THRESHOLD;
+function shouldBlurFrame(state: FrameBlurState): boolean {
+  return isRealHumanNudityBlur(state) || isViolenceBlur(state);
 }
 
 /**
@@ -108,17 +175,22 @@ export function evaluateBlurState(state: FrameBlurState): BlurEvaluation {
     return { action: "HOLD", reason: "model_not_loaded" };
   }
 
-  if (isClearlyUnsafe(state.nudityDetected, state.score)) {
-    return { action: "BLUR", reason: "unsafe" };
+  if (shouldBlurFrame(state)) {
+    const reason = isViolenceBlur(state) ? "violence" : "real_human_nudity";
+    return { action: "BLUR", reason };
   }
 
-  if (isSuspicious(state.score)) {
-    return { action: "BLUR", reason: "suspicious" };
-  }
-
-  if (isClearlySafe(state.nudityDetected, state.score)) {
+  if (isGateAllow(state)) {
     if (!state.unsafeSeen) {
-      return { action: "CLEAR", reason: "first_safe" };
+      const reason =
+        state.gateReason === "animation_skip"
+          ? "animation_skip"
+          : state.gateReason === "no_real_human"
+            ? "no_real_human"
+            : state.gateReason === "real_human_safe"
+              ? "real_human_safe"
+              : "first_safe";
+      return { action: "CLEAR", reason };
     }
 
     if (state.nowMs < state.unsafeLockUntil) {
@@ -133,20 +205,16 @@ export function evaluateBlurState(state: FrameBlurState): BlurEvaluation {
     return { action: "HOLD", reason: "building_safe_streak" };
   }
 
-  if (isUncertainBand(state.score)) {
-    if (!state.firstDecisionMade) {
-      return { action: "HOLD", reason: "uncertain_precheck" };
-    }
+  if (!state.firstDecisionMade) {
+    return { action: "HOLD", reason: "precheck" };
+  }
 
-    if (!state.unsafeSeen) {
-      return { action: "HOLD", reason: "uncertain_no_reblur" };
-    }
+  if (!state.unsafeSeen) {
+    return { action: "HOLD", reason: "pending" };
+  }
 
-    if (state.nowMs < state.unsafeLockUntil) {
-      return { action: "HOLD", reason: "unsafe_lock" };
-    }
-
-    return { action: "HOLD", reason: "uncertain_after_unsafe" };
+  if (state.nowMs < state.unsafeLockUntil) {
+    return { action: "HOLD", reason: "unsafe_lock" };
   }
 
   return { action: "HOLD", reason: "pending" };
@@ -175,11 +243,8 @@ export function applyBlurStateUpdates(
   if (evaluation.action === "BLUR") {
     safeStreak = 0;
     firstDecisionMade = true;
-
-    if (evaluation.reason === "unsafe") {
-      unsafeSeen = true;
-      unsafeLockUntil = state.nowMs + UNSAFE_LOCK_MS;
-    }
+    unsafeSeen = true;
+    unsafeLockUntil = state.nowMs + UNSAFE_LOCK_MS;
   } else if (evaluation.action === "CLEAR") {
     unsafeSeen = false;
     safeStreak = 0;
@@ -201,12 +266,15 @@ export function logBlurEvaluation(
     label: BlurLabel;
     score: number;
     nudityDetected: boolean;
+    violenceDetected?: boolean;
+    gateReason: string | null;
     frame: number;
     gen: number;
     currentGen?: number;
   }
 ): void {
-  const { label, score, nudityDetected, frame, gen, currentGen } = meta;
+  const { label, score, nudityDetected, violenceDetected, gateReason, frame, gen, currentGen } =
+    meta;
 
   if (evaluation.action === "DROP") {
     console.log(
@@ -221,8 +289,9 @@ export function logBlurEvaluation(
 
   if (evaluation.action === "HOLD") {
     console.log(
-      "[SafeView][DECISION] HOLD reason=%s label=%s score=%s frame=%s gen=%s",
+      "[SafeView][DECISION] HOLD reason=%s gate=%s label=%s score=%s frame=%s gen=%s",
       evaluation.reason,
+      gateReason ?? "-",
       label,
       score.toFixed(2),
       frame,
@@ -232,9 +301,11 @@ export function logBlurEvaluation(
   }
 
   console.log(
-    "[SafeView][DECISION] score=%s nudity_detected=%s → %s (%s)",
+    "[SafeView][DECISION] score=%s nudity=%s violence=%s gate=%s → %s (%s)",
     score.toFixed(2),
     nudityDetected,
+    violenceDetected ?? false,
+    gateReason ?? "-",
     evaluation.action,
     evaluation.reason
   );

@@ -93,6 +93,49 @@ def _confidence_from_logits(logits: torch.Tensor) -> float:
     return torch.sigmoid(logits.reshape(-1)[0]).item()
 
 
+def run_inference_raw(tensor: torch.Tensor) -> Dict[str, Any]:
+    """
+    Run forward pass and return raw nudity score (no sensitivity threshold).
+
+    Returns:
+        dict: confidence (P nudity), label (NSFW|SFW).
+    """
+    model = model_loader.get_model()
+    if model is None or not model_loader.MODEL_LOADED:
+        _purge_tensor(tensor)
+        return {
+            "confidence": 0.0,
+            "label": "SFW",
+        }
+
+    confidence = 0.0
+    label = "SFW"
+
+    try:
+        assert not model.training
+        model.eval()
+
+        with torch.inference_mode():
+            logits = model(tensor)
+            confidence = _confidence_from_logits(logits)
+            label = (
+                "NSFW"
+                if logits[0, POSITIVE_CLASS_INDEX].item()
+                > logits[0, NEGATIVE_CLASS_INDEX].item()
+                else "SFW"
+            )
+            del logits
+    except Exception as exc:
+        logger.error("[SafeView] Inference failed: %s", exc)
+    finally:
+        _purge_tensor(tensor)
+
+    return {
+        "confidence": confidence,
+        "label": label,
+    }
+
+
 def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
     """
     Run the cached model forward pass and apply BR-01 detection threshold.

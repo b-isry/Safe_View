@@ -21,7 +21,7 @@ export const SENSITIVITY_HIGH = 0.9;
 export const DEFAULT_PROFANITY_WORDS: string[] = [];
 
 /** Categories with real inference models (stubs skipped to avoid 5× /analyze-image per frame). */
-export const ACTIVE_MODEL_CATEGORIES: readonly string[] = ["nudity"];
+export const ACTIVE_MODEL_CATEGORIES: readonly string[] = ["nudity", "violence"];
 
 /** BR-05: audio mute duration in milliseconds. */
 export const MUTE_DURATION_MS = 1500;
@@ -222,6 +222,28 @@ export function isNudityProtectionActive(settings: SafeViewSettings): boolean {
     settings.categories.nudity &&
     getEnabledCategories(settings).includes("nudity")
   );
+}
+
+/**
+ * True when violence full-video protection should run on the active page.
+ *
+ * @param settings - Resolved SafeView settings.
+ */
+export function isViolenceProtectionActive(settings: SafeViewSettings): boolean {
+  return (
+    settings.protectionEnabled &&
+    settings.categories.violence &&
+    getEnabledCategories(settings).includes("violence")
+  );
+}
+
+/**
+ * True when any frame-based vision category (nudity or violence) is enabled.
+ *
+ * @param settings - Resolved SafeView settings.
+ */
+export function isFrameProtectionActive(settings: SafeViewSettings): boolean {
+  return isNudityProtectionActive(settings) || isViolenceProtectionActive(settings);
 }
 
 /**

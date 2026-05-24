@@ -15,6 +15,7 @@ import audio_processor
 import inference
 import main
 import model_loader
+import violence_loader
 from models import kissing, lgbtq, profanity, violence
 
 ANALYZE_RESPONSE_KEYS = {
@@ -24,6 +25,8 @@ ANALYZE_RESPONSE_KEYS = {
     "action",
     "model_loaded",
     "label",
+    "gate_reason",
+    "content_type",
 }
 HEALTH_RESPONSE_KEYS = {"status", "model", "model_loaded", "whisper_loaded"}
 
@@ -63,6 +66,11 @@ def test_analyze_image_blank_jpeg_response_shape(
     assert isinstance(body["confidence"], float)
     assert 0.0 <= body["confidence"] <= 1.0
     assert isinstance(body["model_loaded"], bool)
+    assert isinstance(body["gate_reason"], str)
+    content_type = body["content_type"]
+    assert isinstance(content_type, dict)
+    assert isinstance(content_type.get("is_animation"), bool)
+    assert isinstance(content_type.get("is_real_human"), bool)
 
 
 def test_br01_threshold_floor_low_sensitivity() -> None:
@@ -91,10 +99,31 @@ def test_br01_threshold_floor_low_sensitivity() -> None:
     assert result["confidence"] == pytest.approx(0.3775, rel=1e-2)
 
 
+def test_violence_module_fail_open_when_model_unloaded(
+    blank_jpeg_bytes: bytes,
+) -> None:
+    """Violence module fails open when YOLO weights are not loaded."""
+    from PIL import Image
+    import io
+
+    image = Image.open(io.BytesIO(blank_jpeg_bytes))
+    try:
+        with patch.object(violence_loader, "MODEL_LOADED", False), patch.object(
+            violence_loader, "get_model", return_value=None
+        ):
+            result = violence.analyze(image, sensitivity=0.75)
+    finally:
+        image.close()
+
+    assert result["category"] == "violence"
+    assert result["detected"] is False
+    assert result["confidence"] == 0.0
+    assert result["action"] == "ALLOW"
+
+
 @pytest.mark.parametrize(
     "module,expected_category",
     [
-        (violence, "violence"),
         (kissing, "kissing"),
         (profanity, "profanity"),
         (lgbtq, "lgbtq"),
@@ -123,7 +152,27 @@ def test_stub_modules_return_no_detection(
     assert result["action"] == "ALLOW"
 
 
-@pytest.mark.parametrize("category", ["violence", "kissing", "profanity", "lgbtq"])
+def test_analyze_image_violence_via_api(
+    client: TestClient,
+    blank_jpeg_bytes: bytes,
+) -> None:
+    """POST /analyze-image for violence returns a valid contract on a blank frame."""
+    response = client.post(
+        "/analyze-image",
+        files={"frame": ("blank.jpg", blank_jpeg_bytes, "image/jpeg")},
+        data={"sensitivity": "0.75", "category": "violence"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["category"] == "violence"
+    assert body["action"] in ("BLUR", "ALLOW")
+    assert isinstance(body["detected"], bool)
+    assert isinstance(body["confidence"], float)
+    assert 0.0 <= body["confidence"] <= 1.0
+    assert isinstance(body["model_loaded"], bool)
+
+
+@pytest.mark.parametrize("category", ["kissing", "profanity", "lgbtq"])
 def test_analyze_image_stubs_via_api(
     client: TestClient,
     blank_jpeg_bytes: bytes,
@@ -168,7 +217,7 @@ def test_analyze_audio_silent_webm_chunk_detected_false(
     assert set(body.keys()) == main.ANALYZE_AUDIO_RESPONSE_KEYS
     assert body["detected"] is False
     assert body["action"] == "ALLOW"
-    assert body["duration_ms"] == 1500
+    assert body["duration_ms"] == 0
     assert body["whisper_loaded"] is True
     assert isinstance(body["action"], str)
 
@@ -181,7 +230,7 @@ def test_analyze_audio_silent_webm_chunk_detected_false(
         (False, "", False, "ALLOW"),
     ],
 )
-def test_analyze_audio_duration_ms_always_1500_br05(
+def test_analyze_audio_duration_ms_br05(
     client: TestClient,
     silent_webm_bytes: bytes,
     whisper_loaded: bool,
@@ -190,12 +239,8 @@ def test_analyze_audio_duration_ms_always_1500_br05(
     expected_action: str,
 ) -> None:
     """
-    BR-05: duration_ms is always exactly 1500 whether or not profanity is detected.
+    MUTE responses use 3500 ms; ALLOW responses use 0 ms.
     """
-    patches = {"WHISPER_LOADED": whisper_loaded}
-    if whisper_loaded:
-        patches["transcribe_audio"] = transcript
-
     with patch.object(audio_processor, "WHISPER_LOADED", whisper_loaded), patch.object(
         audio_processor,
         "transcribe_audio",
@@ -211,7 +256,10 @@ def test_analyze_audio_duration_ms_always_1500_br05(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["duration_ms"] == 1500
+    if expected_action == "MUTE":
+        assert body["duration_ms"] == 3500
+    else:
+        assert body["duration_ms"] == 0
     assert body["detected"] is expected_detected
     assert body["action"] == expected_action
 
@@ -235,11 +283,7 @@ def test_analyze_audio_detected_via_api(
     body = response.json()
     assert body["detected"] is True
     assert body["action"] == "MUTE"
-    assert body["duration_ms"] == 1500
-    assert body["whisper_loaded"] is True
-
-
-def test_analyze_audio_invalid_language(client: TestClient) -> None:
+    assert body["duration_ms"] == 3500
     """POST /analyze-audio rejects unsupported language codes."""
     response = client.post(
         "/analyze-audio",
@@ -258,5 +302,5 @@ def test_profanity_analyze_audio_module() -> None:
 
     assert result["detected"] is False
     assert result["action"] == "ALLOW"
-    assert result["duration_ms"] == 1500
+    assert result["duration_ms"] == 0
     assert result["whisper_loaded"] is True

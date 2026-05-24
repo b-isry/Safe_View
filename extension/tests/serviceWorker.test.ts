@@ -76,6 +76,15 @@ const framePayload = {
   frameSeq: 1,
 };
 
+const realHumanBlur = {
+  content_type: {
+    is_animation: false,
+    is_real_human: true,
+    gate_reason: "real_human_nudity",
+  },
+  gate_reason: "real_human_nudity",
+};
+
 describe("serviceWorker", () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -94,6 +103,7 @@ describe("serviceWorker", () => {
         action: "BLUR",
         label: "NSFW",
         model_loaded: true,
+        ...realHumanBlur,
       },
       backendOnline: true,
       fromFallback: false,
@@ -115,7 +125,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("sends BLUR for high suspicious score even when nudity not detected", async () => {
+  it("sends CLEAR for high score when nudity not detected (no suspicious blur)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -124,12 +134,18 @@ describe("serviceWorker", () => {
         action: "ALLOW",
         label: "SFW",
         model_loaded: true,
+        gate_reason: "real_human_safe",
+        content_type: {
+          is_animation: false,
+          is_real_human: true,
+          gate_reason: "real_human_safe",
+        },
       },
       backendOnline: true,
       fromFallback: false,
     });
 
-    const { handleFrameSample, MESSAGE_ACTION_BLUR } = await import(
+    const { handleFrameSample, MESSAGE_ACTION_CLEAR } = await import(
       "../src/background/serviceWorker"
     );
 
@@ -138,7 +154,7 @@ describe("serviceWorker", () => {
     expect(tabsSendMessage).toHaveBeenCalledWith(
       7,
       expect.objectContaining({
-        action: MESSAGE_ACTION_BLUR,
+        action: MESSAGE_ACTION_CLEAR,
         videoId: 1,
       })
     );
@@ -173,7 +189,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("BLURs suspicious score in the uncertain band", async () => {
+  it("does not blur uncertain score in the middle band", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -182,6 +198,12 @@ describe("serviceWorker", () => {
         action: "ALLOW",
         label: "NSFW",
         model_loaded: true,
+        gate_reason: "real_human_safe",
+        content_type: {
+          is_animation: false,
+          is_real_human: true,
+          gate_reason: "real_human_safe",
+        },
       },
       backendOnline: true,
       fromFallback: false,
@@ -193,7 +215,7 @@ describe("serviceWorker", () => {
 
     await handleFrameSample(framePayload, 7);
 
-    expect(tabsSendMessage).toHaveBeenCalledWith(
+    expect(tabsSendMessage).not.toHaveBeenCalledWith(
       7,
       expect.objectContaining({
         action: MESSAGE_ACTION_BLUR,
@@ -211,6 +233,7 @@ describe("serviceWorker", () => {
         action: "BLUR",
         label: "NSFW",
         model_loaded: true,
+        ...realHumanBlur,
       },
       backendOnline: true,
       fromFallback: false,
@@ -253,6 +276,7 @@ describe("serviceWorker", () => {
           action: "BLUR",
           label: "NSFW",
           model_loaded: true,
+          ...realHumanBlur,
         },
         backendOnline: true,
         fromFallback: false,
@@ -280,6 +304,39 @@ describe("serviceWorker", () => {
       expect.objectContaining({
         action: MESSAGE_ACTION_BLUR,
         videoId: 50,
+      })
+    );
+  });
+
+  it("sends CLEAR on animation_skip gate", async () => {
+    mockAnalyzeImage.mockResolvedValue({
+      response: {
+        category: "nudity",
+        detected: false,
+        confidence: 0,
+        action: "ALLOW",
+        label: "SFW",
+        model_loaded: true,
+        gate_reason: "animation_skip",
+        content_type: {
+          is_animation: true,
+          is_real_human: false,
+          gate_reason: "animation_skip",
+        },
+      },
+      backendOnline: true,
+      fromFallback: false,
+    });
+
+    const { handleFrameSample, MESSAGE_ACTION_CLEAR } = await import(
+      "../src/background/serviceWorker"
+    );
+    await handleFrameSample(framePayload, 12);
+    expect(tabsSendMessage).toHaveBeenCalledWith(
+      12,
+      expect.objectContaining({
+        action: MESSAGE_ACTION_CLEAR,
+        videoId: 1,
       })
     );
   });

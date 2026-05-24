@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 CATEGORY = "profanity"
 ACTION_ALLOW = "ALLOW"
 ACTION_MUTE = "MUTE"
-# BR-05: client mute duration when profanity is detected
-MUTE_DURATION_MS = 1500
+# BR-05: client mute duration when profanity is detected (3.5s vault window)
+MUTE_DURATION_MS = 3500
 
 
 def analyze_audio(
@@ -47,9 +47,10 @@ def analyze_audio(
     _ = sensitivity
 
     base_response: Dict[str, Any] = {
+        "category": CATEGORY,
         "detected": False,
         "action": ACTION_ALLOW,
-        "duration_ms": MUTE_DURATION_MS,
+        "duration_ms": 0,
         "whisper_loaded": audio_processor.WHISPER_LOADED,
         "confidence": 0.0,
     }
@@ -70,17 +71,19 @@ def analyze_audio(
 
     if result["detected"]:
         return {
+            "category": CATEGORY,
             "detected": True,
-            "action": result.get("action", ACTION_MUTE),
+            "action": ACTION_MUTE,
             "duration_ms": MUTE_DURATION_MS,
             "whisper_loaded": True,
             "confidence": 1.0,
         }
 
     return {
+        "category": CATEGORY,
         "detected": False,
         "action": ACTION_ALLOW,
-        "duration_ms": MUTE_DURATION_MS,
+        "duration_ms": 0,
         "whisper_loaded": True,
         "confidence": 0.0,
     }

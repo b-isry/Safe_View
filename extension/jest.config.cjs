@@ -13,6 +13,7 @@ module.exports = {
         "**/placeholder.test.ts",
         "**/businessRules.test.ts",
         "**/serviceWorker.test.ts",
+        "**/blurDecision.test.ts",
         "**/aiClient.test.ts",
         "**/options.test.ts",
       ],
