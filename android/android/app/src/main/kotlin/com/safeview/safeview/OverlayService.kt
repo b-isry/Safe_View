@@ -187,6 +187,19 @@ class OverlayService : Service() {
      * Runs enabled category checks against FastAPI; updates overlay (fail-open).
      */
     private fun analyzeFrame(jpegBytes: ByteArray) {
+        // #region agent log
+        BackendApiClient.debugAgentLog(
+            baseUrl = backendUrl,
+            hypothesisId = "H1",
+            location = "OverlayService.kt:analyzeFrame:entry",
+            message = "overlay frame ready for analysis",
+            data = mapOf(
+                "jpegBytes" to jpegBytes.size,
+                "categories" to categories,
+                "sensitivity" to sensitivity,
+            ),
+        )
+        // #endregion
         var blurRequired = false
         var statusCategory = categories.firstOrNull() ?: "nudity"
 
@@ -213,6 +226,21 @@ class OverlayService : Service() {
             }
 
             statusCategory = response.category
+            // #region agent log
+            BackendApiClient.debugAgentLog(
+                baseUrl = backendUrl,
+                hypothesisId = "H4",
+                location = "OverlayService.kt:analyzeFrame:result",
+                message = "overlay analyze-image result",
+                data = mapOf(
+                    "category" to response.category,
+                    "action" to response.action,
+                    "detected" to response.detected,
+                    "shouldBlur" to response.shouldBlur,
+                    "confidence" to response.confidence,
+                ),
+            )
+            // #endregion
             if (response.shouldBlur) {
                 blurRequired = true
                 OverlayEventBridge.emitDetection(
@@ -232,6 +260,18 @@ class OverlayService : Service() {
             )
         }
         postOverlayChange(show = blurRequired)
+        // #region agent log
+        BackendApiClient.debugAgentLog(
+            baseUrl = backendUrl,
+            hypothesisId = "H5",
+            location = "OverlayService.kt:analyzeFrame:blurDecision",
+            message = "overlay blur decision",
+            data = mapOf(
+                "blurRequired" to blurRequired,
+                "categories" to categories,
+            ),
+        )
+        // #endregion
     }
 
     private fun postOverlayChange(show: Boolean) {
@@ -296,14 +336,41 @@ class OverlayService : Service() {
             overlayVisible.set(true)
             OverlayEventBridge.emitServiceStatus(OverlayEventBridge.STATUS_OVERLAY_SHOWN)
             Log.i(TAG, "Overlay window attached")
+            // #region agent log
+            BackendApiClient.debugAgentLog(
+                baseUrl = backendUrl,
+                hypothesisId = "H5",
+                location = "OverlayService.kt:attachOverlayWindow",
+                message = "overlay window attached",
+                data = mapOf("attached" to true),
+            )
+            // #endregion
         } catch (e: SecurityException) {
             Log.e(TAG, "Overlay permission missing: ${e.message}")
             overlayView = null
             overlayVisible.set(false)
+            // #region agent log
+            BackendApiClient.debugAgentLog(
+                baseUrl = backendUrl,
+                hypothesisId = "H5",
+                location = "OverlayService.kt:attachOverlayWindow",
+                message = "overlay attach security exception",
+                data = mapOf("error" to (e.message ?: "unknown")),
+            )
+            // #endregion
         } catch (e: Exception) {
             Log.e(TAG, "attachOverlayWindow failed: ${e.message}")
             overlayView = null
             overlayVisible.set(false)
+            // #region agent log
+            BackendApiClient.debugAgentLog(
+                baseUrl = backendUrl,
+                hypothesisId = "H5",
+                location = "OverlayService.kt:attachOverlayWindow",
+                message = "overlay attach failed",
+                data = mapOf("error" to (e.message ?: "unknown")),
+            )
+            // #endregion
         }
     }
 

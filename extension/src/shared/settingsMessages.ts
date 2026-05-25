@@ -25,10 +25,21 @@ export function isViolenceProtectionActive(settings: SafeViewSettings): boolean 
 }
 
 /**
- * True when any frame-based vision category (nudity or violence) is enabled.
+ * True when full-video kissing/romantic protection should be active on the current page.
+ */
+export function isKissingProtectionActive(settings: SafeViewSettings): boolean {
+  return settings.protectionEnabled && settings.categories.kissing;
+}
+
+/**
+ * True when any frame-based vision category (nudity, violence, or kissing) is enabled.
  */
 export function isFrameProtectionActive(settings: SafeViewSettings): boolean {
-  return isNudityProtectionActive(settings) || isViolenceProtectionActive(settings);
+  return (
+    isNudityProtectionActive(settings) ||
+    isViolenceProtectionActive(settings) ||
+    isKissingProtectionActive(settings)
+  );
 }
 
 /**

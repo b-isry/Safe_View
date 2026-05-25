@@ -26,6 +26,7 @@ class _SettingsScreenState extends State<SettingsScreen> with WidgetsBindingObse
 
   final TextEditingController _backendController = TextEditingController();
   bool? _backendOk;
+  String? _backendError;
   bool _testing = false;
 
   static const List<String> _sensitivityLabels = ['Low', 'Medium', 'High'];
@@ -64,6 +65,7 @@ class _SettingsScreenState extends State<SettingsScreen> with WidgetsBindingObse
     setState(() {
       _testing = true;
       _backendOk = null;
+      _backendError = null;
     });
     final url = _backendController.text.trim();
     final client = AiClient(baseUrl: url);
@@ -74,10 +76,14 @@ class _SettingsScreenState extends State<SettingsScreen> with WidgetsBindingObse
     if (mounted) {
       setState(() {
         _backendOk = ok;
+        _backendError = ok ? null : AiClient.backendStatus.lastError;
         _testing = false;
       });
     }
   }
+
+  bool get _usesEmulatorLoopback =>
+      _backendController.text.contains('10.0.2.2');
 
   Future<void> _resetDefaults() async {
     await _settings?.resetToDefaults();
@@ -213,13 +219,24 @@ class _SettingsScreenState extends State<SettingsScreen> with WidgetsBindingObse
             style: const TextStyle(color: SafeViewColors.text),
             decoration: const InputDecoration(
               labelText: 'Backend URL',
-              hintText: defaultBackendUrlEmulator,
+              hintText: defaultBackendUrlDevice,
+              helperText:
+                  'Emulator: http://10.0.2.2:8000 · Physical phone: http://<PC_LAN_IP>:8000',
               labelStyle: TextStyle(color: SafeViewColors.accent),
               hintStyle: TextStyle(color: Colors.white38),
+              helperStyle: TextStyle(color: Colors.white54, fontSize: 12),
               border: OutlineInputBorder(),
             ),
             onSubmitted: (_) => _testConnection(),
           ),
+          if (_usesEmulatorLoopback)
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text(
+                '10.0.2.2 only works on the Android emulator. On a real phone, use your PC\'s LAN IP.',
+                style: TextStyle(color: SafeViewColors.warning, fontSize: 13),
+              ),
+            ),
           const SizedBox(height: 8),
           Row(
             children: [
@@ -240,11 +257,13 @@ class _SettingsScreenState extends State<SettingsScreen> with WidgetsBindingObse
               ),
             ),
           if (_backendOk == false)
-            const Padding(
-              padding: EdgeInsets.only(top: 8),
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
               child: Text(
-                'Backend unreachable — fail-open (no blur on errors)',
-                style: TextStyle(color: SafeViewColors.warning),
+                _backendError == null
+                    ? 'Backend unreachable — fail-open (no blur on errors)'
+                    : 'Backend unreachable — fail-open (no blur on errors)\n$_backendError',
+                style: const TextStyle(color: SafeViewColors.warning),
               ),
             ),
           const SizedBox(height: 24),

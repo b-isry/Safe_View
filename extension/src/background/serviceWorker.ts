@@ -19,6 +19,7 @@ import {
   getEnabledCategories,
   initSettingsCache,
   isFrameProtectionActive,
+  isKissingProtectionActive,
   isNudityProtectionActive,
   isViolenceProtectionActive,
   loadSettings,
@@ -514,11 +515,14 @@ export interface FrameAnalysisOutcome {
   label: BlurLabel;
   score: number;
   violenceScore: number;
+  kissingScore: number;
   categories: string[];
   nudityDetected: boolean | null;
   nudityAction: string | null;
   violenceDetected: boolean | null;
   violenceAction: string | null;
+  kissingDetected: boolean | null;
+  kissingAction: string | null;
   contentType: ContentTypeGate | null;
   gateReason: string | null;
   backendTrusted: boolean;
@@ -526,7 +530,7 @@ export interface FrameAnalysisOutcome {
 }
 
 /**
- * Run enabled /analyze-image checks (nudity and/or violence).
+ * Run enabled /analyze-image checks (nudity, violence, and/or kissing).
  *
  * @param frame - JPEG blob from the content script.
  * @param settings - User settings from storage.
@@ -539,17 +543,21 @@ export async function analyzeFrameAgainstEnabledCategories(
 ): Promise<FrameAnalysisOutcome> {
   const runNudity = isNudityProtectionActive(settings);
   const runViolence = isViolenceProtectionActive(settings);
+  const runKissing = isKissingProtectionActive(settings);
 
-  if (!runNudity && !runViolence) {
+  if (!runNudity && !runViolence && !runKissing) {
     return {
       label: "SFW",
       score: 0,
       violenceScore: 0,
+      kissingScore: 0,
       categories: [],
       nudityDetected: null,
       nudityAction: null,
       violenceDetected: null,
       violenceAction: null,
+      kissingDetected: null,
+      kissingAction: null,
       contentType: null,
       gateReason: null,
       backendTrusted: true,
@@ -564,17 +572,23 @@ export async function analyzeFrameAgainstEnabledCategories(
   if (runViolence) {
     categories.push("violence");
   }
+  if (runKissing) {
+    categories.push("kissing");
+  }
 
-  const [nudityResult, violenceResult] = await Promise.all([
+  const [nudityResult, violenceResult, kissingResult] = await Promise.all([
     runNudity
       ? analyzeImage(frame, settings.sensitivity, "nudity", signal)
       : Promise.resolve(null),
     runViolence
       ? analyzeImage(frame, settings.sensitivity, "violence", signal)
       : Promise.resolve(null),
+    runKissing
+      ? analyzeImage(frame, settings.sensitivity, "kissing", signal)
+      : Promise.resolve(null),
   ]);
 
-  const results = [nudityResult, violenceResult].filter(
+  const results = [nudityResult, violenceResult, kissingResult].filter(
     (entry): entry is NonNullable<typeof entry> => entry !== null
   );
 
@@ -583,11 +597,14 @@ export async function analyzeFrameAgainstEnabledCategories(
       label: "SFW",
       score: 0,
       violenceScore: 0,
+      kissingScore: 0,
       categories,
       nudityDetected: null,
       nudityAction: null,
       violenceDetected: null,
       violenceAction: null,
+      kissingDetected: null,
+      kissingAction: null,
       contentType: null,
       gateReason: null,
       backendTrusted: false,
@@ -605,11 +622,14 @@ export async function analyzeFrameAgainstEnabledCategories(
       label: "SFW",
       score: 0,
       violenceScore: 0,
+      kissingScore: 0,
       categories,
       nudityDetected: null,
       nudityAction: null,
       violenceDetected: null,
       violenceAction: null,
+      kissingDetected: null,
+      kissingAction: null,
       contentType: null,
       gateReason: null,
       backendTrusted: false,
@@ -619,13 +639,17 @@ export async function analyzeFrameAgainstEnabledCategories(
 
   const nudityResponse = nudityResult?.response;
   const violenceResponse = violenceResult?.response;
+  const kissingResponse = kissingResult?.response;
   const nudityScore = nudityResponse?.confidence ?? 0;
   const violenceScore = violenceResponse?.confidence ?? 0;
-  const displayScore = Math.max(nudityScore, violenceScore);
+  const kissingScore = kissingResponse?.confidence ?? 0;
+  const displayScore = Math.max(nudityScore, violenceScore, kissingScore);
   const displayLabel = normalizeBlurLabel(
-    violenceScore > nudityScore
-      ? violenceResponse?.label
-      : nudityResponse?.label,
+    kissingScore >= violenceScore && kissingScore >= nudityScore
+      ? kissingResponse?.label
+      : violenceScore > nudityScore
+        ? violenceResponse?.label
+        : nudityResponse?.label,
     displayScore
   );
   const contentType = nudityResponse?.content_type ?? null;
@@ -636,11 +660,14 @@ export async function analyzeFrameAgainstEnabledCategories(
     label: displayLabel,
     score: nudityScore,
     violenceScore,
+    kissingScore,
     categories,
     nudityDetected: runNudity ? Boolean(nudityResponse?.detected) : null,
     nudityAction: nudityResponse?.action ?? null,
     violenceDetected: runViolence ? Boolean(violenceResponse?.detected) : null,
     violenceAction: violenceResponse?.action ?? null,
+    kissingDetected: runKissing ? Boolean(kissingResponse?.detected) : null,
+    kissingAction: kissingResponse?.action ?? null,
     contentType,
     gateReason,
     backendTrusted: true,
@@ -884,14 +911,23 @@ async function processFrameSample(
         : outcome.violenceAction === "ALLOW"
           ? "ALLOW"
           : null;
+    const kissingAction =
+      outcome.kissingAction === "BLUR"
+        ? "BLUR"
+        : outcome.kissingAction === "ALLOW"
+          ? "ALLOW"
+          : null;
 
     const evaluation = evaluateBlurState({
       score: outcome.score,
       violenceScore: outcome.violenceScore,
+      kissingScore: outcome.kissingScore,
       nudityDetected: outcome.nudityDetected === true,
       violenceDetected: outcome.violenceDetected === true,
+      kissingDetected: outcome.kissingDetected === true,
       backendAction,
       violenceAction,
+      kissingAction,
       contentType: outcome.contentType,
       gateReason: outcome.gateReason,
       frameSeq,
@@ -914,6 +950,7 @@ async function processFrameSample(
       score: outcome.score,
       nudityDetected: outcome.nudityDetected === true,
       violenceDetected: outcome.violenceDetected === true,
+      kissingDetected: outcome.kissingDetected === true,
       gateReason: outcome.gateReason,
       frame: frameSeq,
       gen: generationAtStart,

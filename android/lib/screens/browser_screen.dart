@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:safeview/constants.dart';
 import 'package:safeview/services/ai_client.dart';
+import 'package:safeview/services/debug_agent_log.dart';
 import 'package:safeview/services/settings_service.dart';
 import 'package:safeview/widgets/blur_overlay.dart';
 import 'package:safeview/widgets/status_badge.dart';
@@ -196,6 +197,19 @@ class _BrowserScreenState extends State<BrowserScreen> {
     if (jpegBytes == null || jpegBytes.isEmpty) return;
 
     final categories = _activeCategories(_settings!);
+    // #region agent log
+    debugAgentLog(
+      baseUrl: _settings!.backendUrl,
+      hypothesisId: 'H1',
+      location: 'browser_screen.dart:_onFrameReceived',
+      message: 'frame received for analysis',
+      data: {
+        'protectionEnabled': _settings!.protectionEnabled,
+        'jpegBytes': jpegBytes.length,
+        'categories': categories,
+      },
+    );
+    // #endregion
     if (categories.isEmpty) {
       _setBlurred(false);
       return;
@@ -217,6 +231,23 @@ class _BrowserScreenState extends State<BrowserScreen> {
           return;
         }
 
+        // #region agent log
+        debugAgentLog(
+          baseUrl: _settings!.backendUrl,
+          hypothesisId: 'H4',
+          location: 'browser_screen.dart:_onFrameReceived:result',
+          message: 'analyze-image client result',
+          data: {
+            'category': category,
+            'action': result.response.action.name,
+            'detected': result.response.detected,
+            'shouldBlur': result.response.shouldBlur,
+            'confidence': result.response.confidence,
+            'backendOnline': result.backendOnline,
+          },
+        );
+        // #endregion
+
         if (result.response.shouldBlur || result.response.detected) {
           blurRequired = true;
           break;
@@ -224,6 +255,15 @@ class _BrowserScreenState extends State<BrowserScreen> {
       }
 
       _setBlurred(blurRequired);
+      // #region agent log
+      debugAgentLog(
+        baseUrl: _settings!.backendUrl,
+        hypothesisId: 'H4',
+        location: 'browser_screen.dart:_onFrameReceived:blurDecision',
+        message: 'browser blur decision applied',
+        data: {'blurRequired': blurRequired},
+      );
+      // #endregion
     } catch (error, stack) {
       debugPrint('[SafeView] Browser frame analysis failed: $error');
       debugPrint(stack.toString());

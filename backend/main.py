@@ -6,22 +6,61 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
+from pydantic import BaseModel, Field
 
 import audio_processor
 import model_loader
+import romance_loader
 import violence_loader
 from models import kissing, lgbtq, nudity, profanity, violence
 
 logger = logging.getLogger(__name__)
+
+DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-42ea0a.log"
+
+
+def _agent_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Dict[str, Any] | None = None,
+) -> None:
+    # #region agent log
+    try:
+        entry = {
+            "sessionId": "42ea0a",
+            "timestamp": int(time.time() * 1000),
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+        }
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+    # #endregion
+
+
+class AgentLogPayload(BaseModel):
+    """Client-side debug log relay for Android instrumentation."""
+
+    hypothesisId: str
+    location: str
+    message: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
 
 ACTION_ALLOW = "ALLOW"
 SENSITIVITY_MIN = 0.0
@@ -98,6 +137,8 @@ def _category_model_loaded(category: str) -> bool:
     """Return whether weights for the requested category are loaded."""
     if category == violence.CATEGORY:
         return violence_loader.MODEL_LOADED
+    if category == kissing.CATEGORY:
+        return romance_loader.MODEL_LOADED
     if category == nudity.CATEGORY:
         return model_loader.MODEL_LOADED
     return False
@@ -133,10 +174,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_loader.load_model()
     if not violence_loader.MODEL_LOADED:
         violence_loader.load_model()
+    if not romance_loader.MODEL_LOADED:
+        romance_loader.load_model()
     logger.info(
-        "[SafeView] Backend ready — nudity_loaded=%s violence_loaded=%s whisper_loaded=%s",
+        "[SafeView] Backend ready — nudity_loaded=%s violence_loaded=%s kissing_loaded=%s whisper_loaded=%s",
         model_loader.MODEL_LOADED,
         violence_loader.MODEL_LOADED,
+        romance_loader.MODEL_LOADED,
         audio_processor.WHISPER_LOADED,
     )
     yield
@@ -155,6 +199,13 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.post("/internal/debug-ingest")
+async def debug_ingest(payload: AgentLogPayload) -> Dict[str, str]:
+    """Relay Android client debug logs to the session NDJSON file."""
+    _agent_log(payload.hypothesisId, payload.location, payload.message, payload.data)
+    return {"status": "ok"}
 
 
 @app.get("/health")
@@ -223,6 +274,19 @@ async def analyze_image(
         if not frame_bytes:
             raise ValueError("Empty frame upload")
 
+        # #region agent log
+        _agent_log(
+            "H1",
+            "main.py:analyze_image:entry",
+            "analyze-image request received",
+            {
+                "category": category_normalized,
+                "sensitivity": sensitivity,
+                "frameBytes": len(frame_bytes),
+            },
+        )
+        # #endregion
+
         image = Image.open(BytesIO(frame_bytes))
         inference_started = time.perf_counter()
         result = await asyncio.to_thread(analyze_fn, image, sensitivity)
@@ -232,7 +296,24 @@ async def analyze_image(
             category_normalized,
             inference_ms,
         )
-        return _normalize_response(result, category_normalized)
+        normalized = _normalize_response(result, category_normalized)
+        # #region agent log
+        _agent_log(
+            "H2",
+            "main.py:analyze_image:exit",
+            "analyze-image response",
+            {
+                "category": category_normalized,
+                "action": normalized.get("action"),
+                "detected": normalized.get("detected"),
+                "confidence": normalized.get("confidence"),
+                "gate_reason": normalized.get("gate_reason"),
+                "content_type": normalized.get("content_type"),
+                "inferenceMs": round(inference_ms, 1),
+            },
+        )
+        # #endregion
+        return normalized
     except HTTPException:
         raise
     except Exception as exc:
