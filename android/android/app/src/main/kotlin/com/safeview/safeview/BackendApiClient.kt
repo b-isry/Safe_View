@@ -12,9 +12,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
 
-/**
- * Parsed /analyze-image response.
- */
 data class AnalyzeResponse(
     val category: String,
     val detected: Boolean,
@@ -36,6 +33,46 @@ object BackendApiClient {
     private const val CONNECT_TIMEOUT_MS = 8_000
     private const val READ_TIMEOUT_MS = 8_000
     private const val CONFIDENCE_FLOOR = 0.75f
+
+    /**
+     * Relay debug logs to FastAPI /internal/debug-ingest (fire-and-forget).
+     */
+    fun debugAgentLog(
+        baseUrl: String,
+        hypothesisId: String,
+        location: String,
+        message: String,
+        data: Map<String, Any?> = emptyMap(),
+    ) {
+        // #region agent log
+        val normalizedBase = baseUrl.trimEnd('/')
+        if (normalizedBase.isEmpty()) return
+
+        var connection: HttpURLConnection? = null
+        try {
+            val payload = JSONObject().apply {
+                put("hypothesisId", hypothesisId)
+                put("location", location)
+                put("message", message)
+                put("data", JSONObject(data))
+            }
+            connection = (URL("$normalizedBase/internal/debug-ingest").openConnection()
+                as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 2_000
+                readTimeout = 2_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                outputStream.use { it.write(payload.toString().toByteArray()) }
+            }
+            connection.responseCode
+        } catch (e: Exception) {
+            Log.d(TAG, "debug ingest failed: ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
+        // #endregion
+    }
 
     /**
      * POST multipart JPEG to /analyze-image. Fail-open: null on any error.

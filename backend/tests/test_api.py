@@ -15,6 +15,7 @@ import audio_processor
 import inference
 import main
 import model_loader
+import romance_loader
 import violence_loader
 from models import kissing, lgbtq, profanity, violence
 
@@ -121,10 +122,31 @@ def test_violence_module_fail_open_when_model_unloaded(
     assert result["action"] == "ALLOW"
 
 
+def test_kissing_module_fail_open_when_model_unloaded(
+    blank_jpeg_bytes: bytes,
+) -> None:
+    """Kissing module fails open when romance weights are not loaded."""
+    from PIL import Image
+    import io
+
+    image = Image.open(io.BytesIO(blank_jpeg_bytes))
+    try:
+        with patch.object(romance_loader, "MODEL_LOADED", False), patch.object(
+            romance_loader, "get_model", return_value=None
+        ):
+            result = kissing.analyze(image, sensitivity=0.75)
+    finally:
+        image.close()
+
+    assert result["category"] == "kissing"
+    assert result["detected"] is False
+    assert result["confidence"] == 0.0
+    assert result["action"] == "ALLOW"
+
+
 @pytest.mark.parametrize(
     "module,expected_category",
     [
-        (kissing, "kissing"),
         (profanity, "profanity"),
         (lgbtq, "lgbtq"),
     ],
@@ -172,7 +194,27 @@ def test_analyze_image_violence_via_api(
     assert isinstance(body["model_loaded"], bool)
 
 
-@pytest.mark.parametrize("category", ["kissing", "profanity", "lgbtq"])
+def test_analyze_image_kissing_via_api(
+    client: TestClient,
+    blank_jpeg_bytes: bytes,
+) -> None:
+    """POST /analyze-image for kissing returns a valid contract on a blank frame."""
+    response = client.post(
+        "/analyze-image",
+        files={"frame": ("blank.jpg", blank_jpeg_bytes, "image/jpeg")},
+        data={"sensitivity": "0.75", "category": "kissing"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["category"] == "kissing"
+    assert body["action"] in ("BLUR", "ALLOW")
+    assert isinstance(body["detected"], bool)
+    assert isinstance(body["confidence"], float)
+    assert 0.0 <= body["confidence"] <= 1.0
+    assert isinstance(body["model_loaded"], bool)
+
+
+@pytest.mark.parametrize("category", ["profanity", "lgbtq"])
 def test_analyze_image_stubs_via_api(
     client: TestClient,
     blank_jpeg_bytes: bytes,

@@ -1,7 +1,7 @@
 // SafeView — blurDecision.ts
 // Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
 // Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
-// Purpose: BLUR / CLEAR for nudity (gated) and violence (YOLO detections).
+// Purpose: BLUR / CLEAR for nudity (gated), violence (YOLO), and kissing (romance classifier).
 
 import {
   AFTER_UNSAFE_SAFE_CLEAR_STREAK,
@@ -34,10 +34,14 @@ export interface FrameBlurState {
   score: number;
   /** Violence confidence from /analyze-image (category=violence). */
   violenceScore?: number;
+  /** Kissing/romance confidence from /analyze-image (category=kissing). */
+  kissingScore?: number;
   nudityDetected: boolean;
   violenceDetected?: boolean;
+  kissingDetected?: boolean;
   backendAction: "BLUR" | "ALLOW" | null;
   violenceAction?: "BLUR" | "ALLOW" | null;
+  kissingAction?: "BLUR" | "ALLOW" | null;
   contentType: ContentTypeGate | null;
   gateReason: string | null;
   frameSeq: number;
@@ -73,7 +77,12 @@ function isGateAllow(state: FrameBlurState): boolean {
   const gate = state.contentType;
   const reason = state.gateReason ?? gate?.gate_reason ?? null;
 
-  if (state.violenceDetected || state.violenceAction === "BLUR") {
+  if (
+    state.violenceDetected ||
+    state.violenceAction === "BLUR" ||
+    state.kissingDetected ||
+    state.kissingAction === "BLUR"
+  ) {
     return false;
   }
 
@@ -139,8 +148,25 @@ function isViolenceBlur(state: FrameBlurState): boolean {
   return violenceScore >= UNSAFE_THRESHOLD;
 }
 
+function isKissingBlur(state: FrameBlurState): boolean {
+  if (state.kissingAction !== "BLUR") {
+    return false;
+  }
+
+  if (!state.kissingDetected) {
+    return false;
+  }
+
+  const kissingScore = state.kissingScore ?? 0;
+  return kissingScore >= UNSAFE_THRESHOLD;
+}
+
 function shouldBlurFrame(state: FrameBlurState): boolean {
-  return isRealHumanNudityBlur(state) || isViolenceBlur(state);
+  return (
+    isRealHumanNudityBlur(state) ||
+    isViolenceBlur(state) ||
+    isKissingBlur(state)
+  );
 }
 
 /**
@@ -176,7 +202,11 @@ export function evaluateBlurState(state: FrameBlurState): BlurEvaluation {
   }
 
   if (shouldBlurFrame(state)) {
-    const reason = isViolenceBlur(state) ? "violence" : "real_human_nudity";
+    const reason = isKissingBlur(state)
+      ? "kissing"
+      : isViolenceBlur(state)
+        ? "violence"
+        : "real_human_nudity";
     return { action: "BLUR", reason };
   }
 
@@ -267,14 +297,24 @@ export function logBlurEvaluation(
     score: number;
     nudityDetected: boolean;
     violenceDetected?: boolean;
+    kissingDetected?: boolean;
     gateReason: string | null;
     frame: number;
     gen: number;
     currentGen?: number;
   }
 ): void {
-  const { label, score, nudityDetected, violenceDetected, gateReason, frame, gen, currentGen } =
-    meta;
+  const {
+    label,
+    score,
+    nudityDetected,
+    violenceDetected,
+    kissingDetected,
+    gateReason,
+    frame,
+    gen,
+    currentGen,
+  } = meta;
 
   if (evaluation.action === "DROP") {
     console.log(
@@ -301,10 +341,11 @@ export function logBlurEvaluation(
   }
 
   console.log(
-    "[SafeView][DECISION] score=%s nudity=%s violence=%s gate=%s → %s (%s)",
+    "[SafeView][DECISION] score=%s nudity=%s violence=%s kissing=%s gate=%s → %s (%s)",
     score.toFixed(2),
     nudityDetected,
     violenceDetected ?? false,
+    kissingDetected ?? false,
     gateReason ?? "-",
     evaluation.action,
     evaluation.reason

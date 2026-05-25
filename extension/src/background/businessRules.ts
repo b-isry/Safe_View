@@ -21,7 +21,11 @@ export const SENSITIVITY_HIGH = 0.9;
 export const DEFAULT_PROFANITY_WORDS: string[] = [];
 
 /** Categories with real inference models (stubs skipped to avoid 5× /analyze-image per frame). */
-export const ACTIVE_MODEL_CATEGORIES: readonly string[] = ["nudity", "violence"];
+export const ACTIVE_MODEL_CATEGORIES: readonly string[] = [
+  "nudity",
+  "violence",
+  "kissing",
+];
 
 /** BR-05: audio mute duration in milliseconds. */
 export const MUTE_DURATION_MS = 1500;
@@ -238,12 +242,29 @@ export function isViolenceProtectionActive(settings: SafeViewSettings): boolean 
 }
 
 /**
- * True when any frame-based vision category (nudity or violence) is enabled.
+ * True when kissing/romantic full-video protection should run on the active page.
+ *
+ * @param settings - Resolved SafeView settings.
+ */
+export function isKissingProtectionActive(settings: SafeViewSettings): boolean {
+  return (
+    settings.protectionEnabled &&
+    settings.categories.kissing &&
+    getEnabledCategories(settings).includes("kissing")
+  );
+}
+
+/**
+ * True when any frame-based vision category (nudity, violence, or kissing) is enabled.
  *
  * @param settings - Resolved SafeView settings.
  */
 export function isFrameProtectionActive(settings: SafeViewSettings): boolean {
-  return isNudityProtectionActive(settings) || isViolenceProtectionActive(settings);
+  return (
+    isNudityProtectionActive(settings) ||
+    isViolenceProtectionActive(settings) ||
+    isKissingProtectionActive(settings)
+  );
 }
 
 /**

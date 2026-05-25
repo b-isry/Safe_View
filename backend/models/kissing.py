@@ -1,12 +1,7 @@
 # SafeView — models/kissing.py
 # Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
 # Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
-# Purpose: Stub kissing/romantic content detection module (placeholder until a real model is integrated).
-
-# TODO: Replace this stub with a real trained model.
-# Interface contract:
-#   Input:  PIL Image, sensitivity: float (0.0–1.0)
-#   Output: { "category": str, "detected": bool, "confidence": float, "action": "BLUR"|"ALLOW" }
+# Purpose: Kissing/romantic content detection via romance_classifier_final.keras.
 
 from __future__ import annotations
 
@@ -15,27 +10,54 @@ from typing import Any, Dict
 
 from PIL import Image
 
+import romance_inference
+import romance_loader
+
 logger = logging.getLogger(__name__)
 
 CATEGORY = "kissing"
-ACTION_ALLOW = "ALLOW"
 
 
 def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
     """
-    Stub kissing/romantic analyzer — always returns no detection until replaced.
+    Detect kissing/romantic content with the MobileNetV2 romance classifier.
 
     Args:
         image: Decoded JPEG frame from the client.
-        sensitivity: User-configured sensitivity (0.0–1.0).
+        sensitivity: User sensitivity (0.0–1.0); BR-01 floor still applies.
 
     Returns:
-        dict: Stub result with detected=False and action ALLOW.
+        dict: category, detected, confidence, action, label, model_loaded.
     """
-    logger.warning("[SafeView][StubModel] returning no detection")
+    if not romance_loader.MODEL_LOADED or romance_loader.get_model() is None:
+        logger.warning(
+            "[SafeView] Kissing analyze called but %s is not loaded; failing open.",
+            romance_loader.MODEL_FILENAME,
+        )
+        return _fail_open_response()
+
+    try:
+        raw = romance_inference.run_detection(image, sensitivity)
+        return {
+            "category": CATEGORY,
+            "detected": raw["detected"],
+            "confidence": raw["confidence"],
+            "action": raw["action"],
+            "label": raw["label"],
+            "model_loaded": True,
+        }
+    except Exception as exc:
+        logger.error("[SafeView] Kissing detection failed: %s", exc)
+        return _fail_open_response()
+
+
+def _fail_open_response() -> Dict[str, Any]:
+    """Fail-open when weights are missing or inference errors."""
     return {
         "category": CATEGORY,
         "detected": False,
         "confidence": 0.0,
-        "action": ACTION_ALLOW,
+        "action": romance_inference.ACTION_ALLOW,
+        "label": "SFW",
+        "model_loaded": romance_loader.MODEL_LOADED,
     }

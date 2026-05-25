@@ -56,6 +56,20 @@ describe("blurDecision", () => {
     ).toEqual({ action: "BLUR", reason: "violence" });
   });
 
+  it("BLUR when kissing/romance meets unsafe threshold (0.72)", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        score: 0,
+        kissingScore: 0.85,
+        nudityDetected: false,
+        kissingDetected: true,
+        backendAction: "ALLOW",
+        kissingAction: "BLUR",
+      })
+    ).toEqual({ action: "BLUR", reason: "kissing" });
+  });
+
   it("BLUR when real human nudity meets unsafe threshold (0.72)", () => {
     expect(
       evaluateBlurState({
