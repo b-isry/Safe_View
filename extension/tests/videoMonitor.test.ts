@@ -46,6 +46,7 @@ import {
   getVideoById,
   getVideoTrackState,
   isPrimaryCaptureTarget,
+  JPEG_QUALITY,
   SAMPLE_INTERVAL_MS,
 } from "../src/content/videoMonitor";
 
@@ -87,8 +88,8 @@ describe("videoMonitor", () => {
     stopVideoMonitor();
   });
 
-  it("exposes 250 ms active sample interval constant", () => {
-    expect(SAMPLE_INTERVAL_MS).toBe(250);
+  it("exposes 700 ms active sample interval constant", () => {
+    expect(SAMPLE_INTERVAL_MS).toBe(700);
   });
 
   it("finds a <video> element after DOM insertion", async () => {
@@ -298,7 +299,7 @@ describe("videoMonitor", () => {
     expect(toBlob).toHaveBeenCalledWith(
       expect.any(Function),
       "image/jpeg",
-      0.45
+      JPEG_QUALITY
     );
     expect(createdCanvas?.width).toBe(64);
     expect(createdCanvas?.height).toBe(48);

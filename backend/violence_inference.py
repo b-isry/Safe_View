@@ -1,7 +1,7 @@
 # SafeView — violence_inference.py
 # Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
 # Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
-# Purpose: YOLO object detection for fight / weapon / blood and BR-01 thresholding.
+# Purpose: YOLO object detection for fight / weapon / blood with normalized bounding boxes.
 
 from __future__ import annotations
 
@@ -14,10 +14,7 @@ import violence_loader
 
 logger = logging.getLogger(__name__)
 
-# BR-01: minimum confidence regardless of user sensitivity
-CONFIDENCE_FLOOR = 0.75
-
-# Minimum box confidence passed to YOLO predict (filter in Python for final decision)
+DEFAULT_VIOLENCE_THRESHOLD = 0.50
 YOLO_MIN_BOX_CONF = 0.1
 
 ACTION_BLUR = "BLUR"
@@ -26,9 +23,14 @@ ACTION_ALLOW = "ALLOW"
 
 def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
     """
-    Run YOLO violence detection and apply BR-01 threshold.
+    Run YOLO violence detection and return normalized boxes.
 
-    Returns max box confidence across fight / weapon / blood detections.
+    Args:
+        image: RGB frame from the client.
+        sensitivity: User sensitivity; effective threshold is max(0.50, sensitivity) capped at 1.0.
+
+    Returns:
+        dict with detected, confidence, action, label, detections (with box when available).
     """
     model = violence_loader.get_model()
     if model is None or not violence_loader.MODEL_LOADED:
@@ -36,12 +38,14 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             "confidence": 0.0,
             "detected": False,
             "action": ACTION_ALLOW,
-            "label": "SFW",
+            "label": "MODEL_NOT_LOADED",
             "detections": [],
+            "gate_reason": "violence_model_not_loaded",
         }
 
-    effective_threshold = max(CONFIDENCE_FLOOR, sensitivity)
+    effective_threshold = max(DEFAULT_VIOLENCE_THRESHOLD, min(1.0, float(sensitivity)))
     rgb_image = image.convert("RGB")
+    width, height = rgb_image.size
 
     try:
         results = model.predict(
@@ -55,34 +59,54 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             "confidence": 0.0,
             "detected": False,
             "action": ACTION_ALLOW,
-            "label": "SFW",
+            "label": "SAFE",
             "detections": [],
         }
 
-    max_confidence = 0.0
     detections: List[Dict[str, Any]] = []
+    max_confidence = 0.0
 
     if results:
         result = results[0]
-        names = result.names or {}
-        boxes = result.boxes
+        names = getattr(result, "names", None) or getattr(model, "names", {}) or {}
+        boxes = getattr(result, "boxes", None)
+
         if boxes is not None and len(boxes):
             for index in range(len(boxes)):
                 confidence = float(boxes.conf[index].item())
+                if confidence < effective_threshold:
+                    continue
+
                 class_id = int(boxes.cls[index].item())
-                class_name = names.get(class_id, str(class_id))
+                if isinstance(names, dict):
+                    class_name = names.get(class_id, str(class_id))
+                else:
+                    class_name = str(class_id)
+
+                x1, y1, x2, y2 = boxes.xyxy[index].tolist()
+                norm_box = [
+                    max(0.0, min(1.0, x1 / width)),
+                    max(0.0, min(1.0, y1 / height)),
+                    max(0.0, min(1.0, x2 / width)),
+                    max(0.0, min(1.0, y2 / height)),
+                ]
+
+                if norm_box[2] <= norm_box[0] or norm_box[3] <= norm_box[1]:
+                    continue
+
                 detections.append(
                     {
                         "class": class_name,
                         "confidence": confidence,
+                        "box": norm_box,
                     }
                 )
                 if confidence > max_confidence:
                     max_confidence = confidence
 
-    detected = max_confidence >= effective_threshold
+    detected = len(detections) > 0
     action = ACTION_BLUR if detected else ACTION_ALLOW
-    label = "NSFW" if detected else "SFW"
+    label = "VIOLENCE" if detected else "SAFE"
 
     return {
         "confidence": max_confidence,

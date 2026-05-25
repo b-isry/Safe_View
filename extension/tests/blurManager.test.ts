@@ -238,9 +238,7 @@ describe("blurManager", () => {
     expect(player.style.filter).toBe("");
     expect(controls.style.filter).toBe("");
 
-    const overlay = document.querySelector(".safeview-blur-overlay");
-    expect(overlay?.parentElement).toBe(surface);
-    expect(overlay?.parentElement).not.toBe(player);
+    expect(video.dataset.safeViewBlurred).toBe("true");
 
     locationSpy.mockRestore();
     stopVideoMonitor();

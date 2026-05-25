@@ -6,18 +6,21 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+import os
 from typing import Any, Dict, Optional, Union
 
 import torch
+import paths
 import torch.nn as nn
-from transformers import AutoConfig, AutoModel, PreTrainedModel
+from transformers import DINOv3ViTConfig, DINOv3ViTModel, PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
-MODEL_FILENAME = "dino_v3_linear.pth"
+MODEL_FILENAME = paths.NUDITY_MODEL_PATH.name
 MODEL_NAME = "dino_v3_linear"
+NUDITY_MODEL_PATH = paths.NUDITY_MODEL_PATH
 DINOV3_CONFIG_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
+DINOV3_REGISTER_TOKENS = 4
 HEAD_IN_FEATURES = 384
 HEAD_OUT_FEATURES = 2
 BACKBONE_STATE_PREFIX = "backbone."
@@ -25,6 +28,7 @@ MODEL_WRAPPER_PREFIX = "model."
 
 _model: Optional["NudityDetectionModel"] = None
 MODEL_LOADED: bool = False
+LAST_LOAD_ERROR: Optional[str] = None
 _device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -62,7 +66,7 @@ class NudityDetectionModel(nn.Module):
         return self.head(cls_token)
 
 
-def get_model_path() -> Path:
+def get_model_path():
     """
     Return the filesystem path for the team-provided weights file.
 
@@ -71,7 +75,7 @@ def get_model_path() -> Path:
     Returns:
         Path: Absolute path to dino_v3_linear.pth.
     """
-    return Path(__file__).resolve().parent / "models" / MODEL_FILENAME
+    return NUDITY_MODEL_PATH
 
 
 def get_device() -> torch.device:
@@ -169,6 +173,34 @@ def _align_backbone_state_dict(
     return prefixed
 
 
+def _resolve_dinov3_config() -> DINOv3ViTConfig:
+    """
+    Build DINOv3 ViT-S/16 config without contacting Hugging Face.
+
+    Uses backend/models/dinov3-vits16-pretrain-lvd1689m/config.json when present,
+    otherwise programmatic ViT-S/16 defaults (4 register tokens for team weights).
+    """
+    config_path = paths.DINOV3_CONFIG_DIR / "config.json"
+    if config_path.is_file():
+        return DINOv3ViTConfig.from_pretrained(
+            paths.DINOV3_CONFIG_DIR,
+            local_files_only=True,
+        )
+
+    if os.environ.get("SAFE_VIEW_USE_HF_HUB", "").strip().lower() in ("1", "true", "yes"):
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        if token:
+            try:
+                return DINOv3ViTConfig.from_pretrained(DINOV3_CONFIG_ID, token=token)
+            except Exception as exc:
+                logger.warning(
+                    "[SafeView] Hugging Face config fetch failed (%s). Using local defaults.",
+                    exc,
+                )
+
+    return DINOv3ViTConfig(num_register_tokens=DINOV3_REGISTER_TOKENS)
+
+
 def _build_model_from_checkpoint(
     checkpoint: Dict[str, torch.Tensor],
     device: torch.device,
@@ -185,8 +217,8 @@ def _build_model_from_checkpoint(
     """
     backbone_state, head_state = _split_checkpoint(checkpoint)
 
-    config = AutoConfig.from_pretrained(DINOV3_CONFIG_ID)
-    backbone = AutoModel.from_config(config)
+    config = _resolve_dinov3_config()
+    backbone = DINOv3ViTModel(config)
     backbone_state = _align_backbone_state_dict(backbone_state, backbone)
     backbone.load_state_dict(backbone_state, strict=True)
 
@@ -212,10 +244,11 @@ def load_model() -> None:
     On success, sets _model and MODEL_LOADED=True. On missing file or load error,
     logs a clear message, leaves _model=None, and sets MODEL_LOADED=False (fail open).
     """
-    global _model, MODEL_LOADED, _device
+    global _model, MODEL_LOADED, LAST_LOAD_ERROR, _device
 
     weights_path = get_model_path()
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LAST_LOAD_ERROR = None
 
     if not weights_path.is_file():
         logger.error(
@@ -227,12 +260,14 @@ def load_model() -> None:
         )
         _model = None
         MODEL_LOADED = False
+        LAST_LOAD_ERROR = f"{MODEL_FILENAME} not found at {weights_path}"
         return
 
     try:
         checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
         _model = _build_model_from_checkpoint(checkpoint, _device)
         MODEL_LOADED = True
+        LAST_LOAD_ERROR = None
         logger.info(
             "[SafeView] Loaded %s from %s on device %s.",
             MODEL_NAME,
@@ -240,6 +275,7 @@ def load_model() -> None:
             _device,
         )
     except Exception as exc:
+        LAST_LOAD_ERROR = str(exc)
         logger.error(
             "[SafeView] Failed to load %s from %s: %s. Nudity detection will fail open.",
             MODEL_FILENAME,
@@ -258,6 +294,3 @@ def get_model() -> Optional[NudityDetectionModel]:
         Optional[NudityDetectionModel]: Model ready for eval(), or None.
     """
     return _model
-
-
-load_model()

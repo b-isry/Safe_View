@@ -18,9 +18,19 @@ import {
   stopSubtitleMonitor,
 } from "./audioMonitor";
 import {
-  applyImmediateLocalBlur,
+  applyFullVideoBlur,
+  clearAllBlur,
+  clearFullVideoBlur,
+} from "./blurOverlay";
+import { DEMO_CLASSIFIER_SWITCH } from "../shared/demoMode";
+import {
+  ANALYZE_INTERVAL_MS,
+  BLUR_TTL_MS,
+  JPEG_QUALITY as STABLE_JPEG_QUALITY,
+  MAX_FRAME_WIDTH,
+} from "../shared/stableBlurPolicy";
+import {
   clearAllFullVideoBlurs,
-  clearImmediateLocalBlur,
 } from "./fullVideoBlur";
 import {
   onYouTubeWatchIdBoundary,
@@ -43,8 +53,10 @@ export {
   SAMPLE_INTERVAL_MS,
 } from "../background/latencyPolicy";
 
-/** @deprecated Alias for SAMPLE_INTERVAL_MS — kept for tests/imports. */
-export const SAMPLE_INTERVAL_ACTIVE_MS = SAMPLE_INTERVAL_MS;
+/** Active playback sampling (stable classifier demo uses ANALYZE_INTERVAL_MS). */
+export const SAMPLE_INTERVAL_ACTIVE_MS = DEMO_CLASSIFIER_SWITCH
+  ? ANALYZE_INTERVAL_MS
+  : SAMPLE_INTERVAL_MS;
 
 /** Paused video: lower sampling rate. */
 export const SAMPLE_INTERVAL_PAUSED_MS = 2000;
@@ -59,10 +71,14 @@ export const ENCODE_STALL_WARN_MS = 200;
 const JPEG_MIME_TYPE = "image/jpeg";
 
 /** JPEG quality for canvas.toBlob (model resizes to 224×224). */
-export const JPEG_QUALITY = 0.45;
+export const JPEG_QUALITY = DEMO_CLASSIFIER_SWITCH
+  ? STABLE_JPEG_QUALITY
+  : 0.75;
 
 /** Max canvas width before JPEG encode (matches model input scale). */
-export const CAPTURE_MAX_WIDTH_PX = 224;
+export const CAPTURE_MAX_WIDTH_PX = DEMO_CLASSIFIER_SWITCH
+  ? MAX_FRAME_WIDTH
+  : 416;
 
 /** Delay before the first frame sample after registration (0 = immediate). */
 const FIRST_SAMPLE_DELAY_MS = 0;
@@ -113,6 +129,20 @@ let primaryCaptureVideo: HTMLVideoElement | null = null;
 /**
  * Per-video backend analysis tracking (frame queue protection).
  */
+/** Per-video stable classifier blur state (hysteresis + hold + streaks). */
+export type DemoFrameState = {
+  frameSeq: number;
+  latestAppliedFrameSeq: number;
+  pending: boolean;
+  isBlurred: boolean;
+  unsafeStreak: number;
+  safeStreak: number;
+  lastUnsafeAt: number;
+  lastSafeAt: number;
+  lastResultAt: number;
+  lastCommand: "BLUR" | "CLEAR" | "KEEP";
+};
+
 export type VideoAnalysisState = {
   isAnalyzing: boolean;
   lastAnalysisStartedAt: number;
@@ -123,6 +153,7 @@ export type VideoAnalysisState = {
   unsafeLockUntil: number;
   /** True when blur is cleared and monitoring continues. */
   isClear: boolean;
+  demo: DemoFrameState;
   /** Downscaled RGBA snapshot for scene-change detection. */
   lastSceneSnapshot: Uint8ClampedArray | null;
   /** Last observed playback time (seek detection). */
@@ -233,6 +264,48 @@ export function getSampleIntervalMs(
 /**
  * Create default per-video backend analysis state.
  */
+function createDemoFrameState(): DemoFrameState {
+  return {
+    frameSeq: 0,
+    latestAppliedFrameSeq: 0,
+    pending: false,
+    isBlurred: false,
+    unsafeStreak: 0,
+    safeStreak: 0,
+    lastUnsafeAt: 0,
+    lastSafeAt: 0,
+    lastResultAt: 0,
+    lastCommand: "CLEAR",
+  };
+}
+
+/**
+ * TTL safety: clear nudity full-frame blur if no unsafe signal within BLUR_TTL_MS.
+ */
+function runDemoBlurTtlCheck(
+  video: HTMLVideoElement,
+  state: VideoTrackState
+): void {
+  const demo = state.analysis.demo;
+  if (!demo.isBlurred || demo.lastUnsafeAt <= 0) {
+    return;
+  }
+
+  if (Date.now() - demo.lastUnsafeAt <= BLUR_TTL_MS) {
+    return;
+  }
+
+  demo.isBlurred = false;
+  demo.safeStreak = 0;
+  demo.unsafeStreak = 0;
+  demo.lastCommand = "CLEAR";
+  clearFullVideoBlur(video);
+  console.log(
+    "[SafeView][StableDecision] frameSeq=%s command=CLEAR reason=blur_ttl_expired isBlurred=false",
+    state.frameSeq
+  );
+}
+
 function createAnalysisState(): VideoAnalysisState {
   return {
     isAnalyzing: false,
@@ -243,6 +316,7 @@ function createAnalysisState(): VideoAnalysisState {
     safeStreak: 0,
     unsafeLockUntil: 0,
     isClear: false,
+    demo: createDemoFrameState(),
     lastSceneSnapshot: null,
     lastVideoTime: -1,
     lastSrc: "",
@@ -313,7 +387,7 @@ function resetForPlaybackBoundary(
   state.analysis.unsafeLockUntil = 0;
   state.analysis.isClear = false;
   state.analysis.lastSceneSnapshot = null;
-  applyImmediateLocalBlur(video);
+  applyFullVideoBlur(video);
 
   console.info(
     "[SafeView][Capture] BOUNDARY RESET video=%s reason=%s",
@@ -384,7 +458,7 @@ function maybeHandleSceneChange(
   state.analysis.firstDecisionMade = false;
   state.analysis.safeStreak = 0;
   state.analysis.isClear = false;
-  applyImmediateLocalBlur(video);
+  applyFullVideoBlur(video);
 
   console.info(
     "[SafeView][Capture] SCENE CHANGE video=%s — temporary blur",
@@ -469,7 +543,14 @@ function handleFrameAnalysisDone(
   videoId: number,
   requestId?: number,
   decision?: string,
-  reason?: string
+  reason?: string,
+  frameSeq?: number,
+  stableMeta?: {
+    score: number;
+    safeStreak: number;
+    unsafeStreak: number;
+    isBlurred: boolean;
+  }
 ): void {
   const video = videoIdToElement.get(videoId);
   if (!video) {
@@ -487,9 +568,84 @@ function handleFrameAnalysisDone(
   }
 
   markAnalysisComplete(state, resolvedRequestId);
+  state.analysis.demo.pending = false;
 
   const primary = findPrimaryVisibleVideo();
   if (video !== primary) {
+    return;
+  }
+
+  const seq = frameSeq ?? state.frameSeq;
+
+  if (DEMO_CLASSIFIER_SWITCH) {
+    if (seq > 0 && seq < state.analysis.demo.latestAppliedFrameSeq) {
+      console.debug(
+        "[SafeView] Ignoring stale frame result seq=%s latestAppliedFrameSeq=%s",
+        seq,
+        state.analysis.demo.latestAppliedFrameSeq
+      );
+      if (isFrameProtectionActiveCached() && video === primary) {
+        void sampleFrame(video, state.captureSession, true);
+      }
+      return;
+    }
+
+    if (decision !== "DROP") {
+      state.analysis.demo.latestAppliedFrameSeq = seq;
+      state.analysis.demo.lastResultAt = Date.now();
+      state.analysis.demo.lastCommand =
+        decision === "BLUR" || decision === "CLEAR" || decision === "KEEP"
+          ? decision
+          : "KEEP";
+      if (stableMeta) {
+        state.analysis.demo.safeStreak = stableMeta.safeStreak;
+        state.analysis.demo.unsafeStreak = stableMeta.unsafeStreak;
+        state.analysis.demo.isBlurred = stableMeta.isBlurred;
+      }
+    }
+
+    if (decision === "BLUR") {
+      state.analysis.demo.isBlurred = true;
+      state.analysis.demo.lastUnsafeAt = Date.now();
+      if (!stableMeta) {
+        state.analysis.demo.unsafeStreak += 1;
+        state.analysis.demo.safeStreak = 0;
+      }
+      applyFullVideoBlur(video);
+      console.log(
+        "[SafeView][StableDecision] frameSeq=%s command=BLUR reason=%s isBlurred=true",
+        seq,
+        reason ?? "-"
+      );
+    } else if (decision === "CLEAR") {
+      state.analysis.demo.isBlurred = false;
+      if (!stableMeta) {
+        state.analysis.demo.safeStreak = 0;
+        state.analysis.demo.unsafeStreak = 0;
+      }
+      clearFullVideoBlur(video);
+      console.log(
+        "[SafeView][StableDecision] frameSeq=%s command=CLEAR reason=%s isBlurred=false",
+        seq,
+        reason ?? "-"
+      );
+    } else if (decision === "KEEP") {
+      const scoreText =
+        stableMeta !== undefined ? stableMeta.score.toFixed(2) : "-";
+      console.log(
+        "[SafeView][StableDecision] frameSeq=%s score=%s command=KEEP reason=%s isBlurred=%s safeStreak=%s unsafeStreak=%s",
+        seq,
+        scoreText,
+        reason ?? "-",
+        state.analysis.demo.isBlurred,
+        state.analysis.demo.safeStreak,
+        state.analysis.demo.unsafeStreak
+      );
+    }
+
+    if (isFrameProtectionActiveCached() && video === primary) {
+      void sampleFrame(video, state.captureSession, true);
+    }
     return;
   }
 
@@ -499,7 +655,7 @@ function handleFrameAnalysisDone(
     state.analysis.unsafeLockUntil = 0;
     state.analysis.firstDecisionMade = true;
     state.analysis.isClear = true;
-    clearImmediateLocalBlur(video);
+    clearFullVideoBlur(video);
     console.log("[SafeView][Blur] clear immediate");
     const snapshot = captureSceneSnapshot(video);
     if (snapshot) {
@@ -509,10 +665,10 @@ function handleFrameAnalysisDone(
     state.analysis.isClear = false;
     state.analysis.safeStreak = 0;
     state.analysis.firstDecisionMade = true;
-    if (reason === "real_human_nudity" || reason === "unsafe") {
+    if (reason === "real_human_nudity" || reason === "unsafe" || reason === "demo_unsafe") {
       state.analysis.unsafeSeen = true;
     }
-    applyImmediateLocalBlur(video);
+    applyFullVideoBlur(video);
   } else if (
     decision === "HOLD" &&
     reason === "building_safe_streak" &&
@@ -700,13 +856,13 @@ function ensureVideoRegistered(video: HTMLVideoElement): void {
     resetVideoAnalysisState(state);
     if (isFrameProtectionActiveCached()) {
       if (findPrimaryVisibleVideo() === video) {
-        applyImmediateLocalBlur(video);
+        applyFullVideoBlur(video);
         triggerImmediateFirstSample(video);
       } else {
-        clearImmediateLocalBlur(video);
+        clearAllBlur(video);
       }
     } else {
-      clearImmediateLocalBlur(video);
+      clearAllBlur(video);
     }
     reconcilePrimaryCaptureLoop("settings-rescan");
     return;
@@ -855,7 +1011,7 @@ function reconcilePrimaryCaptureLoop(reason: string): void {
 
     if (video !== primary) {
       stopSampling(video, state, `not-primary:${reason}`);
-      clearImmediateLocalBlur(video);
+      clearAllBlur(video);
     }
   }
 
@@ -864,7 +1020,7 @@ function reconcilePrimaryCaptureLoop(reason: string): void {
     return;
   }
 
-  applyImmediateLocalBlur(primary);
+  applyFullVideoBlur(primary);
   const primaryState = trackedVideos.get(primary);
   if (primaryState) {
     scheduleFirstSample(primary, primaryState);
@@ -964,7 +1120,7 @@ function unregisterVideo(video: HTMLVideoElement, reason = "unregister"): void {
   }
 
   stopSampling(video, state, reason);
-  clearImmediateLocalBlur(video);
+  clearAllBlur(video);
   video.removeEventListener("loadedmetadata", state.onMetadataLoaded);
   teardownFirstSampleListeners(video, state);
   stopSubtitleMonitor(video);
@@ -1278,6 +1434,13 @@ async function sampleFrame(
     return;
   }
 
+  if (DEMO_CLASSIFIER_SWITCH) {
+    runDemoBlurTtlCheck(video, state);
+    if (state.analysis.demo.pending) {
+      return;
+    }
+  }
+
   const now = performance.now();
 
   if (state.capturePausedUntil > now) {
@@ -1416,6 +1579,7 @@ async function sampleFrame(
     after.analysis.requestId += 1;
     const requestId = after.analysis.requestId;
     after.analysis.isAnalyzing = true;
+    after.analysis.demo.pending = true;
     after.analysis.lastAnalysisStartedAt = now;
     clearAnalysisTimeout(after);
     after.analysisTimeoutId = window.setTimeout(() => {
@@ -1453,6 +1617,20 @@ async function sampleFrame(
     );
   } catch (error) {
     console.error("[SafeView] Frame sampling failed:", error);
+    const failed = trackedVideos.get(video);
+    if (failed && failed.captureSession === captureSession) {
+      failed.analysis.demo.pending = false;
+      failed.analysis.isAnalyzing = false;
+      failed.analysis.demo.lastResultAt = Date.now();
+      console.warn("[SafeView] Frame analysis failed (capture)", error);
+      if (
+        DEMO_CLASSIFIER_SWITCH &&
+        failed.analysis.demo.isBlurred &&
+        Date.now() - failed.analysis.demo.lastUnsafeAt > BLUR_TTL_MS
+      ) {
+        runDemoBlurTtlCheck(video, failed);
+      }
+    }
   } finally {
     const current = trackedVideos.get(video);
     if (current && current.captureSession === captureSession) {
@@ -1715,7 +1893,16 @@ function setupRuntimeMessageListener(): void {
           payload.videoId,
           payload.requestId,
           framePayload.decision,
-          framePayload.reason
+          framePayload.reason,
+          (message as { frameSeq?: number }).frameSeq,
+          (message as {
+            stableMeta?: {
+              score: number;
+              safeStreak: number;
+              unsafeStreak: number;
+              isBlurred: boolean;
+            };
+          }).stableMeta
         );
       }
       return;

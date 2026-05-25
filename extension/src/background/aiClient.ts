@@ -1,6 +1,4 @@
 // SafeView — aiClient.ts
-// Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
-// Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
 // Purpose: fetch() wrapper for localhost FastAPI POST /analyze-image.
 
 import {
@@ -8,8 +6,16 @@ import {
   DEFAULT_SENSITIVITY,
   MUTE_DURATION_MS,
   getCachedSettings,
-  loadSettings,
 } from "./businessRules";
+import {
+  ANALYZE_IMAGE_TIMEOUT_MS,
+  BACKEND_OFFLINE_FAILURE_STREAK,
+} from "./latencyPolicy";
+import {
+  normalizeAnalyzeImageResponse,
+  type AnalyzeImageResponse,
+  type HealthResponse,
+} from "../shared/apiTypes";
 
 /** JSON body returned by the SafeView backend POST /analyze-audio endpoint. */
 export interface AnalyzeAudioResponse {
@@ -20,66 +26,34 @@ export interface AnalyzeAudioResponse {
   confidence: number;
 }
 
-/**
- * Result of analyzeAudio — always resolves; never throws.
- */
 export interface AnalyzeAudioResult {
   response: AnalyzeAudioResponse;
   backendOnline: boolean;
   fromFallback: boolean;
 }
 
-/** JSON body returned by the SafeView backend analyze-image endpoint. */
-export interface ContentTypeInfo {
-  is_animation?: boolean;
-  is_real_human?: boolean;
-  gate_reason?: string | null;
-}
+export type { AnalyzeImageResponse, HealthResponse };
 
-/** JSON body returned by the SafeView backend analyze-image endpoint. */
-export interface AnalyzeImageResponse {
-  category: string;
-  detected: boolean;
-  confidence: number;
-  action: "BLUR" | "ALLOW";
-  /** Argmax class from the model (independent of user sensitivity threshold). */
-  label?: "NSFW" | "SFW";
-  model_loaded: boolean;
-  gate_reason?: string;
-  content_type?: ContentTypeInfo;
-}
-
-/**
- * Result of analyzeImage — always resolves; never throws.
- */
 export interface AnalyzeImageResult {
   response: AnalyzeImageResponse;
   backendOnline: boolean;
   fromFallback: boolean;
 }
 
-/**
- * Backend connectivity flag for popup status badge (BR-04 / fail-open).
- */
 export interface BackendStatus {
   online: boolean;
   lastCheckedAt: number;
   lastError?: string;
-  /** From GET /health — false when nudity weights are not loaded. */
   modelLoaded?: boolean;
 }
 
-/** chrome.storage.local key for backend online/offline status. */
 export const BACKEND_STATUS_STORAGE_KEY = "safeview_backend_status";
 
 const ACTION_ALLOW = "ALLOW" as const;
 const ACTION_MUTE = "MUTE" as const;
 
-/**
- * Fail-open response when /analyze-audio is unreachable or invalid.
- *
- * @returns Safe ALLOW result with BR-05 duration_ms.
- */
+let consecutiveFailures = 0;
+
 function buildSafeAudioDefaultResponse(): AnalyzeAudioResponse {
   return {
     detected: false,
@@ -95,20 +69,10 @@ let cachedBackendStatus: BackendStatus = {
   lastCheckedAt: 0,
 };
 
-/**
- * Read the current backend online/offline status (in-memory cache).
- *
- * @returns Latest BackendStatus snapshot.
- */
 export function getBackendStatus(): BackendStatus {
   return { ...cachedBackendStatus };
 }
 
-/**
- * Persist backend status to chrome.storage.local for UI consumers.
- *
- * @param status - Connectivity snapshot to store.
- */
 async function persistBackendStatus(status: BackendStatus): Promise<void> {
   cachedBackendStatus = status;
 
@@ -121,12 +85,12 @@ async function persistBackendStatus(status: BackendStatus): Promise<void> {
   }
 }
 
-/**
- * Mark backend offline with an optional error message.
- *
- * @param errorMessage - Human-readable failure reason (not frame data).
- */
 async function markBackendOffline(errorMessage?: string): Promise<void> {
+  consecutiveFailures += 1;
+  if (consecutiveFailures < BACKEND_OFFLINE_FAILURE_STREAK) {
+    return;
+  }
+
   await persistBackendStatus({
     online: false,
     lastCheckedAt: Date.now(),
@@ -134,12 +98,8 @@ async function markBackendOffline(errorMessage?: string): Promise<void> {
   });
 }
 
-/**
- * Mark backend online after a successful request.
- *
- * @param modelLoaded - From GET /health model_loaded when known.
- */
 async function markBackendOnline(modelLoaded?: boolean): Promise<void> {
+  consecutiveFailures = 0;
   await persistBackendStatus({
     online: true,
     lastCheckedAt: Date.now(),
@@ -148,12 +108,6 @@ async function markBackendOnline(modelLoaded?: boolean): Promise<void> {
   });
 }
 
-/**
- * Fail-open response when the backend is unreachable or returns an error.
- *
- * @param category - Requested detection category.
- * @returns Safe ALLOW result with zero confidence.
- */
 function buildSafeDefaultResponse(category: string): AnalyzeImageResponse {
   return {
     category,
@@ -161,50 +115,36 @@ function buildSafeDefaultResponse(category: string): AnalyzeImageResponse {
     confidence: 0,
     action: ACTION_ALLOW,
     model_loaded: false,
+    detections: [],
+    content_type: null,
+    gate_reason: null,
   };
 }
 
-/**
- * Resolve backend base URL from chrome.storage.local (BR-04).
- *
- * @returns Backend URL string.
- */
 function resolveBackendUrl(): string {
   return getCachedSettings().backendUrl || DEFAULT_BACKEND_URL;
 }
 
-/**
- * Minimal fields extracted from an analyze-image response body.
- */
 export interface ParsedAnalyzeImageBody {
-  label?: "NSFW" | "SFW";
+  label?: string;
   score: number;
   category?: string;
   detected?: boolean;
   action?: string;
   model_loaded?: boolean;
   gate_reason?: string;
-  content_type?: ContentTypeInfo;
+  content_type?: AnalyzeImageResponse["content_type"];
+  detections?: AnalyzeImageResponse["detections"];
+  supports_boxes?: boolean;
+  categories?: AnalyzeImageResponse["categories"];
 }
 
-/**
- * Strip ```json ... ``` (or plain ```) markdown fences when present.
- *
- * @param text - Raw HTTP response text.
- * @returns Inner payload or trimmed text.
- */
 function stripMarkdownJsonFences(text: string): string {
   const trimmed = text.trim();
   const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   return fenceMatch ? fenceMatch[1].trim() : trimmed;
 }
 
-/**
- * Extract the first balanced `{ ... }` object from surrounding text.
- *
- * @param text - Raw or partially cleaned response text.
- * @returns JSON object substring, or null when none found.
- */
 function extractFirstJsonObject(text: string): string | null {
   const start = text.indexOf("{");
   if (start === -1) {
@@ -244,12 +184,6 @@ function extractFirstJsonObject(text: string): string | null {
   return null;
 }
 
-/**
- * Parse analyze-image response text (handles fences and leading/trailing prose).
- *
- * @param rawText - Full response body as text.
- * @returns Parsed label/score and optional API fields, or null when unparseable.
- */
 export function parseAnalyzeImageResponseText(
   rawText: string
 ): ParsedAnalyzeImageBody | null {
@@ -275,48 +209,33 @@ export function parseAnalyzeImageResponseText(
         continue;
       }
 
-      const rawLabel = body.label;
-      const label =
-        rawLabel === "NSFW" || rawLabel === "SFW" ? rawLabel : undefined;
+      const normalized = normalizeAnalyzeImageResponse(
+        { ...body, confidence: score },
+        typeof body.category === "string" ? body.category : "nudity"
+      );
 
       return {
-        label,
-        score,
-        category: typeof body.category === "string" ? body.category : undefined,
-        detected:
-          typeof body.detected === "boolean" ? body.detected : undefined,
-        action: typeof body.action === "string" ? body.action : undefined,
-        model_loaded:
-          typeof body.model_loaded === "boolean" ? body.model_loaded : undefined,
-        gate_reason:
-          typeof body.gate_reason === "string" ? body.gate_reason : undefined,
-        content_type:
-          body.content_type && typeof body.content_type === "object"
-            ? (body.content_type as ContentTypeInfo)
-            : undefined,
+        label: normalized.label,
+        score: normalized.confidence,
+        category: normalized.category,
+        detected: normalized.detected,
+        action: normalized.action,
+        model_loaded: normalized.model_loaded,
+        gate_reason: normalized.gate_reason ?? undefined,
+        content_type: normalized.content_type,
+        detections: normalized.detections,
+        supports_boxes: normalized.supports_boxes,
+        categories: normalized.categories,
       };
     } catch {
       // try next candidate
     }
   }
 
-  console.error("[SafeView] Unparseable analyze-image response:", rawText);
-  console.warn(
-    "[SafeView][PARSE ERROR] raw response logged above — frame skipped"
-  );
+  console.error("[SafeView] Unparseable analyze-image response");
   return null;
 }
 
-/**
- * POST a JPEG frame to /analyze-image. Reads backend URL from storage.
- *
- * Never throws — on failure returns a safe ALLOW default and sets backend offline.
- *
- * @param frame - JPEG blob from the content script (never logged).
- * @param sensitivity - User sensitivity (0.0–1.0).
- * @param category - Detection category to run.
- * @returns AnalyzeImageResult with response and connectivity flags, or null when the body is unparseable (frame skipped).
- */
 export async function analyzeImage(
   frame: Blob,
   sensitivity: number = DEFAULT_SENSITIVITY,
@@ -328,6 +247,13 @@ export async function analyzeImage(
   if (signal?.aborted) {
     throw new DOMException("Frame analysis aborted", "AbortError");
   }
+
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(), ANALYZE_IMAGE_TIMEOUT_MS);
+
+  const combinedSignal = signal
+    ? AbortSignal.any([signal, timeoutController.signal])
+    : timeoutController.signal;
 
   try {
     const backendUrl = resolveBackendUrl();
@@ -345,7 +271,7 @@ export async function analyzeImage(
       response = await fetch(endpoint, {
         method: "POST",
         body: formData,
-        signal,
+        signal: combinedSignal,
       });
     } catch (error) {
       if (signal?.aborted) {
@@ -360,6 +286,8 @@ export async function analyzeImage(
         backendOnline: false,
         fromFallback: true,
       };
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     if (!response.ok) {
@@ -374,8 +302,6 @@ export async function analyzeImage(
     }
 
     const rawText = await response.text();
-    console.log("[SafeView] Raw response:", rawText);
-
     const parsed = parseAnalyzeImageResponseText(rawText);
     if (parsed === null) {
       return null;
@@ -395,23 +321,27 @@ export async function analyzeImage(
       };
     }
 
-    await markBackendOnline();
+    await markBackendOnline(parsed.model_loaded);
 
-    const rawLabel = parsed.label;
-    const label =
-      rawLabel === "NSFW" || rawLabel === "SFW" ? rawLabel : undefined;
-
-    return {
-      response: {
+    const responseBody = normalizeAnalyzeImageResponse(
+      {
         category: parsed.category ?? category,
         detected: parsed.detected,
         confidence: parsed.score,
-        action: parsed.action === "BLUR" ? "BLUR" : ACTION_ALLOW,
-        label,
-        model_loaded: Boolean(parsed.model_loaded),
+        action: parsed.action,
+        label: parsed.label,
+        model_loaded: parsed.model_loaded,
         gate_reason: parsed.gate_reason,
         content_type: parsed.content_type,
+        detections: parsed.detections,
+        supports_boxes: parsed.supports_boxes,
+        categories: parsed.categories,
       },
+      category
+    );
+
+    return {
+      response: responseBody,
       backendOnline: true,
       fromFallback: false,
     };
@@ -432,16 +362,6 @@ export async function analyzeImage(
   }
 }
 
-/**
- * POST WebM audio to /analyze-audio. Reads backend URL from storage.
- *
- * Never throws — on failure returns a safe ALLOW default.
- *
- * @param audio - WebM blob from MediaRecorder (never logged).
- * @param language - Whisper language code (en | am).
- * @param sensitivity - User sensitivity (unused by backend profanity; kept for API).
- * @returns AnalyzeAudioResult with response and connectivity flags.
- */
 export async function analyzeAudio(
   audio: Blob,
   language: string,
@@ -552,13 +472,6 @@ export async function analyzeAudio(
   }
 }
 
-/**
- * GET /health against a specific backend base URL.
- *
- * @param backendUrl - Base URL to probe (e.g. from options field).
- * @param updateStatusFlag - When true, persist online/offline to storage.
- * @returns True when the backend responds with status ok.
- */
 export async function checkBackendHealthAt(
   backendUrl: string,
   updateStatusFlag = true
@@ -574,16 +487,14 @@ export async function checkBackendHealthAt(
       return false;
     }
 
-    const body = (await response.json()) as {
-      status?: string;
-      model_loaded?: boolean;
-    };
+    const body = (await response.json()) as HealthResponse;
 
     if (body.status === "ok") {
+      const nudityLoaded = body.models?.nudity?.loaded ?? body.model_loaded;
       if (updateStatusFlag) {
-        await markBackendOnline(body.model_loaded);
+        await markBackendOnline(nudityLoaded);
       }
-      return true;
+      return Boolean(nudityLoaded);
     }
 
     if (updateStatusFlag) {
@@ -600,18 +511,10 @@ export async function checkBackendHealthAt(
   }
 }
 
-/**
- * GET /health using backend URL from chrome.storage.local.
- *
- * @returns True when the backend responds with status ok.
- */
 export async function checkBackendHealth(): Promise<boolean> {
   return checkBackendHealthAt(resolveBackendUrl(), true);
 }
 
-/**
- * Hydrate in-memory backend status from chrome.storage.local on worker startup.
- */
 export async function loadBackendStatusFromStorage(): Promise<BackendStatus> {
   try {
     const stored = await chrome.storage.local.get(BACKEND_STATUS_STORAGE_KEY);

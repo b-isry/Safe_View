@@ -1,7 +1,5 @@
 # SafeView — models/nudity.py
-# Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
-# Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
-# Purpose: Real nudity detection with animation/human content gate.
+# Purpose: Nudity classification via dino_v3_linear.pth (full-frame blur only; no boxes).
 
 from __future__ import annotations
 
@@ -17,16 +15,16 @@ import model_loader
 logger = logging.getLogger(__name__)
 
 CATEGORY = "nudity"
+UNSAFE_THRESHOLD = content_gate.UNSAFE_THRESHOLD
 
 
 def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
     """
-    Run content gate then nudity inference on real-human frames only.
+    Run nudity classifier first; content gate is metadata unless model is strongly NSFW.
 
-    Animation/cartoon/anime frames return ALLOW immediately (no nudity blur).
-    Person/face/skin alone never triggers blur — only gated nudity >= 0.72.
+    High-confidence NSFW from the classifier always triggers BLUR (no partial-region boxes).
     """
-    del sensitivity  # Final threshold is UNSAFE_THRESHOLD in content_gate.
+    del sensitivity  # Threshold fixed at UNSAFE_THRESHOLD for nudity classifier.
 
     if not model_loader.MODEL_LOADED or model_loader.get_model() is None:
         logger.warning(
@@ -37,25 +35,29 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
 
     try:
         content_type = content_gate.classify_content_type(image)
-
-        if content_type.get("is_animation") or not content_type.get("is_real_human"):
-            return {
-                "category": CATEGORY,
-                **content_gate.build_gated_nudity_response(
-                    content_type,
-                    nudity_confidence=0.0,
-                    nudity_positive=False,
-                    model_loaded=True,
-                ),
-            }
-
         tensor = inference.preprocess(image)
         raw = inference.run_inference_raw(tensor)
         nudity_positive = raw["label"] == "NSFW"
+        confidence = float(raw["confidence"])
+
+        # Trust classifier when confidence is high — do not block on weak heuristics.
+        if nudity_positive and confidence >= UNSAFE_THRESHOLD:
+            return {
+                "category": CATEGORY,
+                "detected": True,
+                "confidence": confidence,
+                "action": inference.ACTION_BLUR,
+                "label": "NSFW",
+                "model_loaded": True,
+                "detections": [],
+                "content_type": content_type,
+                "gate_reason": "classifier_nsfw",
+                "supports_boxes": False,
+            }
 
         gated = content_gate.build_gated_nudity_response(
             content_type,
-            nudity_confidence=raw["confidence"],
+            nudity_confidence=confidence,
             nudity_positive=nudity_positive,
             model_loaded=True,
         )
@@ -63,6 +65,8 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
         return {
             "category": CATEGORY,
             **gated,
+            "detections": [],
+            "supports_boxes": False,
         }
     except Exception as exc:
         logger.error("[SafeView] Nudity detection failed: %s", exc)
@@ -78,10 +82,8 @@ def _fail_open_response() -> Dict[str, Any]:
         "action": inference.ACTION_ALLOW,
         "label": "SFW",
         "model_loaded": model_loader.MODEL_LOADED,
+        "detections": [],
+        "content_type": None,
         "gate_reason": "model_unavailable",
-        "content_type": {
-            "is_animation": False,
-            "is_real_human": False,
-            "gate_reason": "model_unavailable",
-        },
+        "supports_boxes": False,
     }

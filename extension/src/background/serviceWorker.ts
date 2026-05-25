@@ -6,12 +6,20 @@
 import { analyzeAudio, analyzeImage, loadBackendStatusFromStorage } from "./aiClient";
 import {
   evaluateBlurState,
+  evaluateDemoBlurSwitch,
   applyBlurStateUpdates,
   logBlurEvaluation,
   normalizeBlurLabel,
   type BlurLabel,
   type ContentTypeGate,
 } from "./blurDecision";
+import { DEMO_CLASSIFIER_SWITCH } from "../shared/demoMode";
+import {
+  createStableBlurState,
+  logStableBlurDecision,
+  type StableBlurState,
+} from "./stableBlurDecision";
+import type { AnalyzeImageResponse } from "../shared/apiTypes";
 import {
   MUTE_DURATION_MS,
   SETTINGS_STORAGE_KEY,
@@ -19,12 +27,12 @@ import {
   getEnabledCategories,
   initSettingsCache,
   isFrameProtectionActive,
-  isKissingProtectionActive,
   isNudityProtectionActive,
   isViolenceProtectionActive,
   loadSettings,
   type SafeViewSettings,
 } from "./businessRules";
+import type { DetectionBox } from "../shared/apiTypes";
 import { SERVICE_WORKER_KEEPALIVE_MS } from "./latencyPolicy";
 import {
   isProfanityProtectionActive,
@@ -167,6 +175,10 @@ export interface BlurCommandMessage {
   commandSeq?: number;
   /** True when blur is applied before backend confirms (latency policy). */
   preemptive?: boolean;
+  /** full = entire video; regions = violence bounding boxes only. */
+  blurMode?: "full" | "regions";
+  /** Normalized violence detections when blurMode is regions. */
+  detections?: DetectionBox[];
 }
 
 /**
@@ -185,6 +197,9 @@ interface FramePipelineState {
   firstDecisionMade: boolean;
   safeStreak: number;
   unsafeLockUntil: number;
+  lastUnsafeAt: number;
+  /** Demo classifier hysteresis / hold / safe-streak state. */
+  stableBlur: StableBlurState;
 }
 
 const DEFAULT_FRAME_MIME_TYPE = "image/jpeg";
@@ -369,6 +384,8 @@ function getFramePipelineState(tabId: number, videoId: number): FramePipelineSta
       firstDecisionMade: false,
       safeStreak: 0,
       unsafeLockUntil: 0,
+      lastUnsafeAt: 0,
+      stableBlur: createStableBlurState(),
     };
     framePipelineState.set(key, state);
   }
@@ -489,7 +506,13 @@ export async function sendBlurCommand(
   videoId: number,
   trace?: Pick<
     BlurCommandMessage,
-    "capturedAt" | "sentAt" | "swReceivedAt" | "backendDoneAt" | "preemptive"
+    | "capturedAt"
+    | "sentAt"
+    | "swReceivedAt"
+    | "backendDoneAt"
+    | "preemptive"
+    | "blurMode"
+    | "detections"
   >
 ): Promise<void> {
   const commandSeq = nextBlurCommandSeq(tabId, videoId);
@@ -515,14 +538,12 @@ export interface FrameAnalysisOutcome {
   label: BlurLabel;
   score: number;
   violenceScore: number;
-  kissingScore: number;
   categories: string[];
-  nudityDetected: boolean | null;
-  nudityAction: string | null;
-  violenceDetected: boolean | null;
-  violenceAction: string | null;
-  kissingDetected: boolean | null;
-  kissingAction: string | null;
+  nudityDetected: boolean;
+  nudityAction: "BLUR" | "ALLOW" | null;
+  violenceDetected: boolean;
+  violenceAction: "BLUR" | "ALLOW" | null;
+  violenceDetections: DetectionBox[];
   contentType: ContentTypeGate | null;
   gateReason: string | null;
   backendTrusted: boolean;
@@ -530,11 +551,7 @@ export interface FrameAnalysisOutcome {
 }
 
 /**
- * Run enabled /analyze-image checks (nudity, violence, and/or kissing).
- *
- * @param frame - JPEG blob from the content script.
- * @param settings - User settings from storage.
- * @returns Combined model outcome for blurDecision.
+ * Run enabled /analyze-image checks (nudity and/or violence).
  */
 export async function analyzeFrameAgainstEnabledCategories(
   frame: Blob,
@@ -542,26 +559,66 @@ export async function analyzeFrameAgainstEnabledCategories(
   signal?: AbortSignal
 ): Promise<FrameAnalysisOutcome> {
   const runNudity = isNudityProtectionActive(settings);
-  const runViolence = isViolenceProtectionActive(settings);
-  const runKissing = isKissingProtectionActive(settings);
+  const runViolence = DEMO_CLASSIFIER_SWITCH
+    ? false
+    : isViolenceProtectionActive(settings);
 
-  if (!runNudity && !runViolence && !runKissing) {
+  const empty: FrameAnalysisOutcome = {
+    label: "SFW",
+    score: 0,
+    violenceScore: 0,
+    categories: [],
+    nudityDetected: false,
+    nudityAction: null,
+    violenceDetected: false,
+    violenceAction: null,
+    violenceDetections: [],
+    contentType: null,
+    gateReason: null,
+    backendTrusted: true,
+    modelLoaded: true,
+  };
+
+  if (!runNudity && !runViolence) {
+    return empty;
+  }
+
+  if (DEMO_CLASSIFIER_SWITCH && runNudity) {
+    const nudityResult = await analyzeImage(
+      frame,
+      settings.sensitivity,
+      "nudity",
+      signal
+    );
+
+    if (
+      nudityResult === null ||
+      !nudityResult.backendOnline ||
+      nudityResult.fromFallback
+    ) {
+      return {
+        ...empty,
+        categories: ["nudity"],
+        backendTrusted: false,
+        modelLoaded: false,
+      };
+    }
+
+    const response = nudityResult.response;
     return {
-      label: "SFW",
-      score: 0,
+      label: normalizeBlurLabel(response.label, response.confidence),
+      score: response.confidence,
       violenceScore: 0,
-      kissingScore: 0,
-      categories: [],
-      nudityDetected: null,
-      nudityAction: null,
-      violenceDetected: null,
+      categories: ["nudity"],
+      nudityDetected: response.detected,
+      nudityAction: response.action,
+      violenceDetected: false,
       violenceAction: null,
-      kissingDetected: null,
-      kissingAction: null,
-      contentType: null,
-      gateReason: null,
+      violenceDetections: response.detections ?? [],
+      contentType: response.content_type ?? null,
+      gateReason: response.gate_reason ?? null,
       backendTrusted: true,
-      modelLoaded: true,
+      modelLoaded: response.model_loaded,
     };
   }
 
@@ -572,44 +629,33 @@ export async function analyzeFrameAgainstEnabledCategories(
   if (runViolence) {
     categories.push("violence");
   }
-  if (runKissing) {
-    categories.push("kissing");
+
+  const useAll = runNudity && runViolence;
+
+  let nudityResult: Awaited<ReturnType<typeof analyzeImage>> = null;
+  let violenceResult: Awaited<ReturnType<typeof analyzeImage>> = null;
+
+  if (useAll) {
+    const allResult = await analyzeImage(frame, settings.sensitivity, "all", signal);
+    nudityResult = allResult;
+    violenceResult = allResult;
+  } else {
+    [nudityResult, violenceResult] = await Promise.all([
+      runNudity
+        ? analyzeImage(frame, settings.sensitivity, "nudity", signal)
+        : Promise.resolve(null),
+      runViolence
+        ? analyzeImage(frame, settings.sensitivity, "violence", signal)
+        : Promise.resolve(null),
+    ]);
   }
 
-  const [nudityResult, violenceResult, kissingResult] = await Promise.all([
-    runNudity
-      ? analyzeImage(frame, settings.sensitivity, "nudity", signal)
-      : Promise.resolve(null),
-    runViolence
-      ? analyzeImage(frame, settings.sensitivity, "violence", signal)
-      : Promise.resolve(null),
-    runKissing
-      ? analyzeImage(frame, settings.sensitivity, "kissing", signal)
-      : Promise.resolve(null),
-  ]);
-
-  const results = [nudityResult, violenceResult, kissingResult].filter(
+  const results = [nudityResult, violenceResult].filter(
     (entry): entry is NonNullable<typeof entry> => entry !== null
   );
 
   if (results.length === 0) {
-    return {
-      label: "SFW",
-      score: 0,
-      violenceScore: 0,
-      kissingScore: 0,
-      categories,
-      nudityDetected: null,
-      nudityAction: null,
-      violenceDetected: null,
-      violenceAction: null,
-      kissingDetected: null,
-      kissingAction: null,
-      contentType: null,
-      gateReason: null,
-      backendTrusted: false,
-      modelLoaded: false,
-    };
+    return { ...empty, categories, backendTrusted: false, modelLoaded: false };
   }
 
   const backendTrusted = results.every(
@@ -618,38 +664,25 @@ export async function analyzeFrameAgainstEnabledCategories(
   const modelLoaded = results.every((entry) => Boolean(entry.response.model_loaded));
 
   if (!backendTrusted) {
-    return {
-      label: "SFW",
-      score: 0,
-      violenceScore: 0,
-      kissingScore: 0,
-      categories,
-      nudityDetected: null,
-      nudityAction: null,
-      violenceDetected: null,
-      violenceAction: null,
-      kissingDetected: null,
-      kissingAction: null,
-      contentType: null,
-      gateReason: null,
-      backendTrusted: false,
-      modelLoaded: false,
-    };
+    return { ...empty, categories, backendTrusted: false, modelLoaded: false };
   }
 
-  const nudityResponse = nudityResult?.response;
-  const violenceResponse = violenceResult?.response;
-  const kissingResponse = kissingResult?.response;
+  let nudityResponse = nudityResult?.response;
+  let violenceResponse = violenceResult?.response;
+
+  if (useAll && nudityResult?.response.categories) {
+    nudityResponse = nudityResult.response.categories.nudity ?? nudityResponse;
+    violenceResponse = nudityResult.response.categories.violence ?? violenceResponse;
+  } else if (useAll) {
+    nudityResponse = nudityResult?.response;
+    violenceResponse = nudityResult?.response;
+  }
+
   const nudityScore = nudityResponse?.confidence ?? 0;
   const violenceScore = violenceResponse?.confidence ?? 0;
-  const kissingScore = kissingResponse?.confidence ?? 0;
-  const displayScore = Math.max(nudityScore, violenceScore, kissingScore);
+  const displayScore = Math.max(nudityScore, violenceScore);
   const displayLabel = normalizeBlurLabel(
-    kissingScore >= violenceScore && kissingScore >= nudityScore
-      ? kissingResponse?.label
-      : violenceScore > nudityScore
-        ? violenceResponse?.label
-        : nudityResponse?.label,
+    violenceScore > nudityScore ? violenceResponse?.label : nudityResponse?.label,
     displayScore
   );
   const contentType = nudityResponse?.content_type ?? null;
@@ -660,14 +693,12 @@ export async function analyzeFrameAgainstEnabledCategories(
     label: displayLabel,
     score: nudityScore,
     violenceScore,
-    kissingScore,
     categories,
-    nudityDetected: runNudity ? Boolean(nudityResponse?.detected) : null,
-    nudityAction: nudityResponse?.action ?? null,
-    violenceDetected: runViolence ? Boolean(violenceResponse?.detected) : null,
-    violenceAction: violenceResponse?.action ?? null,
-    kissingDetected: runKissing ? Boolean(kissingResponse?.detected) : null,
-    kissingAction: kissingResponse?.action ?? null,
+    nudityDetected: runNudity ? Boolean(nudityResponse?.detected) : false,
+    nudityAction: runNudity ? (nudityResponse?.action ?? null) : null,
+    violenceDetected: runViolence ? Boolean(violenceResponse?.detected) : false,
+    violenceAction: runViolence ? (violenceResponse?.action ?? null) : null,
+    violenceDetections: violenceResponse?.detections ?? [],
     contentType,
     gateReason,
     backendTrusted: true,
@@ -698,6 +729,7 @@ function resetFramePipelineForVideo(tabId: number, videoId: number): void {
   pipeline.firstDecisionMade = false;
   pipeline.safeStreak = 0;
   pipeline.unsafeLockUntil = 0;
+  pipeline.lastUnsafeAt = 0;
   pipeline.analysisInFlight = false;
   pipeline.abortController = null;
 }
@@ -731,12 +763,34 @@ function resetFramePipelineForTab(tabId: number): number[] {
 /**
  * Notify the content script that one frame analysis cycle finished.
  */
+function demoStableMeta(
+  pipeline: FramePipelineState,
+  score = 0
+): { score: number; safeStreak: number; unsafeStreak: number; isBlurred: boolean } | undefined {
+  if (!DEMO_CLASSIFIER_SWITCH) {
+    return undefined;
+  }
+  return {
+    score,
+    safeStreak: pipeline.stableBlur.safeStreak,
+    unsafeStreak: pipeline.stableBlur.unsafeStreak,
+    isBlurred: pipeline.stableBlur.isBlurred,
+  };
+}
+
 async function sendFrameAnalysisDone(
   tabId: number,
   videoId: number,
   requestId: number | undefined,
   decision: string,
-  reason: string
+  reason: string,
+  frameSeq?: number,
+  stableMeta?: {
+    score: number;
+    safeStreak: number;
+    unsafeStreak: number;
+    isBlurred: boolean;
+  }
 ): Promise<void> {
   try {
     await chrome.tabs.sendMessage(tabId, {
@@ -745,6 +799,8 @@ async function sendFrameAnalysisDone(
       requestId,
       decision,
       reason,
+      frameSeq,
+      stableMeta,
     });
   } catch {
     /* Tab may have navigated away. */
@@ -770,6 +826,7 @@ async function processFrameSample(
   const requestId = message.requestId ?? 0;
   let analysisDecision = "HOLD";
   let analysisReason = "pending";
+  let decisionScore = 0;
 
   const sessionId = message.sessionId ?? 0;
   if (sessionId > 0) {
@@ -856,6 +913,7 @@ async function processFrameSample(
       settings,
       abortController.signal
     );
+    decisionScore = outcome.score;
 
     if (generationAtStart !== pipeline.generation) {
       await sendFrameAnalysisDone(
@@ -899,58 +957,107 @@ async function processFrameSample(
     const frameSeq = message.frameSeq ?? 0;
     const nowMs = Date.now();
 
-    const backendAction =
-      outcome.nudityAction === "BLUR"
-        ? "BLUR"
-        : outcome.nudityAction === "ALLOW"
-          ? "ALLOW"
-          : null;
-    const violenceAction =
-      outcome.violenceAction === "BLUR"
-        ? "BLUR"
-        : outcome.violenceAction === "ALLOW"
-          ? "ALLOW"
-          : null;
-    const kissingAction =
-      outcome.kissingAction === "BLUR"
-        ? "BLUR"
-        : outcome.kissingAction === "ALLOW"
-          ? "ALLOW"
-          : null;
+    const nudityResponse: AnalyzeImageResponse = {
+      category: "nudity",
+      detected: outcome.nudityDetected,
+      confidence: outcome.score,
+      action:
+        outcome.nudityAction === "BLUR"
+          ? "BLUR"
+          : "ALLOW",
+      label: outcome.label,
+      model_loaded: outcome.modelLoaded,
+      detections: outcome.violenceDetections ?? [],
+      content_type: outcome.contentType,
+      gate_reason: outcome.gateReason,
+      supports_boxes: false,
+    };
 
-    const evaluation = evaluateBlurState({
-      score: outcome.score,
-      violenceScore: outcome.violenceScore,
-      kissingScore: outcome.kissingScore,
-      nudityDetected: outcome.nudityDetected === true,
-      violenceDetected: outcome.violenceDetected === true,
-      kissingDetected: outcome.kissingDetected === true,
-      backendAction,
-      violenceAction,
-      kissingAction,
-      contentType: outcome.contentType,
-      gateReason: outcome.gateReason,
-      frameSeq,
-      lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
-      resultGeneration: generationAtStart,
-      currentGeneration: pipeline.generation,
-      backendTrusted: outcome.backendTrusted,
-      modelLoaded: outcome.modelLoaded,
-      requestId,
-      latestRequestId: pipeline.latestRequestId,
-      unsafeSeen: pipeline.unsafeSeen,
-      firstDecisionMade: pipeline.firstDecisionMade,
-      safeStreak: pipeline.safeStreak,
-      unsafeLockUntil: pipeline.unsafeLockUntil,
-      nowMs,
-    });
+    const demoEvaluation = DEMO_CLASSIFIER_SWITCH
+      ? evaluateDemoBlurSwitch({
+        response: nudityResponse,
+        frameSeq,
+        lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
+        requestId,
+        latestRequestId: pipeline.latestRequestId,
+        resultGeneration: generationAtStart,
+        currentGeneration: pipeline.generation,
+        backendTrusted: outcome.backendTrusted,
+        stableState: pipeline.stableBlur,
+        nowMs,
+      })
+      : null;
+
+    const evaluation = demoEvaluation
+      ?? evaluateBlurState({
+        score: outcome.score,
+        violenceScore: outcome.violenceScore,
+        nudityDetected: outcome.nudityDetected,
+        violenceDetected: outcome.violenceDetected,
+        nudityAction:
+          outcome.nudityAction === "BLUR"
+            ? "BLUR"
+            : outcome.nudityAction === "ALLOW"
+              ? "ALLOW"
+              : null,
+        violenceAction:
+          outcome.violenceAction === "BLUR"
+            ? "BLUR"
+            : outcome.violenceAction === "ALLOW"
+              ? "ALLOW"
+              : null,
+        violenceDetections: outcome.violenceDetections,
+        contentType: outcome.contentType,
+        gateReason: outcome.gateReason,
+        frameSeq,
+        lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
+        resultGeneration: generationAtStart,
+        currentGeneration: pipeline.generation,
+        backendTrusted: outcome.backendTrusted,
+        modelLoaded: outcome.modelLoaded,
+        requestId,
+        latestRequestId: pipeline.latestRequestId,
+        unsafeSeen: pipeline.unsafeSeen,
+        firstDecisionMade: pipeline.firstDecisionMade,
+        safeStreak: pipeline.safeStreak,
+        unsafeLockUntil: pipeline.unsafeLockUntil,
+        lastUnsafeAt: pipeline.lastUnsafeAt,
+        nowMs,
+      });
+
+    if (demoEvaluation?.stableState) {
+      pipeline.stableBlur = demoEvaluation.stableState;
+      logStableBlurDecision(
+        {
+          command:
+            evaluation.action === "BLUR" ||
+              evaluation.action === "CLEAR" ||
+              evaluation.action === "KEEP"
+              ? evaluation.action
+              : "KEEP",
+          reason: evaluation.reason,
+          mode:
+            evaluation.action === "BLUR"
+              ? "full"
+              : evaluation.action === "KEEP"
+                ? "full"
+                : "none",
+          score: outcome.score,
+          state: pipeline.stableBlur,
+        },
+        {
+          frameSeq,
+          backendMs: inferenceMs,
+          totalMs: backendDoneAt - (message.capturedAt ?? backendDoneAt),
+        }
+      );
+    }
 
     logBlurEvaluation(evaluation, {
       label: outcome.label,
       score: outcome.score,
-      nudityDetected: outcome.nudityDetected === true,
-      violenceDetected: outcome.violenceDetected === true,
-      kissingDetected: outcome.kissingDetected === true,
+      nudityDetected: outcome.nudityDetected,
+      violenceDetected: outcome.violenceDetected,
       gateReason: outcome.gateReason,
       frame: frameSeq,
       gen: generationAtStart,
@@ -987,28 +1094,35 @@ async function processFrameSample(
       return;
     }
 
-    const updates = applyBlurStateUpdates(
-      {
-        unsafeSeen: pipeline.unsafeSeen,
-        firstDecisionMade: pipeline.firstDecisionMade,
-        safeStreak: pipeline.safeStreak,
-        unsafeLockUntil: pipeline.unsafeLockUntil,
-        nowMs,
-      },
-      evaluation
-    );
-    pipeline.unsafeSeen = updates.unsafeSeen;
-    pipeline.firstDecisionMade = updates.firstDecisionMade;
-    pipeline.safeStreak = updates.safeStreak;
-    pipeline.unsafeLockUntil = updates.unsafeLockUntil;
+    if (!DEMO_CLASSIFIER_SWITCH) {
+      const updates = applyBlurStateUpdates(
+        {
+          unsafeSeen: pipeline.unsafeSeen,
+          firstDecisionMade: pipeline.firstDecisionMade,
+          safeStreak: pipeline.safeStreak,
+          unsafeLockUntil: pipeline.unsafeLockUntil,
+          lastUnsafeAt: pipeline.lastUnsafeAt,
+          nowMs,
+        },
+        evaluation
+      );
+      pipeline.unsafeSeen = updates.unsafeSeen;
+      pipeline.firstDecisionMade = updates.firstDecisionMade;
+      pipeline.safeStreak = updates.safeStreak;
+      pipeline.unsafeLockUntil = updates.unsafeLockUntil;
+      pipeline.lastUnsafeAt = updates.lastUnsafeAt;
+    }
 
-    if (evaluation.action === "HOLD") {
+    if (evaluation.action === "HOLD" || evaluation.action === "KEEP") {
+      pipeline.lastProcessedFrameSeq = frameSeq;
       await sendFrameAnalysisDone(
         tabId,
         message.videoId,
         requestId,
         analysisDecision,
-        analysisReason
+        analysisReason,
+        frameSeq,
+        demoStableMeta(pipeline, outcome.score)
       );
       return;
     }
@@ -1044,8 +1158,17 @@ async function processFrameSample(
         MESSAGE_ACTION_BLUR,
         inferenceMs
       );
-      await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, trace);
-    } else {
+      await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, {
+        ...trace,
+        blurMode: DEMO_CLASSIFIER_SWITCH
+          ? "full"
+          : evaluation.action === "BLUR" && evaluation.blurMode === "regions"
+            ? "regions"
+            : "full",
+        detections:
+          evaluation.action === "BLUR" ? evaluation.detections : undefined,
+      });
+    } else if (evaluation.action === "CLEAR") {
       logPipelineLatency(
         tabId,
         message.videoId,
@@ -1062,17 +1185,46 @@ async function processFrameSample(
       return;
     }
 
-    console.error(
-      "[SafeView] Frame handling failed — keeping blur (fail closed):",
-      error
-    );
+    console.error("[SafeView] Frame handling failed:", error);
 
     if (generationAtStart !== pipeline.generation) {
       return;
     }
 
-    analysisDecision = "HOLD";
-    analysisReason = "backend_error";
+    if (DEMO_CLASSIFIER_SWITCH) {
+      const errorEval = evaluateDemoBlurSwitch({
+        response: {
+          model_loaded: false,
+          action: "ALLOW",
+          detected: false,
+          confidence: 0,
+        },
+        frameSeq: message.frameSeq ?? 0,
+        lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
+        requestId: message.requestId ?? 0,
+        latestRequestId: pipeline.latestRequestId,
+        resultGeneration: generationAtStart,
+        currentGeneration: pipeline.generation,
+        backendTrusted: false,
+        stableState: pipeline.stableBlur,
+        nowMs: Date.now(),
+      });
+      if (errorEval.stableState) {
+        pipeline.stableBlur = errorEval.stableState;
+      }
+      analysisDecision = errorEval.action;
+      analysisReason = errorEval.reason;
+      if (errorEval.action === "BLUR") {
+        await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, {
+          blurMode: "full",
+        });
+      } else if (errorEval.action === "CLEAR") {
+        await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId);
+      }
+    } else {
+      analysisDecision = "HOLD";
+      analysisReason = "backend_error";
+    }
   } finally {
     if (pipeline.abortController === abortController) {
       pipeline.abortController = null;
@@ -1084,7 +1236,9 @@ async function processFrameSample(
     message.videoId,
     requestId,
     analysisDecision,
-    analysisReason
+    analysisReason,
+    message.frameSeq,
+    demoStableMeta(pipeline, decisionScore)
   );
 }
 
@@ -1893,7 +2047,7 @@ function startServiceWorkerKeepalive(): void {
   }
 
   setInterval(() => {
-    void chrome.storage.local.get(null).catch(() => {});
+    void chrome.storage.local.get(null).catch(() => { });
   }, SERVICE_WORKER_KEEPALIVE_MS);
 }
 

@@ -14,6 +14,7 @@ module.exports = {
         "**/businessRules.test.ts",
         "**/serviceWorker.test.ts",
         "**/blurDecision.test.ts",
+        "**/stableBlurDecision.test.ts",
         "**/aiClient.test.ts",
         "**/options.test.ts",
       ],

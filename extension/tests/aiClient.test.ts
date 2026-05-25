@@ -62,13 +62,17 @@ describe("aiClient", () => {
 
     expect(result.fromFallback).toBe(true);
     expect(result.backendOnline).toBe(false);
-    expect(result.response).toEqual({
+    expect(result.response).toMatchObject({
       category: "nudity",
       detected: false,
       confidence: 0,
       action: "ALLOW",
       model_loaded: false,
+      detections: [],
     });
+
+    await analyzeImage(new Blob(["jpeg"], { type: "image/jpeg" }), 0.75, "nudity");
+    await analyzeImage(new Blob(["jpeg"], { type: "image/jpeg" }), 0.75, "nudity");
 
     const status = getBackendStatus();
     expect(status.online).toBe(false);

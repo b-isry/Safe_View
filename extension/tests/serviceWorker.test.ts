@@ -125,7 +125,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("sends CLEAR for high score when nudity not detected (no suspicious blur)", async () => {
+  it("sends BLUR on high score even when backend gate says ALLOW (score-primary demo)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -145,7 +145,7 @@ describe("serviceWorker", () => {
       fromFallback: false,
     });
 
-    const { handleFrameSample, MESSAGE_ACTION_CLEAR } = await import(
+    const { handleFrameSample, MESSAGE_ACTION_BLUR } = await import(
       "../src/background/serviceWorker"
     );
 
@@ -154,7 +154,7 @@ describe("serviceWorker", () => {
     expect(tabsSendMessage).toHaveBeenCalledWith(
       7,
       expect.objectContaining({
-        action: MESSAGE_ACTION_CLEAR,
+        action: MESSAGE_ACTION_BLUR,
         videoId: 1,
       })
     );
@@ -224,7 +224,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("blurs when nudity detected at or above unsafe threshold (0.72)", async () => {
+  it("blurs when score is at or above demo blur-on threshold (0.70)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -368,7 +368,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("keeps blur when backend is offline (fail closed)", async () => {
+  it("does not immediately clear blur when backend is offline in demo mode", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -376,6 +376,7 @@ describe("serviceWorker", () => {
         confidence: 0,
         action: "ALLOW",
         model_loaded: false,
+        detections: [],
       },
       backendOnline: false,
       fromFallback: true,
@@ -386,13 +387,13 @@ describe("serviceWorker", () => {
     );
     await handleFrameSample({ ...framePayload, videoId: 2 }, 5);
 
-    expect(tabsSendMessage).not.toHaveBeenCalledWith(
-      5,
-      expect.objectContaining({
-        action: MESSAGE_ACTION_CLEAR,
-        videoId: 2,
-      })
+    const clearCalls = tabsSendMessage.mock.calls.filter(
+      (call) =>
+        call[1] &&
+        typeof call[1] === "object" &&
+        (call[1] as { action?: string }).action === MESSAGE_ACTION_CLEAR
     );
+    expect(clearCalls).toHaveLength(0);
   });
 
   it("sends MUTE when analyze-audio reports profanity", async () => {

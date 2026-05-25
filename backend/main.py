@@ -19,15 +19,49 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel, Field
 
+import api_schema
 import audio_processor
 import model_loader
-import romance_loader
+import paths
 import violence_loader
-from models import kissing, lgbtq, nudity, profanity, violence
+from models import nudity, violence
 
 logger = logging.getLogger(__name__)
 
 DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-42ea0a.log"
+
+ALLOWED_CATEGORIES: List[str] = ["nudity", "violence", "all"]
+ALLOWED_AUDIO_LANGUAGES: List[str] = ["en", "am"]
+
+AnalyzeFn = Callable[[Image.Image, float], Dict[str, Any]]
+
+CATEGORY_ANALYZERS: Dict[str, AnalyzeFn] = {
+    nudity.CATEGORY: nudity.analyze,
+    violence.CATEGORY: violence.analyze,
+}
+
+ANALYZE_AUDIO_RESPONSE_KEYS = {
+    "category",
+    "detected",
+    "action",
+    "duration_ms",
+    "whisper_loaded",
+    "confidence",
+}
+
+# CORS: chrome-extension://*, localhost, 127.0.0.1, Android emulator
+CORS_ALLOW_ORIGIN_REGEX = (
+    r"^(chrome-extension://.*|http://localhost:\d+|http://127\.0\.0\.1:\d+|http://10\.0\.2\.2:\d+)$"
+)
+
+
+class AgentLogPayload(BaseModel):
+    """Client-side debug log relay for Android instrumentation."""
+
+    hypothesisId: str
+    location: str
+    message: str
+    data: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _agent_log(
@@ -36,7 +70,6 @@ def _agent_log(
     message: str,
     data: Dict[str, Any] | None = None,
 ) -> None:
-    # #region agent log
     try:
         entry = {
             "sessionId": "42ea0a",
@@ -50,137 +83,80 @@ def _agent_log(
             log_file.write(json.dumps(entry) + "\n")
     except OSError:
         pass
-    # #endregion
 
 
-class AgentLogPayload(BaseModel):
-    """Client-side debug log relay for Android instrumentation."""
-
-    hypothesisId: str
-    location: str
-    message: str
-    data: Dict[str, Any] = Field(default_factory=dict)
-
-
-ACTION_ALLOW = "ALLOW"
-SENSITIVITY_MIN = 0.0
-SENSITIVITY_MAX = 1.0
-
-AnalyzeFn = Callable[[Image.Image, float], Dict[str, Any]]
-
-CATEGORY_ANALYZERS: Dict[str, AnalyzeFn] = {
-    nudity.CATEGORY: nudity.analyze,
-    violence.CATEGORY: violence.analyze,
-    kissing.CATEGORY: kissing.analyze,
-    profanity.CATEGORY: profanity.analyze,
-    lgbtq.CATEGORY: lgbtq.analyze,
-}
-
-ALLOWED_CATEGORIES: List[str] = list(CATEGORY_ANALYZERS.keys())
-ALLOWED_AUDIO_LANGUAGES: List[str] = ["en", "am"]
-
-ANALYZE_AUDIO_RESPONSE_KEYS = {
-    "category",
-    "detected",
-    "action",
-    "duration_ms",
-    "whisper_loaded",
-    "confidence",
-}
-
-# CORS: chrome-extension://*, http://localhost:*, http://10.0.2.2:* — no wildcard *
-CORS_ALLOW_ORIGIN_REGEX = (
-    r"^(chrome-extension://.*|http://localhost:\d+|http://10\.0\.2\.2:\d+)$"
-)
-
-
-def _normalize_response(result: Dict[str, Any], category: str) -> Dict[str, Any]:
-    """
-    Ensure every /analyze-image response matches the API contract.
-
-    Args:
-        result: Raw dict from a category model module.
-        category: Requested category string.
-
-    Returns:
-        dict: category, detected, confidence, action, model_loaded.
-    """
-    raw_label = result.get("label", "SFW")
-    label = raw_label if raw_label in ("NSFW", "SFW") else "SFW"
-
-    normalized: Dict[str, Any] = {
-        "category": result.get("category", category),
-        "detected": bool(result.get("detected", False)),
-        "confidence": float(result.get("confidence", 0.0)),
-        "action": result.get("action", ACTION_ALLOW),
-        "label": label,
-        "model_loaded": bool(
-            result.get(
-                "model_loaded",
-                _category_model_loaded(category),
-            )
-        ),
+def _model_health_entry(
+    *,
+    loaded: bool,
+    path: Path,
+    model_type: str,
+    supports_boxes: bool,
+    error: str | None = None,
+) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "loaded": loaded,
+        "path": str(path),
+        "type": model_type,
+        "supports_boxes": supports_boxes,
     }
-
-    gate_reason = result.get("gate_reason")
-    if isinstance(gate_reason, str):
-        normalized["gate_reason"] = gate_reason
-
-    content_type = result.get("content_type")
-    if isinstance(content_type, dict):
-        normalized["content_type"] = content_type
-
-    return normalized
+    if error:
+        entry["error"] = error
+    return entry
 
 
-def _category_model_loaded(category: str) -> bool:
-    """Return whether weights for the requested category are loaded."""
-    if category == violence.CATEGORY:
-        return violence_loader.MODEL_LOADED
-    if category == kissing.CATEGORY:
-        return romance_loader.MODEL_LOADED
-    if category == nudity.CATEGORY:
-        return model_loader.MODEL_LOADED
-    return False
+def _build_health_models() -> Dict[str, Any]:
+    nudity_path = paths.NUDITY_MODEL_PATH
+    violence_path = violence_loader.get_loaded_path() or paths.VIOLENCE_MODEL_PATH
 
+    nudity_error = None
+    if not model_loader.MODEL_LOADED:
+        if not nudity_path.is_file():
+            nudity_error = f"{nudity_path.name} not found at {nudity_path}"
+        elif model_loader.LAST_LOAD_ERROR:
+            nudity_error = model_loader.LAST_LOAD_ERROR
+        else:
+            nudity_error = f"{nudity_path.name} failed to load — see server logs"
 
-def _fail_open_response(category: str) -> Dict[str, Any]:
-    """
-    Build a fail-open response when frame processing or routing fails.
+    violence_error = None
+    if not violence_loader.MODEL_LOADED:
+        resolved = violence_loader.resolve_weights_path()
+        if resolved is None:
+            violence_error = (
+                f"{paths.VIOLENCE_MODEL_PATH.name} not found "
+                f"(fallback {paths.VIOLENCE_MODEL_FALLBACK_PATH.name} also missing)"
+            )
+        else:
+            violence_error = "violence weights failed to load — see server logs"
 
-    Args:
-        category: Requested detection category.
-
-    Returns:
-        dict: No detection; model_loaded reflects category weights status.
-    """
     return {
-        "category": category,
-        "detected": False,
-        "confidence": 0.0,
-        "action": ACTION_ALLOW,
-        "label": "SFW",
-        "model_loaded": _category_model_loaded(category),
+        "nudity": _model_health_entry(
+            loaded=model_loader.MODEL_LOADED,
+            path=nudity_path,
+            model_type="dino_classifier",
+            supports_boxes=False,
+            error=nudity_error,
+        ),
+        "violence": _model_health_entry(
+            loaded=violence_loader.MODEL_LOADED,
+            path=violence_path,
+            model_type="yolo_detector",
+            supports_boxes=True,
+            error=violence_error,
+        ),
     }
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """
-    Application lifespan: load dino_v3_linear.pth once before serving requests.
-    """
+    """Load nudity and violence models once before serving requests."""
     logging.basicConfig(level=logging.INFO)
-    if not model_loader.MODEL_LOADED:
-        model_loader.load_model()
+    model_loader.load_model()
     if not violence_loader.MODEL_LOADED:
         violence_loader.load_model()
-    if not romance_loader.MODEL_LOADED:
-        romance_loader.load_model()
     logger.info(
-        "[SafeView] Backend ready — nudity_loaded=%s violence_loaded=%s kissing_loaded=%s whisper_loaded=%s",
+        "[SafeView] Backend ready — nudity_loaded=%s violence_loaded=%s whisper_loaded=%s",
         model_loader.MODEL_LOADED,
         violence_loader.MODEL_LOADED,
-        romance_loader.MODEL_LOADED,
         audio_processor.WHISPER_LOADED,
     )
     yield
@@ -196,7 +172,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -211,13 +187,17 @@ async def debug_ingest(payload: AgentLogPayload) -> Dict[str, str]:
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     """
-    Health check — reports server status and whether model weights are loaded.
+    Health check — server status and per-model load state.
 
     Returns:
-        dict: { status, model, model_loaded, whisper_loaded } per API contract.
+        status, backend, models{nudity, violence}, legacy model_loaded for clients.
     """
+    models = _build_health_models()
     return {
         "status": "ok",
+        "backend": "running",
+        "models": models,
+        # Legacy fields for older extension/Android clients
         "model": model_loader.MODEL_NAME,
         "model_loaded": model_loader.MODEL_LOADED,
         "whisper_loaded": audio_processor.WHISPER_LOADED,
@@ -227,46 +207,28 @@ async def health() -> Dict[str, Any]:
 @app.post("/analyze-image")
 async def analyze_image(
     frame: UploadFile = File(...),
-    sensitivity: float = Form(...),
-    category: str = Form(...),
+    sensitivity: float = Form(0.75),
+    category: str = Form("nudity"),
 ) -> Dict[str, Any]:
     """
-    Analyze a single JPEG frame for the requested content category.
+    Analyze a single JPEG frame for nudity and/or violence.
 
-    Request (multipart/form-data):
-        frame: JPEG image bytes
-        sensitivity: float 0.0–1.0
-        category: nudity | violence | kissing | profanity | lgbtq
-
-    Response:
-        category, detected, confidence, action (BLUR | ALLOW), model_loaded
-
-    Args:
-        frame: Uploaded JPEG from extension or Android client.
-        sensitivity: User sensitivity setting (BR-01 applied in inference for nudity).
-        category: Detection category to run.
-
-    Returns:
-        dict: Analysis result per API contract.
+    Categories: nudity | violence | all
     """
-    category_normalized = category.strip().lower()
+    category_normalized = category.strip().lower() or "nudity"
 
-    if category_normalized not in CATEGORY_ANALYZERS:
+    if category_normalized not in ALLOWED_CATEGORIES:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid category '{category}'. Allowed: {', '.join(ALLOWED_CATEGORIES)}",
         )
 
-    if not SENSITIVITY_MIN <= sensitivity <= SENSITIVITY_MAX:
+    if not 0.0 <= sensitivity <= 1.0:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Sensitivity must be between {SENSITIVITY_MIN} and {SENSITIVITY_MAX}, "
-                f"got {sensitivity}."
-            ),
+            detail=f"Sensitivity must be between 0.0 and 1.0, got {sensitivity}.",
         )
 
-    analyze_fn = CATEGORY_ANALYZERS[category_normalized]
     image: Image.Image | None = None
 
     try:
@@ -274,20 +236,19 @@ async def analyze_image(
         if not frame_bytes:
             raise ValueError("Empty frame upload")
 
-        # #region agent log
-        _agent_log(
-            "H1",
-            "main.py:analyze_image:entry",
-            "analyze-image request received",
-            {
-                "category": category_normalized,
-                "sensitivity": sensitivity,
-                "frameBytes": len(frame_bytes),
-            },
-        )
-        # #endregion
-
         image = Image.open(BytesIO(frame_bytes))
+
+        if category_normalized == "all":
+            nudity_result = await asyncio.to_thread(
+                nudity.analyze, image, sensitivity
+            )
+            violence_result = await asyncio.to_thread(
+                violence.analyze, image, sensitivity
+            )
+            merged = api_schema.merge_category_results(nudity_result, violence_result)
+            return merged
+
+        analyze_fn = CATEGORY_ANALYZERS[category_normalized]
         inference_started = time.perf_counter()
         result = await asyncio.to_thread(analyze_fn, image, sensitivity)
         inference_ms = (time.perf_counter() - inference_started) * 1000.0
@@ -296,24 +257,7 @@ async def analyze_image(
             category_normalized,
             inference_ms,
         )
-        normalized = _normalize_response(result, category_normalized)
-        # #region agent log
-        _agent_log(
-            "H2",
-            "main.py:analyze_image:exit",
-            "analyze-image response",
-            {
-                "category": category_normalized,
-                "action": normalized.get("action"),
-                "detected": normalized.get("detected"),
-                "confidence": normalized.get("confidence"),
-                "gate_reason": normalized.get("gate_reason"),
-                "content_type": normalized.get("content_type"),
-                "inferenceMs": round(inference_ms, 1),
-            },
-        )
-        # #endregion
-        return normalized
+        return api_schema.normalize_analyze_response(result, category_normalized)
     except HTTPException:
         raise
     except Exception as exc:
@@ -322,7 +266,7 @@ async def analyze_image(
             category_normalized,
             exc,
         )
-        return _fail_open_response(category_normalized)
+        return api_schema.build_fail_open(category_normalized)
     finally:
         if image is not None:
             image.close()
@@ -335,24 +279,10 @@ async def analyze_audio(
     sensitivity: float = Form(...),
 ) -> Dict[str, Any]:
     """
-    Transcribe a WebM audio chunk and detect profanity (BR-05 mute duration).
-
-    Request (multipart/form-data):
-        audio_chunk: WebM/Opus bytes from MediaRecorder
-        language: en | am
-        sensitivity: float 0.0–1.0 (unused for profanity; kept for API consistency)
-
-    Response:
-        detected, action (MUTE | ALLOW), duration_ms (always 1500), whisper_loaded
-
-    Args:
-        audio_chunk: Uploaded audio from extension or Android client.
-        language: Whisper transcription language code.
-        sensitivity: User sensitivity (accepted but not applied to profanity).
-
-    Returns:
-        dict: Profanity analysis result per API contract.
+    Transcribe a WebM audio chunk and detect profanity (optional; extension may disable).
     """
+    from models import profanity
+
     language_normalized = language.strip().lower()
 
     if language_normalized not in ALLOWED_AUDIO_LANGUAGES:
@@ -364,13 +294,10 @@ async def analyze_audio(
             ),
         )
 
-    if not SENSITIVITY_MIN <= sensitivity <= SENSITIVITY_MAX:
+    if not 0.0 <= sensitivity <= 1.0:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Sensitivity must be between {SENSITIVITY_MIN} and {SENSITIVITY_MAX}, "
-                f"got {sensitivity}."
-            ),
+            detail=f"Sensitivity must be between 0.0 and 1.0, got {sensitivity}.",
         )
 
     try:
@@ -386,7 +313,7 @@ async def analyze_audio(
         logger.error("[SafeView] Failed to process audio chunk: %s", exc)
         return {
             "detected": False,
-            "action": ACTION_ALLOW,
+            "action": "ALLOW",
             "duration_ms": profanity.MUTE_DURATION_MS,
             "whisper_loaded": audio_processor.WHISPER_LOADED,
         }
