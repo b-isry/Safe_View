@@ -30,6 +30,13 @@ export interface AnalyzeAudioResult {
 }
 
 /** JSON body returned by the SafeView backend analyze-image endpoint. */
+export interface ContentTypeInfo {
+  is_animation?: boolean;
+  is_real_human?: boolean;
+  gate_reason?: string | null;
+}
+
+/** JSON body returned by the SafeView backend analyze-image endpoint. */
 export interface AnalyzeImageResponse {
   category: string;
   detected: boolean;
@@ -38,6 +45,8 @@ export interface AnalyzeImageResponse {
   /** Argmax class from the model (independent of user sensitivity threshold). */
   label?: "NSFW" | "SFW";
   model_loaded: boolean;
+  gate_reason?: string;
+  content_type?: ContentTypeInfo;
 }
 
 /**
@@ -174,6 +183,8 @@ export interface ParsedAnalyzeImageBody {
   detected?: boolean;
   action?: string;
   model_loaded?: boolean;
+  gate_reason?: string;
+  content_type?: ContentTypeInfo;
 }
 
 /**
@@ -277,6 +288,12 @@ export function parseAnalyzeImageResponseText(
         action: typeof body.action === "string" ? body.action : undefined,
         model_loaded:
           typeof body.model_loaded === "boolean" ? body.model_loaded : undefined,
+        gate_reason:
+          typeof body.gate_reason === "string" ? body.gate_reason : undefined,
+        content_type:
+          body.content_type && typeof body.content_type === "object"
+            ? (body.content_type as ContentTypeInfo)
+            : undefined,
       };
     } catch {
       // try next candidate
@@ -392,6 +409,8 @@ export async function analyzeImage(
         action: parsed.action === "BLUR" ? "BLUR" : ACTION_ALLOW,
         label,
         model_loaded: Boolean(parsed.model_loaded),
+        gate_reason: parsed.gate_reason,
+        content_type: parsed.content_type,
       },
       backendOnline: true,
       fromFallback: false,

@@ -1,7 +1,7 @@
 # SafeView — models/nudity.py
 # Authors: Blen Bizuayehu, Lidiya Getale, Bisrat Teshome
 # Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
-# Purpose: Real nudity detection using the team-provided dino_v3_linear.pth weights.
+# Purpose: Real nudity detection with animation/human content gate.
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Any, Dict
 
 from PIL import Image
 
+import content_gate
 import inference
 import model_loader
 
@@ -20,25 +21,13 @@ CATEGORY = "nudity"
 
 def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
     """
-    Run nudity inference on a single frame via model_loader + inference pipeline.
+    Run content gate then nudity inference on real-human frames only.
 
-    Interface contract:
-        Input:  PIL Image, sensitivity: float (0.0–1.0)
-        Output: {
-            "category": str,
-            "detected": bool,
-            "confidence": float,
-            "action": "BLUR" | "ALLOW",
-            "model_loaded": bool,
-        }
-
-    Args:
-        image: Decoded JPEG frame from the client.
-        sensitivity: User-configured sensitivity (BR-01 floor applied in inference).
-
-    Returns:
-        dict: Detection result for the nudity category.
+    Animation/cartoon/anime frames return ALLOW immediately (no nudity blur).
+    Person/face/skin alone never triggers blur — only gated nudity >= 0.72.
     """
+    del sensitivity  # Final threshold is UNSAFE_THRESHOLD in content_gate.
+
     if not model_loader.MODEL_LOADED or model_loader.get_model() is None:
         logger.warning(
             "[SafeView] Nudity analyze called but %s is not loaded; failing open.",
@@ -47,15 +36,33 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
         return _fail_open_response()
 
     try:
+        content_type = content_gate.classify_content_type(image)
+
+        if content_type.get("is_animation") or not content_type.get("is_real_human"):
+            return {
+                "category": CATEGORY,
+                **content_gate.build_gated_nudity_response(
+                    content_type,
+                    nudity_confidence=0.0,
+                    nudity_positive=False,
+                    model_loaded=True,
+                ),
+            }
+
         tensor = inference.preprocess(image)
-        result = inference.run_inference(tensor, sensitivity)
+        raw = inference.run_inference_raw(tensor)
+        nudity_positive = raw["label"] == "NSFW"
+
+        gated = content_gate.build_gated_nudity_response(
+            content_type,
+            nudity_confidence=raw["confidence"],
+            nudity_positive=nudity_positive,
+            model_loaded=True,
+        )
+
         return {
             "category": CATEGORY,
-            "detected": result["detected"],
-            "confidence": result["confidence"],
-            "action": result["action"],
-            "label": result.get("label", "SFW"),
-            "model_loaded": True,
+            **gated,
         }
     except Exception as exc:
         logger.error("[SafeView] Nudity detection failed: %s", exc)
@@ -63,12 +70,7 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
 
 
 def _fail_open_response() -> Dict[str, Any]:
-    """
-    Build a fail-open API response when the model is unavailable or inference errors.
-
-    Returns:
-        dict: No detection, zero confidence, ALLOW action, model_loaded=False.
-    """
+    """Fail-open when model unavailable or inference errors."""
     return {
         "category": CATEGORY,
         "detected": False,
@@ -76,4 +78,10 @@ def _fail_open_response() -> Dict[str, Any]:
         "action": inference.ACTION_ALLOW,
         "label": "SFW",
         "model_loaded": model_loader.MODEL_LOADED,
+        "gate_reason": "model_unavailable",
+        "content_type": {
+            "is_animation": False,
+            "is_real_human": False,
+            "gate_reason": "model_unavailable",
+        },
     }

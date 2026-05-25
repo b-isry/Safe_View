@@ -5,7 +5,7 @@
 // CSP-safe: native DOM only — no injected <script> tags or page-context hooks.
 
 import {
-  isNudityProtectionActive,
+  isFrameProtectionActive,
   loadSettings,
   SETTINGS_STORAGE_KEY,
   type SafeViewSettings,
@@ -26,9 +26,22 @@ import {
   onYouTubeWatchIdBoundary,
   seedYouTubeWatchVideoId,
 } from "./pipelineNavigation";
+import {
+  BACKEND_TIMEOUT_MS,
+  ENCODE_ADAPTIVE_THRESHOLD_MS,
+  ENCODE_PAUSE_DURATION_MS,
+  ENCODE_PAUSE_THRESHOLD_MS,
+  MAX_PENDING_ANALYSIS_MS,
+  SAMPLE_INTERVAL_MS,
+  SAMPLE_INTERVAL_THROTTLED_MS,
+} from "../background/latencyPolicy";
 
-/** Active visible tab: ~25 FPS sampling gate. */
-export const SAMPLE_INTERVAL_MS = 40;
+/** Re-export for tests and legacy imports. */
+export {
+  BACKEND_TIMEOUT_MS,
+  MAX_PENDING_ANALYSIS_MS,
+  SAMPLE_INTERVAL_MS,
+} from "../background/latencyPolicy";
 
 /** @deprecated Alias for SAMPLE_INTERVAL_MS — kept for tests/imports. */
 export const SAMPLE_INTERVAL_ACTIVE_MS = SAMPLE_INTERVAL_MS;
@@ -55,13 +68,7 @@ export const CAPTURE_MAX_WIDTH_PX = 224;
 const FIRST_SAMPLE_DELAY_MS = 0;
 
 /** Retry interval when the first sample has no decoded frame yet (ms). */
-const FIRST_SAMPLE_RETRY_MS = 80;
-
-/** Mark in-flight analysis stale after this duration (ms). */
-const MAX_PENDING_ANALYSIS_MS = 1200;
-
-/** Keep blur when backend analysis exceeds this duration (ms). */
-const BACKEND_TIMEOUT_MS = 1000;
+const FIRST_SAMPLE_RETRY_MS = 120;
 
 /** Reject near-black frames (transitions, fades, failed decode). */
 const MIN_FRAME_LUMINANCE = 12;
@@ -93,6 +100,9 @@ const SAFE_VIEW_TRACKED_DATASET = "safeViewTracked";
 
 /** Global bump invalidates all in-flight capture / rVFC chains (YouTube navigation). */
 let globalCaptureGeneration = 0;
+
+/** Reused capture canvas per video (avoids per-frame allocation). */
+const captureCanvasByVideo = new WeakMap<HTMLVideoElement, HTMLCanvasElement>();
 
 /** Number of overlapping canvas encodes (diagnostic; expect 0 or 1). */
 let activeCaptureCount = 0;
@@ -155,6 +165,10 @@ export interface VideoTrackState {
   analysisTimeoutId: ReturnType<typeof setTimeout> | null;
   /** Retry timer when the first sample has no frame data yet. */
   firstSampleRetryId: ReturnType<typeof setTimeout> | null;
+  /** Temporary slower interval after encode stall (ms). */
+  adaptiveIntervalMs: number;
+  /** performance.now() until which capture is paused after severe encode stall. */
+  capturePausedUntil: number;
 }
 
 const trackedVideos = new WeakMap<HTMLVideoElement, VideoTrackState>();
@@ -199,7 +213,10 @@ export function isPrimaryCaptureTarget(video: HTMLVideoElement): boolean {
  * @param video - Target HTMLVideoElement.
  * @returns Milliseconds between frame samples.
  */
-export function getSampleIntervalMs(video: HTMLVideoElement): number {
+export function getSampleIntervalMs(
+  video: HTMLVideoElement,
+  state?: VideoTrackState
+): number {
   if (document.hidden) {
     return SAMPLE_INTERVAL_HIDDEN_MS;
   }
@@ -208,7 +225,9 @@ export function getSampleIntervalMs(video: HTMLVideoElement): number {
     return SAMPLE_INTERVAL_PAUSED_MS;
   }
 
-  return SAMPLE_INTERVAL_ACTIVE_MS;
+  const base = SAMPLE_INTERVAL_ACTIVE_MS;
+  const adaptive = state?.adaptiveIntervalMs ?? 0;
+  return Math.max(base, adaptive);
 }
 
 /**
@@ -481,6 +500,7 @@ function handleFrameAnalysisDone(
     state.analysis.firstDecisionMade = true;
     state.analysis.isClear = true;
     clearImmediateLocalBlur(video);
+    console.log("[SafeView][Blur] clear immediate");
     const snapshot = captureSceneSnapshot(video);
     if (snapshot) {
       state.analysis.lastSceneSnapshot = snapshot;
@@ -489,7 +509,7 @@ function handleFrameAnalysisDone(
     state.analysis.isClear = false;
     state.analysis.safeStreak = 0;
     state.analysis.firstDecisionMade = true;
-    if (reason === "unsafe") {
+    if (reason === "real_human_nudity" || reason === "unsafe") {
       state.analysis.unsafeSeen = true;
     }
     applyImmediateLocalBlur(video);
@@ -501,7 +521,7 @@ function handleFrameAnalysisDone(
     state.analysis.safeStreak += 1;
   }
 
-  if (isNudityProtectionActiveCached() && video === primary) {
+  if (isFrameProtectionActiveCached() && video === primary) {
     void sampleFrame(video, state.captureSession, true);
   }
 }
@@ -600,22 +620,18 @@ function supportsCancelVideoFrameCallback(video: HTMLVideoElement): boolean {
  * @param video - HTMLVideoElement discovered on the page.
  */
 export function initAudioCaptureForElement(video: HTMLVideoElement): void {
-  if (!isNudityProtectionActiveCached()) {
-    return;
-  }
-
   ensureVideoRegistered(video);
 }
 
 /**
- * True when protection and nudity are enabled (uses cached content settings).
+ * True when protection and a frame-based category are enabled (cached settings).
  */
-function isNudityProtectionActiveCached(): boolean {
+function isFrameProtectionActiveCached(): boolean {
   if (!cachedContentSettings) {
-    return true;
+    return false;
   }
 
-  return isNudityProtectionActive(cachedContentSettings);
+  return isFrameProtectionActive(cachedContentSettings);
 }
 
 /**
@@ -682,9 +698,13 @@ function ensureVideoRegistered(video: HTMLVideoElement): void {
     }
 
     resetVideoAnalysisState(state);
-    if (findPrimaryVisibleVideo() === video) {
-      applyImmediateLocalBlur(video);
-      triggerImmediateFirstSample(video);
+    if (isFrameProtectionActiveCached()) {
+      if (findPrimaryVisibleVideo() === video) {
+        applyImmediateLocalBlur(video);
+        triggerImmediateFirstSample(video);
+      } else {
+        clearImmediateLocalBlur(video);
+      }
     } else {
       clearImmediateLocalBlur(video);
     }
@@ -819,6 +839,12 @@ export function resetVideoCaptureForNavigation(reason: string): void {
  * @param reason - Diagnostic label.
  */
 function reconcilePrimaryCaptureLoop(reason: string): void {
+  if (!isFrameProtectionActiveCached()) {
+    stopAllSampling();
+    primaryCaptureVideo = null;
+    return;
+  }
+
   const primary = findPrimaryVisibleVideo();
 
   for (const video of [...videoIdToElement.values()]) {
@@ -905,6 +931,8 @@ function registerVideo(video: HTMLVideoElement): void {
     onFirstSampleReady,
     analysisTimeoutId: null,
     firstSampleRetryId: null,
+    adaptiveIntervalMs: 0,
+    capturePausedUntil: 0,
   };
 
   trackedVideos.set(video, state);
@@ -1113,9 +1141,31 @@ function isFrameLikelyBlank(
 }
 
 /**
+ * Return or create a reused offscreen canvas for frame capture.
+ */
+function getCaptureCanvas(
+  video: HTMLVideoElement,
+  canvasWidth: number,
+  canvasHeight: number
+): HTMLCanvasElement {
+  let canvas = captureCanvasByVideo.get(video);
+  if (!canvas) {
+    canvas = document.createElement("canvas");
+    captureCanvasByVideo.set(video, canvas);
+  }
+
+  if (canvas.width !== canvasWidth || canvas.height !== canvasHeight) {
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
+  }
+
+  return canvas;
+}
+
+/**
  * Draw the current video frame to an offscreen canvas and encode as JPEG.
  *
- * BR-02: canvas dimensions reset to 0 after toBlob — before messaging.
+ * Reuses one hidden canvas per video to reduce allocation and encode stalls.
  */
 async function captureVideoFrameToBlob(
   video: HTMLVideoElement,
@@ -1126,10 +1176,12 @@ async function captureVideoFrameToBlob(
   captureMs: number;
   encodeMs: number;
 } | null> {
+  if (!isFrameProtectionActiveCached()) {
+    return null;
+  }
+
   const captureStarted = performance.now();
-  const canvas = document.createElement("canvas");
-  canvas.width = canvasWidth;
-  canvas.height = canvasHeight;
+  const canvas = getCaptureCanvas(video, canvasWidth, canvasHeight);
 
   activeCaptureCount += 1;
 
@@ -1148,9 +1200,7 @@ async function captureVideoFrameToBlob(
     const captureMs = Math.round(performance.now() - captureStarted);
     const encodeStarted = performance.now();
 
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, JPEG_MIME_TYPE, JPEG_QUALITY);
-    });
+    const blob = await formBlob(canvas);
 
     const encodeMs = Math.round(performance.now() - encodeStarted);
 
@@ -1158,7 +1208,7 @@ async function captureVideoFrameToBlob(
       return null;
     }
 
-    if (encodeMs > ENCODE_STALL_WARN_MS) {
+    if (encodeMs > ENCODE_ADAPTIVE_THRESHOLD_MS) {
       console.warn(
         "[SafeView][Capture] ENCODE STALL encodeMs=%s activeCaptures=%s canvas=%sx%s native=%sx%s",
         encodeMs,
@@ -1178,8 +1228,13 @@ async function captureVideoFrameToBlob(
     return null;
   } finally {
     activeCaptureCount = Math.max(0, activeCaptureCount - 1);
-    purgeCanvas(canvas);
   }
+}
+
+function formBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
+  return new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, JPEG_MIME_TYPE, JPEG_QUALITY);
+  });
 }
 
 /**
@@ -1210,6 +1265,10 @@ async function sampleFrame(
     return;
   }
 
+  if (!isFrameProtectionActiveCached()) {
+    return;
+  }
+
   if (state.isCapturing) {
     console.debug(
       "[SafeView][Capture] SKIP overlap video=%s session=%s",
@@ -1221,15 +1280,13 @@ async function sampleFrame(
 
   const now = performance.now();
 
+  if (state.capturePausedUntil > now) {
+    return;
+  }
+
   if (state.analysis.isAnalyzing) {
     const pendingMs = now - state.analysis.lastAnalysisStartedAt;
-    if (pendingMs < MAX_PENDING_ANALYSIS_MS && !immediate) {
-      console.debug(
-        "[SafeView][Capture] SKIP pending analysis video=%s request=%s pendingMs=%s",
-        state.videoId,
-        state.analysis.requestId,
-        Math.round(pendingMs)
-      );
+    if (pendingMs < MAX_PENDING_ANALYSIS_MS) {
       return;
     }
 
@@ -1251,7 +1308,7 @@ async function sampleFrame(
     }
   }
 
-  const intervalMs = getSampleIntervalMs(video);
+  const intervalMs = getSampleIntervalMs(video, state);
   if (!immediate && now - state.lastSampleAt < intervalMs) {
     return;
   }
@@ -1336,6 +1393,26 @@ async function sampleFrame(
     after.lastSampleAt = now;
     after.lastSampledTime = video.currentTime;
 
+    if (result.encodeMs > ENCODE_PAUSE_THRESHOLD_MS) {
+      after.capturePausedUntil = performance.now() + ENCODE_PAUSE_DURATION_MS;
+      console.warn(
+        "[SafeView][Capture] adaptive pause encodeMs=%s pauseMs=%s video=%s",
+        result.encodeMs,
+        ENCODE_PAUSE_DURATION_MS,
+        after.videoId
+      );
+    } else if (result.encodeMs > ENCODE_ADAPTIVE_THRESHOLD_MS) {
+      after.adaptiveIntervalMs = SAMPLE_INTERVAL_THROTTLED_MS;
+      console.info(
+        "[SafeView][Capture] adaptive throttle encodeMs=%s intervalMs=%s video=%s",
+        result.encodeMs,
+        SAMPLE_INTERVAL_THROTTLED_MS,
+        after.videoId
+      );
+    } else if (after.adaptiveIntervalMs > 0) {
+      after.adaptiveIntervalMs = 0;
+    }
+
     after.analysis.requestId += 1;
     const requestId = after.analysis.requestId;
     after.analysis.isAnalyzing = true;
@@ -1370,7 +1447,9 @@ async function sampleFrame(
       result.encodeMs,
       captureSession,
       seq,
-      requestId
+      requestId,
+      video.currentSrc || video.src,
+      video.currentTime
     );
   } catch (error) {
     console.error("[SafeView] Frame sampling failed:", error);
@@ -1426,7 +1505,9 @@ async function sendFrameToServiceWorker(
   encodeMs: number,
   captureSession: number,
   captureSeq: number,
-  requestId: number
+  requestId: number,
+  videoSrc: string,
+  videoTime: number
 ): Promise<void> {
   try {
     const transferStarted = performance.now();
@@ -1460,6 +1541,9 @@ async function sendFrameToServiceWorker(
         sentAt,
         frameSeq,
         requestId,
+        sessionId: captureSession,
+        videoSrc,
+        videoTime,
         captureMs,
         encodeMs,
       })
@@ -1536,7 +1620,7 @@ function teardownYouTubeNavigationListener(): void {
 export async function rescanAndApplyCurrentSettings(): Promise<void> {
   cachedContentSettings = await loadSettings();
 
-  if (!isNudityProtectionActive(cachedContentSettings)) {
+  if (!isFrameProtectionActive(cachedContentSettings)) {
     stopAllSampling();
     clearAllFullVideoBlurs();
     resetAllAnalysisStates();
@@ -1572,6 +1656,7 @@ export async function rescanAndApplyCurrentSettings(): Promise<void> {
  */
 export async function handleSettingsUpdated(reason: string): Promise<void> {
   console.info("[SafeView] SETTINGS_UPDATED in content script (%s)", reason);
+  cachedContentSettings = await loadSettings();
   await rescanAndApplyCurrentSettings();
 }
 

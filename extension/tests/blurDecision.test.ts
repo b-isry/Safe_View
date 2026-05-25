@@ -4,12 +4,28 @@ import {
   applyBlurStateUpdates,
   evaluateBlurState,
   normalizeBlurLabel,
+  type ContentTypeGate,
 } from "../src/background/blurDecision";
 import { UNSAFE_LOCK_MS } from "../src/background/latencyPolicy";
+
+const realHuman: ContentTypeGate = {
+  is_animation: false,
+  is_real_human: true,
+  gate_reason: null,
+};
+
+const animationGate: ContentTypeGate = {
+  is_animation: true,
+  is_real_human: false,
+  gate_reason: "animation_skip",
+};
 
 const baseState = {
   score: 0,
   nudityDetected: false,
+  backendAction: null as "BLUR" | "ALLOW" | null,
+  contentType: null as ContentTypeGate | null,
+  gateReason: null as string | null,
   frameSeq: 10,
   lastProcessedFrameSeq: 9,
   resultGeneration: 3,
@@ -26,56 +42,101 @@ const baseState = {
 };
 
 describe("blurDecision", () => {
-  it("BLUR when nudity detected and score meets unsafe threshold (0.72)", () => {
+  it("BLUR when violence meets unsafe threshold (0.72)", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        score: 0,
+        violenceScore: 0.88,
+        nudityDetected: false,
+        violenceDetected: true,
+        backendAction: "ALLOW",
+        violenceAction: "BLUR",
+      })
+    ).toEqual({ action: "BLUR", reason: "violence" });
+  });
+
+  it("BLUR when real human nudity meets unsafe threshold (0.72)", () => {
     expect(
       evaluateBlurState({
         ...baseState,
         score: 0.82,
         nudityDetected: true,
+        backendAction: "BLUR",
+        contentType: { ...realHuman, gate_reason: "real_human_nudity" },
+        gateReason: "real_human_nudity",
       })
-    ).toEqual({ action: "BLUR", reason: "unsafe" });
+    ).toEqual({ action: "BLUR", reason: "real_human_nudity" });
   });
 
-  it("BLUR unsafe even after video was previously marked safe", () => {
+  it("BLUR real human nudity even after video was previously marked safe", () => {
     expect(
       evaluateBlurState({
         ...baseState,
         score: 0.8,
         nudityDetected: true,
+        backendAction: "BLUR",
+        contentType: { ...realHuman, gate_reason: "real_human_nudity" },
+        gateReason: "real_human_nudity",
         firstDecisionMade: true,
         unsafeSeen: false,
       })
-    ).toEqual({ action: "BLUR", reason: "unsafe" });
+    ).toEqual({ action: "BLUR", reason: "real_human_nudity" });
   });
 
-  it("BLUR suspicious score before unsafe confirmation", () => {
+  it("CLEAR animation_skip immediately", () => {
     expect(
       evaluateBlurState({
         ...baseState,
-        score: 0.65,
+        score: 0.95,
         nudityDetected: false,
+        backendAction: "ALLOW",
+        contentType: animationGate,
+        gateReason: "animation_skip",
       })
-    ).toEqual({ action: "BLUR", reason: "suspicious" });
+    ).toEqual({ action: "CLEAR", reason: "animation_skip" });
   });
 
-  it("BLUR suspicious when detected but below unsafe threshold", () => {
+  it("CLEAR no_real_human gate", () => {
     expect(
       evaluateBlurState({
         ...baseState,
         score: 0.7,
         nudityDetected: true,
+        backendAction: "ALLOW",
+        contentType: {
+          is_animation: false,
+          is_real_human: false,
+          gate_reason: "no_real_human",
+        },
+        gateReason: "no_real_human",
       })
-    ).toEqual({ action: "BLUR", reason: "suspicious" });
+    ).toEqual({ action: "CLEAR", reason: "no_real_human" });
   });
 
-  it("HOLD uncertain band when score is below suspicious threshold", () => {
+  it("does not BLUR high score when nudity not detected (no suspicious blur)", () => {
     expect(
       evaluateBlurState({
         ...baseState,
-        score: 0.55,
-        nudityDetected: true,
+        score: 0.95,
+        nudityDetected: false,
+        backendAction: "ALLOW",
       })
-    ).toEqual({ action: "HOLD", reason: "uncertain_precheck" });
+    ).toEqual({ action: "CLEAR", reason: "first_safe" });
+  });
+
+  it("CLEAR when nudity flagged but backend ALLOW (below blur threshold)", () => {
+    expect(
+      evaluateBlurState({
+        ...baseState,
+        score: 0.65,
+        nudityDetected: true,
+        backendAction: "ALLOW",
+        contentType: realHuman,
+        gateReason: "real_human_safe",
+        firstDecisionMade: true,
+      })
+    ).toEqual({ action: "CLEAR", reason: "real_human_safe" });
   });
 
   it("CLEAR on first clearly safe frame", () => {
@@ -84,18 +145,11 @@ describe("blurDecision", () => {
         ...baseState,
         score: 0.4,
         nudityDetected: false,
+        backendAction: "ALLOW",
+        contentType: realHuman,
+        gateReason: "real_human_safe",
       })
-    ).toEqual({ action: "CLEAR", reason: "first_safe" });
-  });
-
-  it("HOLD high score when nudity not detected (not below safe threshold)", () => {
-    expect(
-      evaluateBlurState({
-        ...baseState,
-        score: 0.95,
-        nudityDetected: false,
-      })
-    ).toEqual({ action: "BLUR", reason: "suspicious" });
+    ).toEqual({ action: "CLEAR", reason: "real_human_safe" });
   });
 
   it("HOLD during unsafe lock after prior unsafe", () => {
@@ -104,6 +158,7 @@ describe("blurDecision", () => {
         ...baseState,
         score: 0.2,
         nudityDetected: false,
+        backendAction: "ALLOW",
         unsafeSeen: true,
         firstDecisionMade: true,
         unsafeLockUntil: baseState.nowMs + 5000,
@@ -117,6 +172,7 @@ describe("blurDecision", () => {
         ...baseState,
         score: 0.2,
         nudityDetected: false,
+        backendAction: "ALLOW",
         unsafeSeen: true,
         firstDecisionMade: true,
         safeStreak: 0,
@@ -131,9 +187,10 @@ describe("blurDecision", () => {
         ...baseState,
         score: 0.2,
         nudityDetected: false,
+        backendAction: "ALLOW",
         unsafeSeen: true,
         firstDecisionMade: true,
-        safeStreak: 14,
+        safeStreak: 9,
         unsafeLockUntil: 0,
       })
     ).toEqual({ action: "CLEAR", reason: "safe_after_unsafe" });
@@ -177,13 +234,15 @@ describe("blurDecision", () => {
         ...baseState,
         score: 0.9,
         nudityDetected: true,
+        backendAction: "BLUR",
+        contentType: realHuman,
         requestId: 3,
         latestRequestId: 5,
       })
     ).toEqual({ action: "DROP", reason: "stale_request" });
   });
 
-  it("applyBlurStateUpdates sets unsafe lock only on confirmed unsafe", () => {
+  it("applyBlurStateUpdates sets unsafe lock on real human nudity blur", () => {
     const nowMs = 1_000_000;
     const updates = applyBlurStateUpdates(
       {
@@ -193,28 +252,11 @@ describe("blurDecision", () => {
         unsafeLockUntil: 0,
         nowMs,
       },
-      { action: "BLUR", reason: "unsafe" }
+      { action: "BLUR", reason: "real_human_nudity" }
     );
 
     expect(updates.unsafeSeen).toBe(true);
     expect(updates.unsafeLockUntil).toBe(nowMs + UNSAFE_LOCK_MS);
-  });
-
-  it("applyBlurStateUpdates does not lock on suspicious blur", () => {
-    const updates = applyBlurStateUpdates(
-      {
-        unsafeSeen: false,
-        firstDecisionMade: true,
-        safeStreak: 3,
-        unsafeLockUntil: 0,
-        nowMs: 1_000_000,
-      },
-      { action: "BLUR", reason: "suspicious" }
-    );
-
-    expect(updates.unsafeSeen).toBe(false);
-    expect(updates.unsafeLockUntil).toBe(0);
-    expect(updates.safeStreak).toBe(0);
   });
 
   it("normalizes label from backend string", () => {

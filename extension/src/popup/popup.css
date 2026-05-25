@@ -38,7 +38,7 @@
 
 body {
   margin: 0;
-  min-width: 300px;
+  min-width: 320px;
   font-family: var(--font-family);
   font-size: 0.875rem;
   background: var(--color-bg);
@@ -98,6 +98,35 @@ body {
 .popup__row--toggle {
   padding-bottom: 8px;
   border-bottom: 1px solid var(--color-border);
+}
+
+.popup__filters {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.popup__filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+  font-size: 0.8125rem;
+}
+
+.popup__filter-row:last-child {
+  border-bottom: none;
+}
+
+.popup__filter-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--color-active);
+  cursor: pointer;
+  flex-shrink: 0;
 }
 
 .popup__label {

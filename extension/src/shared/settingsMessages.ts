@@ -18,6 +18,27 @@ export function isNudityProtectionActive(settings: SafeViewSettings): boolean {
 }
 
 /**
+ * True when full-video violence protection should be active on the current page.
+ */
+export function isViolenceProtectionActive(settings: SafeViewSettings): boolean {
+  return settings.protectionEnabled && settings.categories.violence;
+}
+
+/**
+ * True when any frame-based vision category (nudity or violence) is enabled.
+ */
+export function isFrameProtectionActive(settings: SafeViewSettings): boolean {
+  return isNudityProtectionActive(settings) || isViolenceProtectionActive(settings);
+}
+
+/**
+ * True when profanity audio pipeline should run on the active page.
+ */
+export function isProfanityProtectionActive(settings: SafeViewSettings): boolean {
+  return settings.protectionEnabled && settings.categories.profanity;
+}
+
+/**
  * Notify the service worker and active tab that settings changed (no page refresh).
  *
  * @param reason - Diagnostic label (category_toggle, protection_on, etc.).

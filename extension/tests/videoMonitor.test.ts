@@ -87,8 +87,8 @@ describe("videoMonitor", () => {
     stopVideoMonitor();
   });
 
-  it("exposes 40 ms active sample interval constant", () => {
-    expect(SAMPLE_INTERVAL_MS).toBe(40);
+  it("exposes 250 ms active sample interval constant", () => {
+    expect(SAMPLE_INTERVAL_MS).toBe(250);
   });
 
   it("finds a <video> element after DOM insertion", async () => {
@@ -300,8 +300,8 @@ describe("videoMonitor", () => {
       "image/jpeg",
       0.45
     );
-    expect(createdCanvas?.width).toBe(0);
-    expect(createdCanvas?.height).toBe(0);
+    expect(createdCanvas?.width).toBe(64);
+    expect(createdCanvas?.height).toBe(48);
     expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         action: "FRAME_SAMPLE",

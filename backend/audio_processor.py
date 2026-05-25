@@ -149,8 +149,8 @@ def transcribe_audio(audio_bytes: bytes, language: str) -> str:
         text = result.get("text", "").strip().lower()
         elapsed_ms = (time.perf_counter() - transcribe_started) * 1000
         logger.info(
-            "[SafeView][Audio-B3] Transcription: '%s' (processed in %.0fms)",
-            text[:100],
+            "[SafeView][Audio-B3] Transcription complete — length=%s (processed in %.0fms)",
+            len(text),
             elapsed_ms,
         )
         return text

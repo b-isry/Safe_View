@@ -9,29 +9,38 @@ export const SAFE_THRESHOLD = 0.5;
 /** At or above this with detected === true: treat as unsafe and keep blur locked. */
 export const UNSAFE_THRESHOLD = 0.72;
 
-/** At or above this: preemptively blur while awaiting confirmation. */
-export const SUSPICIOUS_THRESHOLD = 0.62;
-
 /** Safe frames to clear preemptive blur on first trusted result. */
 export const FIRST_SAFE_CLEAR_STREAK = 1;
 
 /** Safe frames required to clear after a confirmed unsafe scene (post lock). */
-export const AFTER_UNSAFE_SAFE_CLEAR_STREAK = 15;
+export const AFTER_UNSAFE_SAFE_CLEAR_STREAK = 10;
 
 /** After real nudity, do not clear blur until this lock expires (ms). */
 export const UNSAFE_LOCK_MS = 12_000;
 
-/** Max duration for scene-change preemptive blur before safe clear (ms). */
-export const SCENE_CHANGE_TEMP_BLUR_MS = 500;
-
 /** Keep blur when backend analysis exceeds this duration (ms). */
-export const BACKEND_TIMEOUT_MS = 1000;
+export const BACKEND_TIMEOUT_MS = 1500;
 
 /** Mark in-flight analysis stale after this duration (ms). */
-export const MAX_PENDING_ANALYSIS_MS = 1200;
+export const MAX_PENDING_ANALYSIS_MS = 1800;
 
-/** Active tab frame sampling interval (ms). */
-export const SAMPLE_INTERVAL_MS = 40;
+/** Active tab frame sampling interval (ms) — avoid CPU encode stalls. */
+export const SAMPLE_INTERVAL_MS = 250;
+
+/** Max concurrent /analyze-image requests per video. */
+export const MAX_IN_FLIGHT_PER_VIDEO = 1;
+
+/** Adaptive throttle when JPEG encode exceeds this (ms). */
+export const ENCODE_ADAPTIVE_THRESHOLD_MS = 500;
+
+/** Pause capture loop when encode exceeds this (ms). */
+export const ENCODE_PAUSE_THRESHOLD_MS = 1500;
+
+/** Capture pause duration after severe encode stall (ms). */
+export const ENCODE_PAUSE_DURATION_MS = 2000;
+
+/** Adaptive sample interval while throttled (ms). */
+export const SAMPLE_INTERVAL_THROTTLED_MS = 500;
 
 /** Ping storage periodically so the MV3 service worker stays warm. */
 export const SERVICE_WORKER_KEEPALIVE_MS = 20_000;

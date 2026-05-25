@@ -4,6 +4,8 @@
 import { getYouTubeWatchVideoId } from "../shared/youtubeUrl";
 import { resetBlurStateForNavigation } from "./blurManager";
 import { clearProcessingMutesOnNavigation } from "./audioMonitor";
+import { loadSettings } from "../background/businessRules";
+import { isProfanityProtectionActive } from "../shared/settingsMessages";
 import * as elementAudioPipeline from "./elementAudioPipeline";
 import { resetVideoCaptureForNavigation } from "./videoMonitor";
 
@@ -51,6 +53,12 @@ export function handlePipelineNavigationBoundary(reason: string): void {
 
   void (async () => {
     elementAudioPipeline.resetElementPipelineGain();
+
+    const settings = await loadSettings();
+    if (!isProfanityProtectionActive(settings)) {
+      elementAudioPipeline.stopElementAudioFallback();
+      return;
+    }
 
     const elementTabId = elementAudioPipeline.getElementPipelineTabId();
     if (elementTabId !== undefined) {

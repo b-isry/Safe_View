@@ -18,6 +18,7 @@ from PIL import Image
 
 import audio_processor
 import model_loader
+import violence_loader
 from models import kissing, lgbtq, nudity, profanity, violence
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ ALLOWED_CATEGORIES: List[str] = list(CATEGORY_ANALYZERS.keys())
 ALLOWED_AUDIO_LANGUAGES: List[str] = ["en", "am"]
 
 ANALYZE_AUDIO_RESPONSE_KEYS = {
+    "category",
     "detected",
     "action",
     "duration_ms",
@@ -67,16 +69,38 @@ def _normalize_response(result: Dict[str, Any], category: str) -> Dict[str, Any]
     raw_label = result.get("label", "SFW")
     label = raw_label if raw_label in ("NSFW", "SFW") else "SFW"
 
-    return {
+    normalized: Dict[str, Any] = {
         "category": result.get("category", category),
         "detected": bool(result.get("detected", False)),
         "confidence": float(result.get("confidence", 0.0)),
         "action": result.get("action", ACTION_ALLOW),
         "label": label,
         "model_loaded": bool(
-            result.get("model_loaded", model_loader.MODEL_LOADED)
+            result.get(
+                "model_loaded",
+                _category_model_loaded(category),
+            )
         ),
     }
+
+    gate_reason = result.get("gate_reason")
+    if isinstance(gate_reason, str):
+        normalized["gate_reason"] = gate_reason
+
+    content_type = result.get("content_type")
+    if isinstance(content_type, dict):
+        normalized["content_type"] = content_type
+
+    return normalized
+
+
+def _category_model_loaded(category: str) -> bool:
+    """Return whether weights for the requested category are loaded."""
+    if category == violence.CATEGORY:
+        return violence_loader.MODEL_LOADED
+    if category == nudity.CATEGORY:
+        return model_loader.MODEL_LOADED
+    return False
 
 
 def _fail_open_response(category: str) -> Dict[str, Any]:
@@ -87,7 +111,7 @@ def _fail_open_response(category: str) -> Dict[str, Any]:
         category: Requested detection category.
 
     Returns:
-        dict: No detection; model_loaded reflects nudity weights status.
+        dict: No detection; model_loaded reflects category weights status.
     """
     return {
         "category": category,
@@ -95,7 +119,7 @@ def _fail_open_response(category: str) -> Dict[str, Any]:
         "confidence": 0.0,
         "action": ACTION_ALLOW,
         "label": "SFW",
-        "model_loaded": model_loader.MODEL_LOADED,
+        "model_loaded": _category_model_loaded(category),
     }
 
 
@@ -107,9 +131,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logging.basicConfig(level=logging.INFO)
     if not model_loader.MODEL_LOADED:
         model_loader.load_model()
+    if not violence_loader.MODEL_LOADED:
+        violence_loader.load_model()
     logger.info(
-        "[SafeView] Backend ready — model_loaded=%s whisper_loaded=%s",
+        "[SafeView] Backend ready — nudity_loaded=%s violence_loaded=%s whisper_loaded=%s",
         model_loader.MODEL_LOADED,
+        violence_loader.MODEL_LOADED,
         audio_processor.WHISPER_LOADED,
     )
     yield
