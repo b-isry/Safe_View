@@ -18,8 +18,8 @@ export const BLUR_OVERLAY_CLASS = "safeview-blur-overlay";
 /** Frosted overlay tint when backdrop-filter alone is insufficient (YouTube). */
 export const BLUR_OVERLAY_TINT = "rgba(13, 27, 42, 0.72)";
 
-/** Overlay stacking — above video pixels, below player chrome. */
-export const BLUR_OVERLAY_Z_INDEX = 1;
+/** Overlay stacking — above video pixels, below YouTube controls (~61). */
+export const BLUR_OVERLAY_Z_INDEX = 50;
 
 interface BlurRestoreState {
   originalFilter: string;

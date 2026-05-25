@@ -87,8 +87,13 @@ describe("videoMonitor", () => {
     stopVideoMonitor();
   });
 
-  it("exposes 40 ms active sample interval constant", () => {
-    expect(SAMPLE_INTERVAL_MS).toBe(40);
+  it("exposes 220 ms active sample interval constant", () => {
+    expect(SAMPLE_INTERVAL_MS).toBe(220);
+  });
+
+  it("exposes 200 ms safe monitoring interval", async () => {
+    const { SAFE_MONITORING_INTERVAL_MS } = await import("../src/content/videoMonitor");
+    expect(SAFE_MONITORING_INTERVAL_MS).toBe(200);
   });
 
   it("finds a <video> element after DOM insertion", async () => {
@@ -298,7 +303,7 @@ describe("videoMonitor", () => {
     expect(toBlob).toHaveBeenCalledWith(
       expect.any(Function),
       "image/jpeg",
-      0.45
+      0.38
     );
     expect(createdCanvas?.width).toBe(0);
     expect(createdCanvas?.height).toBe(0);

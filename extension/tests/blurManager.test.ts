@@ -198,7 +198,7 @@ describe("blurManager", () => {
     applyBlur(idB!);
 
     expect(readVideoFilter(videoA)).toBe(BLUR_FILTER);
-    expect(readVideoFilter(videoB)).toBe(BLUR_FILTER);
+    expect(readVideoFilter(videoB)).toBe("");
 
     clearBlur(idB!);
     jest.useRealTimers();
@@ -246,11 +246,12 @@ describe("blurManager", () => {
     stopVideoMonitor();
   });
 
-  it("ignores BLUR for unknown or removed video ids", () => {
+  it("ignores BLUR for unknown or removed video ids", async () => {
     const video = document.createElement("video");
     mockVideoLayout(video, 640, 360);
     document.body.appendChild(video);
     startVideoMonitor();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     applyBlur(999);
     expect(readVideoFilter(video)).toBe(BLUR_FILTER);

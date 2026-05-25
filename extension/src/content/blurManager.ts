@@ -18,6 +18,7 @@ import {
 import {
   findPrimaryVisibleVideo,
   getVideoById,
+  MAX_APPLY_TIME_DRIFT_SEC,
 } from "./videoMonitor";
 
 export { BLUR_FILTER, BLUR_RADIUS_PX, BLUR_BACKDROP, BLUR_OVERLAY_CLASS, BLUR_OVERLAY_TINT };
@@ -63,6 +64,7 @@ export interface BlurCommandMessage {
   backendDoneAt?: number;
   commandSeq?: number;
   preemptive?: boolean;
+  capturedVideoTime?: number;
 }
 
 let removalObserver: MutationObserver | null = null;
@@ -102,7 +104,7 @@ export function clearAllBlurs(): void {
 function resolveBlurTarget(videoId: number): HTMLVideoElement | undefined {
   const byId = getVideoById(videoId);
   if (!byId) {
-    return undefined;
+    return findPrimaryVisibleVideo();
   }
 
   if (!byId.isConnected) {
@@ -146,6 +148,7 @@ export function applyBlur(videoId: number, trace?: Partial<BlurCommandMessage>):
   }
 
   applyImmediateLocalBlur(video);
+  console.info("[SafeView][Blur] apply confirmed unsafe");
 }
 
 /**
@@ -160,6 +163,7 @@ export function clearBlur(videoId: number): void {
   }
 
   clearImmediateLocalBlur(video);
+  console.info("[SafeView][Blur] clear confirmed safe");
 }
 
 /**
@@ -215,6 +219,21 @@ function acceptBlurCommand(videoId: number, commandSeq: number | undefined): boo
   return true;
 }
 
+function isStaleBlurCommand(video: HTMLVideoElement, command: Partial<BlurCommandMessage>): boolean {
+  if (command.capturedVideoTime === undefined) {
+    return false;
+  }
+  const drift = Math.abs(video.currentTime - command.capturedVideoTime);
+  if (drift > MAX_APPLY_TIME_DRIFT_SEC) {
+    console.info(
+      "[SafeView][Timing] ignored delayed result drift=%s",
+      drift.toFixed(3)
+    );
+    return true;
+  }
+  return false;
+}
+
 function handleRuntimeMessage(message: unknown): boolean {
   if (!message || typeof message !== "object") {
     return false;
@@ -228,6 +247,11 @@ function handleRuntimeMessage(message: unknown): boolean {
   }
 
   if (!acceptBlurCommand(videoId, command.commandSeq)) {
+    return true;
+  }
+
+  const video = resolveBlurTarget(videoId);
+  if (video && isStaleBlurCommand(video, command)) {
     return true;
   }
 

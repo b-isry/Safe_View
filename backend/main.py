@@ -17,8 +17,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 import audio_processor
+import detail_log
 import model_loader
+import romance_loader
+import violence_loader
 from models import kissing, lgbtq, nudity, profanity, violence
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 

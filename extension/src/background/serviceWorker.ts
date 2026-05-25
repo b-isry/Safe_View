@@ -9,6 +9,7 @@ import {
   logBlurEvaluation,
   normalizeBlurLabel,
   type BlurLabel,
+  type CategoryBlurResult,
 } from "./blurDecision";
 import {
   CONFIDENCE_FLOOR,
@@ -22,7 +23,15 @@ import {
   loadSettings,
   type SafeViewSettings,
 } from "./businessRules";
-import { SERVICE_WORKER_KEEPALIVE_MS } from "./latencyPolicy";
+import {
+  MAX_APPLY_TIME_DRIFT_SEC,
+  MIN_CONFIRMED_UNSAFE_HOLD_MS,
+  CONTENT_BLUR_THRESHOLD,
+  SERVICE_WORKER_KEEPALIVE_MS,
+  STALE_RESPONSE_MS,
+  ANIMATION_SKIP_THRESHOLD,
+} from "./latencyPolicy";
+import { detailLog } from "../shared/detailLog";
 import { MESSAGE_ACTION_SETTINGS_UPDATED } from "../shared/settingsMessages";
 
 /** Content script → service worker: JPEG frame sample. */
@@ -120,6 +129,10 @@ export interface FrameSampleMessage {
   captureMs?: number;
   /** canvas.toBlob duration (ms). */
   encodeMs?: number;
+  /** Content-script capture session (navigation invalidation). */
+  captureSession?: number;
+  /** video.currentTime when the frame was captured. */
+  capturedVideoTime?: number;
 }
 
 /**
@@ -155,6 +168,8 @@ export interface BlurCommandMessage {
   commandSeq?: number;
   /** True when blur is applied before backend confirms (latency policy). */
   preemptive?: boolean;
+  /** video.currentTime when the analyzed frame was captured. */
+  capturedVideoTime?: number;
 }
 
 /**
@@ -173,8 +188,14 @@ interface FramePipelineState {
   firstDecisionMade: boolean;
   /** Consecutive clearly-safe frames while blurred. */
   safeStreak: number;
-  /** Consecutive uncertain-band frames without high nudity confidence. */
-  uncertainStreak: number;
+  /** True once a trusted unsafe BLUR was applied for this video. */
+  confirmedUnsafe: boolean;
+  /** Earliest time (ms) a CLEAR may follow confirmed unsafe. */
+  unsafeLockUntil: number;
+  /** Count of ignored unsafe results due to time drift (diagnostic). */
+  ignoredUnsafeDriftCount: number;
+  /** Capture session id from content script (stale-response guard). */
+  captureSession: number;
   /** Latest frame while analysis is in flight (coalesced, not aborted). */
   pendingSample: FrameSampleMessage | null;
 }
@@ -359,7 +380,10 @@ function getFramePipelineState(tabId: number, videoId: number): FramePipelineSta
       latestRequestId: 0,
       firstDecisionMade: false,
       safeStreak: 0,
-      uncertainStreak: 0,
+      confirmedUnsafe: false,
+      unsafeLockUntil: 0,
+      ignoredUnsafeDriftCount: 0,
+      captureSession: 0,
       pendingSample: null,
     };
     framePipelineState.set(key, state);
@@ -481,7 +505,12 @@ export async function sendBlurCommand(
   videoId: number,
   trace?: Pick<
     BlurCommandMessage,
-    "capturedAt" | "sentAt" | "swReceivedAt" | "backendDoneAt" | "preemptive"
+    | "capturedAt"
+    | "sentAt"
+    | "swReceivedAt"
+    | "backendDoneAt"
+    | "preemptive"
+    | "capturedVideoTime"
   >
 ): Promise<void> {
   const commandSeq = nextBlurCommandSeq(tabId, videoId);
@@ -507,9 +536,49 @@ export interface FrameAnalysisOutcome {
   label: BlurLabel;
   score: number;
   categories: string[];
-  nudityDetected: boolean | null;
-  nudityAction: string | null;
   backendTrusted: boolean;
+  animationScore: number;
+  nudity: CategoryBlurResult;
+  violence: CategoryBlurResult;
+  kissing: CategoryBlurResult;
+}
+
+function emptyCategoryResult(): CategoryBlurResult {
+  return {
+    analyzed: false,
+    detected: false,
+    action: null,
+    score: 0,
+    label: "SFW",
+  };
+}
+
+function isCategoryOutcomeUnsafe(result: CategoryBlurResult): boolean {
+  return (
+    result.analyzed &&
+    result.detected &&
+    result.action === "BLUR" &&
+    result.score >= CONTENT_BLUR_THRESHOLD
+  );
+}
+
+function isAnyCategoryUnsafe(outcome: FrameAnalysisOutcome): boolean {
+  return (
+    isCategoryOutcomeUnsafe(outcome.nudity) ||
+    isCategoryOutcomeUnsafe(outcome.violence) ||
+    isCategoryOutcomeUnsafe(outcome.kissing)
+  );
+}
+
+function isOutcomeSafe(outcome: FrameAnalysisOutcome): boolean {
+  const results = [outcome.nudity, outcome.violence, outcome.kissing];
+  return results.every(
+    (result) =>
+      !result.analyzed ||
+      !result.detected ||
+      result.action === "ALLOW" ||
+      (result.label === "SFW" && result.score < 0.5)
+  );
 }
 
 /**
@@ -531,33 +600,37 @@ export async function analyzeFrameAgainstEnabledCategories(
       label: "SFW",
       score: 0,
       categories,
-      nudityDetected: null,
-      nudityAction: null,
       backendTrusted: true,
+      animationScore: 0,
+      nudity: emptyCategoryResult(),
+      violence: emptyCategoryResult(),
+      kissing: emptyCategoryResult(),
     };
   }
 
-  let nudityScore = 0;
-  let nudityLabel: BlurLabel = "SFW";
-  let nudityDetected: boolean | null = null;
-  let nudityAction: string | null = null;
+  let nudity = emptyCategoryResult();
+  let violence = emptyCategoryResult();
+  let kissing = emptyCategoryResult();
+  let animationScore = 0;
 
-  for (const category of categories) {
-    const result = await analyzeImage(
-      frame,
-      settings.sensitivity,
+  const results = await Promise.all(
+    categories.map(async (category) => ({
       category,
-      signal
-    );
+      result: await analyzeImage(frame, settings.sensitivity, category, signal),
+    }))
+  );
 
+  for (const { category, result } of results) {
     if (result === null) {
       return {
         label: "SFW",
         score: 0,
         categories,
-        nudityDetected: null,
-        nudityAction: null,
         backendTrusted: false,
+        animationScore: 0,
+        nudity,
+        violence,
+        kissing,
       };
     }
 
@@ -566,27 +639,51 @@ export async function analyzeFrameAgainstEnabledCategories(
         label: "SFW",
         score: 0,
         categories,
-        nudityDetected,
-        nudityAction,
         backendTrusted: false,
+        animationScore: 0,
+        nudity,
+        violence,
+        kissing,
       };
     }
 
+    const confidence = result.response.confidence;
+    const label = normalizeBlurLabel(result.response.label, confidence);
+    const detected = result.response.detected === true;
+    const action = normalizeCategoryAction(result.response.action);
+    const categoryResult: CategoryBlurResult = {
+      analyzed: true,
+      detected,
+      action,
+      score: confidence,
+      label,
+    };
+
     if (category === "nudity") {
-      nudityScore = result.response.confidence;
-      nudityLabel = normalizeBlurLabel(result.response.label, nudityScore);
-      nudityDetected = result.response.detected;
-      nudityAction = result.response.action;
+      nudity = categoryResult;
+      animationScore = result.response.animation_score ?? 0;
+    } else if (category === "violence") {
+      violence = categoryResult;
+    } else if (category === "kissing") {
+      kissing = categoryResult;
     }
   }
 
+  const analyzed = [nudity, violence, kissing].filter((item) => item.analyzed);
+  const maxScore = analyzed.reduce((max, item) => Math.max(max, item.score), 0);
+  const label: BlurLabel = analyzed.some((item) => item.label === "NSFW")
+    ? "NSFW"
+    : "SFW";
+
   return {
-    label: nudityLabel,
-    score: nudityScore,
+    label,
+    score: maxScore,
     categories,
-    nudityDetected,
-    nudityAction,
     backendTrusted: true,
+    animationScore,
+    nudity,
+    violence,
+    kissing,
   };
 }
 
@@ -610,7 +707,10 @@ function resetFramePipelineForVideo(tabId: number, videoId: number): void {
   pipeline.latestRequestId = 0;
   pipeline.firstDecisionMade = false;
   pipeline.safeStreak = 0;
-  pipeline.uncertainStreak = 0;
+  pipeline.confirmedUnsafe = false;
+  pipeline.unsafeLockUntil = 0;
+  pipeline.ignoredUnsafeDriftCount = 0;
+  pipeline.captureSession = 0;
   pipeline.pendingSample = null;
   pipeline.analysisInFlight = false;
   pipeline.abortController = null;
@@ -648,17 +748,83 @@ function resetFramePipelineForTab(tabId: number): number[] {
 async function sendFrameAnalysisDone(
   tabId: number,
   videoId: number,
-  requestId: number | undefined
+  requestId: number | undefined,
+  decision?: string,
+  reason?: string,
+  meta?: {
+    detected?: boolean;
+    confidence?: number;
+    action?: string;
+    capturedVideoTime?: number;
+    responseAgeMs?: number;
+  }
 ): Promise<void> {
   try {
     await chrome.tabs.sendMessage(tabId, {
       action: MESSAGE_ACTION_FRAME_ANALYSIS_DONE,
       videoId,
       requestId,
+      decision,
+      reason,
+      ...meta,
     });
   } catch {
     /* Tab may have navigated away. */
   }
+}
+
+/** Count of ignored unsafe drift results before warning. */
+const IGNORED_UNSAFE_DRIFT_WARN_COUNT = 5;
+
+type TimingRejectReason = "stale" | "time-drift" | "session-mismatch";
+
+/**
+ * Validate whether a backend result is fresh enough to apply.
+ */
+function validateResultTiming(
+  message: FrameSampleMessage,
+  pipeline: FramePipelineState,
+  backendDoneAt: number,
+  isUnsafeResult: boolean,
+  isSafeResult: boolean
+): { accept: boolean; reason?: TimingRejectReason } {
+  const capturedAt = message.capturedAt;
+  if (capturedAt === undefined) {
+    return { accept: true };
+  }
+
+  const responseAgeMs = backendDoneAt - capturedAt;
+  if (responseAgeMs > STALE_RESPONSE_MS) {
+    return { accept: false, reason: "stale" };
+  }
+
+  const wallDriftSec = (Date.now() - capturedAt) / 1000;
+  if ((isUnsafeResult || isSafeResult) && wallDriftSec > MAX_APPLY_TIME_DRIFT_SEC) {
+    return { accept: false, reason: "time-drift" };
+  }
+
+  const messageSession = (message as FrameSampleMessage & { captureSession?: number })
+    .captureSession;
+  if (
+    messageSession !== undefined &&
+    pipeline.captureSession > 0 &&
+    messageSession !== pipeline.captureSession
+  ) {
+    return { accept: false, reason: "session-mismatch" };
+  }
+
+  return { accept: true };
+}
+
+function normalizeCategoryAction(action: string | null | undefined): "BLUR" | "ALLOW" | null {
+  if (!action) {
+    return null;
+  }
+  const upper = action.toUpperCase();
+  if (upper === "BLUR" || upper === "BLOCK" || upper === "UNSAFE" || upper === "BLUR_REGION") {
+    return "BLUR";
+  }
+  return "ALLOW";
 }
 
 /**
@@ -678,6 +844,12 @@ async function processFrameSample(
   pipeline.abortController = abortController;
 
   const requestId = message.requestId ?? 0;
+  let analysisDecision = "HOLD";
+  let analysisReason = "pending";
+  let lastDetected: boolean | undefined;
+  let lastConfidence: number | undefined;
+  let lastNudityAction: string | null | undefined;
+
   if (requestId > 0 && requestId < pipeline.latestRequestId) {
     return;
   }
@@ -688,6 +860,33 @@ async function processFrameSample(
   const swReceivedAt = Date.now();
   const settings = getCachedSettings();
   const frame = frameFromMessage(message);
+  const frameSeq = message.frameSeq ?? 0;
+  const requestLabel = requestId > 0 ? String(requestId) : "?";
+
+  if (message.captureSession !== undefined) {
+    pipeline.captureSession = message.captureSession;
+  }
+
+  console.info(
+    "[SafeView][Pipeline] frame received video=%s session=%s request=%s time=%s",
+    message.videoId,
+    message.captureSession ?? pipeline.captureSession,
+    requestLabel,
+    message.capturedAt ?? swReceivedAt
+  );
+  detailLog(
+    "serviceWorker.ts:processFrameSample:entry",
+    "frame received",
+    {
+      tabId,
+      videoId: message.videoId,
+      requestId,
+      frameSeq,
+      captureSession: message.captureSession ?? pipeline.captureSession,
+      capturedAt: message.capturedAt,
+    },
+    "H3"
+  );
 
   if (!frame) {
     console.warn("[SafeView] FRAME_SAMPLE ignored — invalid frame buffer.");
@@ -696,6 +895,12 @@ async function processFrameSample(
     await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId);
   } else {
     try {
+      console.info(
+        "[SafeView][Pipeline] sending backend categories=%s request=%s",
+        getEnabledCategories(settings).join(",") || "none",
+        requestLabel
+      );
+
       const inferenceStarted = Date.now();
       const outcome = await analyzeFrameAgainstEnabledCategories(
         frame,
@@ -709,25 +914,135 @@ async function processFrameSample(
 
       const backendDoneAt = Date.now();
       const inferenceMs = backendDoneAt - inferenceStarted;
+      const anyDetected =
+        outcome.nudity.detected ||
+        outcome.violence.detected ||
+        outcome.kissing.detected;
+      lastDetected = anyDetected;
+      lastConfidence = outcome.score;
+      lastNudityAction =
+        outcome.nudity.action ??
+        outcome.violence.action ??
+        outcome.kissing.action ??
+        undefined;
 
-      const threshold = effectiveThreshold(settings.sensitivity);
-      const frameSeq = message.frameSeq ?? 0;
+      console.info(
+        "[SafeView][Pipeline] backend response request=%s nudity=%s/%s violence=%s/%s kissing=%s/%s maxScore=%s",
+        requestLabel,
+        outcome.nudity.detected,
+        outcome.nudity.action ?? "?",
+        outcome.violence.detected,
+        outcome.violence.action ?? "?",
+        outcome.kissing.detected,
+        outcome.kissing.action ?? "?",
+        outcome.score.toFixed(3)
+      );
+      detailLog(
+        "serviceWorker.ts:processFrameSample:backend",
+        "backend response",
+        {
+          requestId,
+          confidence: outcome.score,
+          label: outcome.label,
+          animationScore: outcome.animationScore,
+          backendTrusted: outcome.backendTrusted,
+          categories: outcome.categories,
+          nudity: outcome.nudity,
+          violence: outcome.violence,
+          kissing: outcome.kissing,
+          inferenceMs,
+        },
+        "H2"
+      );
+
+      const animationScore = outcome.animationScore ?? 0;
+      if (animationScore >= ANIMATION_SKIP_THRESHOLD) {
+        console.info(
+          "[SafeView][Pipeline] decision=ALLOW reason=animation-skip score=%s",
+          animationScore.toFixed(2)
+        );
+        pipeline.confirmedUnsafe = false;
+        pipeline.lastUnsafe = false;
+        pipeline.safeStreak = 0;
+        pipeline.firstDecisionMade = true;
+        analysisDecision = "CLEAR";
+        analysisReason = "animation-skip";
+        detailLog(
+          "serviceWorker.ts:processFrameSample:decision",
+          "decision=ALLOW reason=animation-skip",
+          { requestId, animationScore },
+          "H4"
+        );
+        await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId, {
+          capturedAt: message.capturedAt,
+          sentAt: message.sentAt,
+          swReceivedAt,
+          backendDoneAt,
+        });
+        return;
+      }
+
+      const wouldBeUnsafe = outcome.backendTrusted && isAnyCategoryUnsafe(outcome);
+
+      const wouldBeSafe = outcome.backendTrusted && isOutcomeSafe(outcome);
+
+      const timing = validateResultTiming(
+        message,
+        pipeline,
+        backendDoneAt,
+        wouldBeUnsafe,
+        wouldBeSafe
+      );
+
+      if (!timing.accept && timing.reason) {
+        console.info(
+          "[SafeView][Pipeline] ignored result reason=%s request=%s",
+          timing.reason,
+          requestLabel
+        );
+
+        if (timing.reason === "time-drift") {
+          const capturedAt = message.capturedAt ?? backendDoneAt;
+          const driftSec = (Date.now() - capturedAt) / 1000;
+          console.info(
+            "[SafeView][Timing] ignored delayed result drift=%s request=%s",
+            driftSec.toFixed(3),
+            requestLabel
+          );
+          pipeline.ignoredUnsafeDriftCount += 1;
+          if (pipeline.ignoredUnsafeDriftCount >= IGNORED_UNSAFE_DRIFT_WARN_COUNT) {
+            console.warn(
+              "[SafeView][Timing] too many unsafe results ignored — drift threshold may be too strict"
+            );
+            pipeline.ignoredUnsafeDriftCount = 0;
+          }
+        }
+
+        analysisDecision = "HOLD";
+        analysisReason = timing.reason;
+        detailLog(
+          "serviceWorker.ts:processFrameSample:timing",
+          "ignored result",
+          { requestId, reason: timing.reason, wouldBeUnsafe },
+          "H5"
+        );
+        return;
+      }
 
       const evaluation = evaluateBlurState({
         label: outcome.label,
         score: outcome.score,
-        threshold,
         frameSeq,
         lastProcessedFrameSeq: pipeline.lastProcessedFrameSeq,
         resultGeneration: generationAtStart,
         currentGeneration: pipeline.generation,
-        analysisInFlight: false,
-        lastUnsafe: pipeline.lastUnsafe,
         backendTrusted: outcome.backendTrusted,
         firstDecisionMade: pipeline.firstDecisionMade,
         safeStreak: pipeline.safeStreak,
-        uncertainStreak: pipeline.uncertainStreak,
-        nudityDetected: outcome.nudityDetected === true,
+        confirmedUnsafe: pipeline.confirmedUnsafe,
+        nudity: outcome.nudity,
+        violence: outcome.violence,
+        kissing: outcome.kissing,
       });
 
       logBlurEvaluation(evaluation, {
@@ -736,7 +1051,20 @@ async function processFrameSample(
         frame: frameSeq,
         gen: generationAtStart,
         currentGen: pipeline.generation,
+        detected: anyDetected,
+        action: lastNudityAction ?? null,
       });
+
+      analysisDecision = evaluation.action;
+      analysisReason = evaluation.reason;
+
+      const trace = {
+        capturedAt: message.capturedAt,
+        sentAt: message.sentAt,
+        swReceivedAt,
+        backendDoneAt,
+        capturedVideoTime: message.capturedVideoTime,
+      };
 
       if (evaluation.action === "DROP") {
         return;
@@ -745,13 +1073,18 @@ async function processFrameSample(
       if (evaluation.action === "HOLD") {
         if (evaluation.reason === "building_safe_streak") {
           pipeline.safeStreak += 1;
-        } else if (evaluation.reason === "uncertain") {
-          pipeline.uncertainStreak += 1;
+        }
+        if (
+          pipeline.confirmedUnsafe &&
+          evaluation.reason === "holding_confirmed_unsafe"
+        ) {
+          await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, trace);
         }
         return;
       }
 
       pipeline.firstDecisionMade = true;
+      pipeline.lastProcessedFrameSeq = frameSeq;
 
       const extensionVersion = chrome.runtime.getManifest().version;
       const contentBuild = message.contentBuild ?? "unknown";
@@ -765,36 +1098,12 @@ async function processFrameSample(
         );
       }
 
-      if (
-        evaluation.action === "CLEAR" &&
-        outcome.label === "NSFW" &&
-        outcome.score >= CONFIDENCE_FLOOR &&
-        outcome.score < threshold
-      ) {
-        const now = Date.now();
-        if (now - lastThresholdHintAt >= THRESHOLD_HINT_INTERVAL_MS) {
-          lastThresholdHintAt = now;
-          console.info(
-            "[SafeView] Nudity score %.2f is below your sensitivity threshold %.2f — set sensitivity to Medium in extension options to blur at ≥75%%.",
-            outcome.score,
-            threshold
-          );
-        }
-      }
-
-      pipeline.lastProcessedFrameSeq = frameSeq;
-
-      const trace = {
-        capturedAt: message.capturedAt,
-        sentAt: message.sentAt,
-        swReceivedAt,
-        backendDoneAt,
-      };
-
       if (evaluation.action === "BLUR") {
         pipeline.lastUnsafe = true;
+        pipeline.confirmedUnsafe = true;
+        pipeline.unsafeLockUntil = Date.now() + MIN_CONFIRMED_UNSAFE_HOLD_MS;
         pipeline.safeStreak = 0;
-        pipeline.uncertainStreak = 0;
+        pipeline.ignoredUnsafeDriftCount = 0;
         logPipelineLatency(
           tabId,
           message.videoId,
@@ -804,11 +1113,25 @@ async function processFrameSample(
           MESSAGE_ACTION_BLUR,
           inferenceMs
         );
+        console.info("[SafeView][Blur] apply confirmed unsafe");
+        detailLog(
+          "serviceWorker.ts:processFrameSample:blur",
+          "BLUR command sent",
+          { tabId, videoId: message.videoId, requestId, inferenceMs },
+          "H4"
+        );
         await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, trace);
-      } else {
+      } else if (evaluation.action === "CLEAR") {
+        if (pipeline.confirmedUnsafe && Date.now() < pipeline.unsafeLockUntil) {
+          analysisDecision = "HOLD";
+          analysisReason = "unsafe_hold";
+          await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, trace);
+          return;
+        }
+
         pipeline.lastUnsafe = false;
+        pipeline.confirmedUnsafe = false;
         pipeline.safeStreak = 0;
-        pipeline.uncertainStreak = 0;
         logPipelineLatency(
           tabId,
           message.videoId,
@@ -818,6 +1141,7 @@ async function processFrameSample(
           MESSAGE_ACTION_CLEAR,
           inferenceMs
         );
+        console.info("[SafeView][Blur] clear confirmed safe");
         await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId, trace);
       }
     } catch (error) {
@@ -825,14 +1149,14 @@ async function processFrameSample(
         return;
       }
 
-      console.error(
-        "[SafeView] Frame handling failed — keeping blur (fail closed):",
-        error
-      );
+      console.error("[SafeView] Frame handling failed — no blur change:", error);
 
       if (generationAtStart !== pipeline.generation) {
         return;
       }
+
+      analysisDecision = "HOLD";
+      analysisReason = "backend_error";
     } finally {
       if (pipeline.abortController === abortController) {
         pipeline.abortController = null;
@@ -840,7 +1164,23 @@ async function processFrameSample(
     }
   }
 
-  await sendFrameAnalysisDone(tabId, message.videoId, requestId);
+  const responseAgeMs =
+    message.capturedAt !== undefined ? Date.now() - message.capturedAt : 0;
+
+  await sendFrameAnalysisDone(
+    tabId,
+    message.videoId,
+    requestId,
+    analysisDecision,
+    analysisReason,
+    {
+      detected: lastDetected,
+      confidence: lastConfidence,
+      action: lastNudityAction ?? undefined,
+      capturedVideoTime: message.capturedVideoTime,
+      responseAgeMs,
+    }
+  );
 }
 
 /**

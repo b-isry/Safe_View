@@ -18,6 +18,10 @@ import {
   SETTINGS_STORAGE_KEY,
   type SafeViewSettings,
 } from "../background/businessRules";
+import {
+  isDetailLogEnabled,
+  setDetailLogEnabled,
+} from "../shared/detailLog";
 import { notifySettingsUpdated } from "../shared/settingsMessages";
 
 /** Visual status for the popup indicator dot. */
@@ -140,6 +144,7 @@ async function refreshPopup(runHealthCheck: boolean): Promise<void> {
     );
 
     protectionToggle.checked = settings.protectionEnabled;
+    detailLogToggle.checked = await isDetailLogEnabled();
     filterCountEl.textContent = String(countActiveFilters(settings));
     renderStatusDot(dotState);
     renderBackendStatusText(backendStatus);
@@ -233,9 +238,17 @@ function handleStorageChanged(
 /**
  * Bootstrap popup listeners and initial render.
  */
+async function handleDetailLogToggle(): Promise<void> {
+  await setDetailLogEnabled(detailLogToggle.checked);
+}
+
 function initPopup(): void {
   protectionToggle.addEventListener("change", () => {
     void handleProtectionToggle();
+  });
+
+  detailLogToggle.addEventListener("change", () => {
+    void handleDetailLogToggle();
   });
 
   openOptionsButton.addEventListener("click", handleOpenOptions);

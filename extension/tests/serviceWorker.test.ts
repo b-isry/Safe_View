@@ -176,7 +176,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("HOLDs uncertain score in the safe/unsafe band (0.50–0.65)", async () => {
+  it("CLEARs when backend returns detected false with ALLOW", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
@@ -202,7 +202,7 @@ describe("serviceWorker", () => {
         videoId: 1,
       })
     );
-    expect(tabsSendMessage).not.toHaveBeenCalledWith(
+    expect(tabsSendMessage).toHaveBeenCalledWith(
       7,
       expect.objectContaining({
         action: MESSAGE_ACTION_CLEAR,
@@ -211,12 +211,12 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("blurs when nudity detected at or above unsafe threshold (0.65)", async () => {
+  it("blurs when nudity detected at or above blur threshold (0.82)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: true,
-        confidence: 0.7,
+        confidence: 0.88,
         action: "BLUR",
         label: "NSFW",
         model_loaded: true,
@@ -267,7 +267,7 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("keeps blur when backend is offline (fail closed)", async () => {
+  it("does not clear blur when backend is offline (HOLD, no CLEAR)", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",

@@ -20,8 +20,12 @@ export const SENSITIVITY_HIGH = 0.9;
 /** Default profanity blacklist (BR-03) — user-editable in options. */
 export const DEFAULT_PROFANITY_WORDS: string[] = [];
 
-/** Categories with real inference models (stubs skipped to avoid 5× /analyze-image per frame). */
-export const ACTIVE_MODEL_CATEGORIES: readonly string[] = ["nudity"];
+/** Categories with real inference models (stubs skipped to avoid extra /analyze-image calls). */
+export const ACTIVE_MODEL_CATEGORIES: readonly string[] = [
+  "nudity",
+  "violence",
+  "kissing",
+];
 
 /** BR-05: audio mute duration in milliseconds. */
 export const MUTE_DURATION_MS = 1500;
@@ -212,16 +216,12 @@ export function getEnabledCategories(settings: SafeViewSettings): string[] {
 }
 
 /**
- * True when nudity full-video protection should run on the active page.
+ * True when full-video protection should run (nudity, violence, and/or kissing enabled).
  *
  * @param settings - Resolved SafeView settings.
  */
 export function isNudityProtectionActive(settings: SafeViewSettings): boolean {
-  return (
-    settings.protectionEnabled &&
-    settings.categories.nudity &&
-    getEnabledCategories(settings).includes("nudity")
-  );
+  return settings.protectionEnabled && getEnabledCategories(settings).length > 0;
 }
 
 /**

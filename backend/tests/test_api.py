@@ -12,9 +12,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import audio_processor
+import detail_log
 import inference
 import main
 import model_loader
+import romance_loader
+import violence_loader
 from models import kissing, lgbtq, profanity, violence
 
 ANALYZE_RESPONSE_KEYS = {
@@ -94,8 +97,6 @@ def test_br01_threshold_floor_low_sensitivity() -> None:
 @pytest.mark.parametrize(
     "module,expected_category",
     [
-        (violence, "violence"),
-        (kissing, "kissing"),
         (profanity, "profanity"),
         (lgbtq, "lgbtq"),
     ],
@@ -123,7 +124,49 @@ def test_stub_modules_return_no_detection(
     assert result["action"] == "ALLOW"
 
 
-@pytest.mark.parametrize("category", ["violence", "kissing", "profanity", "lgbtq"])
+def test_violence_module_returns_shape(blank_jpeg_bytes: bytes) -> None:
+    """Violence module returns API contract (fail-open if YOLO not loaded)."""
+    from PIL import Image
+    import io
+
+    image = Image.open(io.BytesIO(blank_jpeg_bytes))
+    try:
+        result = violence.analyze(image, sensitivity=0.75)
+    finally:
+        image.close()
+
+    assert result["category"] == "violence"
+    assert result["action"] in ("BLUR", "ALLOW")
+    assert isinstance(result["detected"], bool)
+    assert isinstance(result["confidence"], float)
+    if violence_loader.MODEL_LOADED:
+        assert result["model_loaded"] is True
+    else:
+        assert result["detected"] is False
+
+
+def test_kissing_module_returns_shape(blank_jpeg_bytes: bytes) -> None:
+    """Kissing module returns API contract (fail-open if Keras weights missing)."""
+    from PIL import Image
+    import io
+
+    image = Image.open(io.BytesIO(blank_jpeg_bytes))
+    try:
+        result = kissing.analyze(image, sensitivity=0.75)
+    finally:
+        image.close()
+
+    assert result["category"] == "kissing"
+    assert result["action"] in ("BLUR", "ALLOW")
+    assert isinstance(result["detected"], bool)
+    assert isinstance(result["confidence"], float)
+    if romance_loader.MODEL_LOADED:
+        assert result["model_loaded"] is True
+    else:
+        assert result["detected"] is False
+
+
+@pytest.mark.parametrize("category", ["profanity", "lgbtq"])
 def test_analyze_image_stubs_via_api(
     client: TestClient,
     blank_jpeg_bytes: bytes,
@@ -260,3 +303,51 @@ def test_profanity_analyze_audio_module() -> None:
     assert result["action"] == "ALLOW"
     assert result["duration_ms"] == 1500
     assert result["whisper_loaded"] is True
+
+
+def test_detail_log_ingest_disabled(client: TestClient) -> None:
+    """POST /internal/detail-log returns 404 when detail logging is off."""
+    with patch.object(detail_log, "_ENABLED", False):
+        response = client.post(
+            "/internal/detail-log",
+            json={
+                "location": "test",
+                "message": "ping",
+                "data": {"ok": True},
+            },
+        )
+    assert response.status_code == 404
+
+
+def test_detail_log_ingest_enabled(
+    client: TestClient,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /internal/detail-log appends NDJSON when detail logging is on."""
+    log_file = tmp_path / "detail-test.log"
+    monkeypatch.setattr(detail_log, "_ENABLED", True)
+    monkeypatch.setattr(detail_log, "_LOG_PATH", log_file)
+
+    response = client.post(
+        "/internal/detail-log",
+        json={
+            "location": "test_api.py",
+            "message": "ingest ok",
+            "data": {"step": 1},
+            "hypothesisId": "H0",
+            "component": "test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    import json
+
+    record = json.loads(lines[0])
+    assert record["location"] == "test_api.py"
+    assert record["message"] == "ingest ok"
+    assert record["data"]["step"] == 1
+    assert record["hypothesisId"] == "H0"
+    assert record["component"] == "test"
