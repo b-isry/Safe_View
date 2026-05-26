@@ -6,18 +6,20 @@
 package com.safeview.safeview
 
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
-import android.view.View
+import android.view.MotionEvent
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
- * Full-screen protection layer shown when content is detected (BR-07).
+ * Full-screen solid-black protection layer shown when content is detected (BR-07).
  *
- * Touch events pass through to the app below because [OverlayService] sets
- * [android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE] and
+ * Paints an opaque black fill on every frame so underlying app content cannot show
+ * through WindowManager overlays. Touch events pass through because [OverlayService]
+ * sets [android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE] and
  * [android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE] on the window.
  */
 class OverlayView(context: Context) : FrameLayout(context) {
@@ -29,47 +31,61 @@ class OverlayView(context: Context) : FrameLayout(context) {
         )
         isClickable = false
         isFocusable = false
-        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
-        contentDescription = "SafeView content protection overlay"
+        isFocusableInTouchMode = false
+        alpha = 1f
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        contentDescription = "Content hidden by SafeView"
+        setBackgroundColor(SOLID_BLACK)
 
-        val tintLayer = View(context).apply {
+        val indicator = LinearLayout(context).apply {
             layoutParams = LayoutParams(
-                LayoutParams.MATCH_PARENT,
-                LayoutParams.MATCH_PARENT,
+                LayoutParams.WRAP_CONTENT,
+                LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
             )
-            background = GradientDrawable().apply {
-                setColor(OVERLAY_TINT_COLOR)
-            }
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             isClickable = false
             isFocusable = false
-        }
-        addView(tintLayer)
+            setBackgroundColor(Color.TRANSPARENT)
 
-        val badge = TextView(context).apply {
-            layoutParams = LayoutParams(
-                LayoutParams.WRAP_CONTENT,
-                LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL,
-            ).apply {
-                topMargin = BADGE_TOP_MARGIN_PX
+            val icon = TextView(context).apply {
+                text = INDICATOR_ICON
+                textSize = 40f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                isClickable = false
+                isFocusable = false
             }
-            text = BADGE_LABEL
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            setBackgroundColor(Color.argb(160, 0, 180, 216))
-            setPadding(BADGE_PADDING_PX, BADGE_PADDING_PX, BADGE_PADDING_PX, BADGE_PADDING_PX)
-            isClickable = false
-            isFocusable = false
+            addView(icon)
+
+            val message = TextView(context).apply {
+                text = INDICATOR_MESSAGE
+                textSize = 16f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setPadding(INDICATOR_PADDING_PX, INDICATOR_PADDING_PX, INDICATOR_PADDING_PX, 0)
+                isClickable = false
+                isFocusable = false
+            }
+            addView(message)
         }
-        addView(badge)
+        addView(indicator)
     }
 
-    companion object {
-        /** Frosted tint aligned with extension BLUR_OVERLAY_TINT (#0D1B2A @ 72%). */
-        val OVERLAY_TINT_COLOR: Int = Color.argb(184, 13, 27, 42)
+    override fun dispatchDraw(canvas: Canvas) {
+        canvas.drawColor(SOLID_BLACK)
+        super.dispatchDraw(canvas)
+    }
 
-        private const val BADGE_LABEL = "SafeView — Protected"
-        private const val BADGE_TOP_MARGIN_PX = 48
-        private const val BADGE_PADDING_PX = 16
+    override fun onTouchEvent(event: MotionEvent): Boolean = false
+
+    companion object {
+        /** Fully opaque black — alpha channel 0xFF, no transparency. */
+        private val SOLID_BLACK: Int = 0xFF000000.toInt()
+
+        private const val INDICATOR_ICON = "🛡"
+        private const val INDICATOR_MESSAGE = "Content hidden by SafeView"
+        private const val INDICATOR_PADDING_PX = 24
     }
 }

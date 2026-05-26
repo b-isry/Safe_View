@@ -5,6 +5,7 @@
 
 package com.safeview.safeview
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -97,14 +98,23 @@ class OverlayService : Service() {
             ?.ifEmpty { ACTIVE_MODEL_CATEGORIES }
             ?: ACTIVE_MODEL_CATEGORIES
 
-        val resultCode = intent?.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, -1) ?: -1
-        @Suppress("DEPRECATION")
-        val projectionData: Intent? = intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
+        val resultCode = intent?.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
 
-        if (resultCode != -1 && projectionData != null) {
+        val projectionData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
+        }
+
+        if (resultCode == Activity.RESULT_OK && projectionData != null) {
             startCapture(resultCode, projectionData)
         } else {
-            Log.w(TAG, "OverlayService started without MediaProjection consent extras")
+            Log.w(
+                TAG,
+                "OverlayService started without MediaProjection consent extras. ResultCode: $resultCode",
+            )
         }
 
         return START_STICKY
@@ -284,6 +294,7 @@ class OverlayService : Service() {
      * Builds [WindowManager.LayoutParams] for a full-screen system overlay (BR-07).
      *
      * [FLAG_NOT_TOUCHABLE] and [FLAG_NOT_FOCUSABLE] keep the foreground app interactive.
+     * No hardware acceleration; [alpha] and [dimAmount] are forced to 1.0f for opaque compositing.
      */
     private fun createOverlayLayoutParams(): WindowManager.LayoutParams {
         val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -296,17 +307,19 @@ class OverlayService : Service() {
         val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+            WindowManager.LayoutParams.FLAG_DIM_BEHIND
 
         return WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             overlayType,
             flags,
-            PixelFormat.TRANSLUCENT,
+            PixelFormat.OPAQUE,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             title = "SafeViewOverlay"
+            alpha = 1.0f
+            dimAmount = 1.0f
         }
     }
 

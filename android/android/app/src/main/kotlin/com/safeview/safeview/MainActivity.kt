@@ -12,10 +12,13 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
@@ -23,13 +26,19 @@ import io.flutter.plugin.common.MethodChannel
 /**
  * Hosts Flutter UI and bridges [OverlayService] via [METHOD_CHANNEL] / [EVENT_CHANNEL].
  */
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
 
     companion object {
         private const val TAG = "SafeView"
         const val METHOD_CHANNEL = "com.safeview/overlay"
         const val EVENT_CHANNEL = "com.safeview/status"
-        private const val REQUEST_MEDIA_PROJECTION = 9001
+        /** Request code for MediaProjection consent (legacy [onActivityResult] path). */
+        private const val MEDIA_PROJECTION_REQUEST_CODE = 9001
+
+        private const val STATE_CAPTURE_SENSITIVITY = "state_capture_sensitivity"
+        private const val STATE_CAPTURE_CATEGORIES = "state_capture_categories"
+        private const val STATE_CAPTURE_BACKEND_URL = "state_capture_backend_url"
+        private const val STATE_AWAITING_PROJECTION = "state_awaiting_projection"
 
         /** Event sink set when Flutter listens on [EVENT_CHANNEL]. */
         @JvmStatic
@@ -38,18 +47,61 @@ class MainActivity : FlutterActivity() {
 
     private var methodChannel: MethodChannel? = null
     private var pendingStartResult: MethodChannel.Result? = null
-    private var pendingStartArgs: PendingCaptureArgs? = null
 
-    private data class PendingCaptureArgs(
-        val sensitivity: Float,
-        val categories: ArrayList<String>,
-        val backendUrl: String,
-    )
+    /** Stored from [requestMediaProjectionAndStart] until consent returns. */
+    private var captureSensitivity: Float = 0.75f
+    private var captureCategories: ArrayList<String> = arrayListOf("nudity")
+    private var captureBackendUrl: String = "http://10.0.2.2:8000"
+    private var awaitingMediaProjectionConsent: Boolean = false
+
+    private var mediaProjectionLauncher: ActivityResultLauncher<Intent>? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         registerOverlayMethodChannel(flutterEngine)
         registerOverlayEventChannel(flutterEngine)
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (mediaProjectionLauncher == null) {
+            registerMediaProjectionLauncher()
+        }
+        if (savedInstanceState != null) {
+            restoreCaptureState(savedInstanceState)
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_AWAITING_PROJECTION, awaitingMediaProjectionConsent)
+        if (awaitingMediaProjectionConsent) {
+            outState.putFloat(STATE_CAPTURE_SENSITIVITY, captureSensitivity)
+            outState.putStringArrayList(STATE_CAPTURE_CATEGORIES, captureCategories)
+            outState.putString(STATE_CAPTURE_BACKEND_URL, captureBackendUrl)
+        }
+    }
+
+    private fun restoreCaptureState(savedInstanceState: Bundle) {
+        awaitingMediaProjectionConsent =
+            savedInstanceState.getBoolean(STATE_AWAITING_PROJECTION, false)
+        if (!awaitingMediaProjectionConsent) return
+        captureSensitivity = savedInstanceState.getFloat(STATE_CAPTURE_SENSITIVITY, 0.75f)
+        captureCategories = savedInstanceState.getStringArrayList(STATE_CAPTURE_CATEGORIES)
+            ?: arrayListOf("nudity")
+        captureBackendUrl = savedInstanceState.getString(STATE_CAPTURE_BACKEND_URL)
+            ?: "http://10.0.2.2:8000"
+    }
+
+    /**
+     * Modern consent callback — Flutter embedding often does not deliver [onActivityResult].
+     */
+    private fun registerMediaProjectionLauncher() {
+        mediaProjectionLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult(),
+        ) { result ->
+            handleMediaProjectionConsent(result.resultCode, result.data)
+        }
     }
 
     /**
@@ -207,41 +259,59 @@ class MainActivity : FlutterActivity() {
             return
         }
 
-        val sensitivity = (call.argument<Double>("sensitivity") ?: 0.75).toFloat()
+        captureSensitivity = (call.argument<Double>("sensitivity") ?: 0.75).toFloat()
         @Suppress("UNCHECKED_CAST")
         val categories =
             call.argument<List<String>>("categories") ?: listOf("nudity")
-        val backendUrl = call.argument<String>("backendUrl") ?: "http://10.0.2.2:8000"
+        captureCategories = ArrayList(categories)
+        captureBackendUrl = call.argument<String>("backendUrl") ?: "http://10.0.2.2:8000"
 
         pendingStartResult = result
-        pendingStartArgs = PendingCaptureArgs(
-            sensitivity = sensitivity,
-            categories = ArrayList(categories),
-            backendUrl = backendUrl,
-        )
+        awaitingMediaProjectionConsent = true
 
         val projectionManager =
             getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val consentIntent = projectionManager.createScreenCaptureIntent()
+
+        val launcher = mediaProjectionLauncher
+        if (launcher != null) {
+            launcher.launch(consentIntent)
+            return
+        }
+
         @Suppress("DEPRECATION")
-        startActivityForResult(
-            projectionManager.createScreenCaptureIntent(),
-            REQUEST_MEDIA_PROJECTION,
-        )
+        startActivityForResult(consentIntent, MEDIA_PROJECTION_REQUEST_CODE)
     }
 
+    /**
+     * Legacy [onActivityResult] path when [ActivityResultLauncher] is unavailable.
+     * Consent [resultCode] and [data] must be forwarded to [OverlayService] unchanged.
+     */
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == MEDIA_PROJECTION_REQUEST_CODE) {
+            handleMediaProjectionConsent(resultCode, data)
+            return
+        }
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
+    }
 
-        if (requestCode != REQUEST_MEDIA_PROJECTION) return
+    /**
+     * Runs after the user responds to the MediaProjection dialog.
+     * Starts [OverlayService] only here — never from [requestMediaProjectionAndStart].
+     */
+    private fun handleMediaProjectionConsent(resultCode: Int, data: Intent?) {
+        if (!awaitingMediaProjectionConsent) return
 
         val pendingResult = pendingStartResult
-        val args = pendingStartArgs
         pendingStartResult = null
-        pendingStartArgs = null
+        awaitingMediaProjectionConsent = false
 
-        if (pendingResult == null || args == null) return
+        if (pendingResult == null) {
+            Log.w(TAG, "MediaProjection consent received with no pending MethodChannel result")
+            return
+        }
 
         if (resultCode != Activity.RESULT_OK || data == null) {
             OverlayEventBridge.emitServiceStatus(
@@ -253,18 +323,13 @@ class MainActivity : FlutterActivity() {
         }
 
         try {
-            val intent = Intent(this, OverlayService::class.java).apply {
-                putExtra(OverlayService.EXTRA_SENSITIVITY, args.sensitivity)
-                putStringArrayListExtra(OverlayService.EXTRA_CATEGORIES, args.categories)
-                putExtra(OverlayService.EXTRA_BACKEND_URL, args.backendUrl)
-                putExtra(OverlayService.EXTRA_PROJECTION_RESULT_CODE, resultCode)
-                putExtra(OverlayService.EXTRA_PROJECTION_DATA, data)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
+            startOverlayServiceWithProjection(
+                resultCode = resultCode,
+                projectionData = data,
+                sensitivity = captureSensitivity,
+                categories = captureCategories,
+                backendUrl = captureBackendUrl,
+            )
             OverlayEventBridge.emitServiceStatus(OverlayEventBridge.STATUS_CAPTURING)
             pendingResult.success(true)
         } catch (e: Exception) {
@@ -274,6 +339,39 @@ class MainActivity : FlutterActivity() {
                 e.message,
             )
             pendingResult.error("SAFEVIEW_ERROR", e.message, null)
+        }
+    }
+
+    /**
+     * Starts [OverlayService] with capture settings and MediaProjection consent tokens.
+     *
+     * [resultCode] and [projectionData] are the values from the system consent activity;
+     * they map to [OverlayService.EXTRA_PROJECTION_RESULT_CODE] and
+     * [OverlayService.EXTRA_PROJECTION_DATA].
+     */
+    private fun startOverlayServiceWithProjection(
+        resultCode: Int,
+        projectionData: Intent,
+        sensitivity: Float,
+        categories: ArrayList<String>,
+        backendUrl: String,
+    ) {
+        val consentData = Intent(projectionData)
+        val intent = Intent(this, OverlayService::class.java).apply {
+            putExtra(OverlayService.EXTRA_SENSITIVITY, sensitivity)
+            putStringArrayListExtra(OverlayService.EXTRA_CATEGORIES, categories)
+            putExtra(OverlayService.EXTRA_BACKEND_URL, backendUrl)
+            putExtra(OverlayService.EXTRA_PROJECTION_RESULT_CODE, resultCode)
+            putExtra(OverlayService.EXTRA_PROJECTION_DATA, consentData)
+        }
+        Log.i(
+            TAG,
+            "Starting OverlayService resultCode=$resultCode backend=$backendUrl categories=$categories",
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
         }
     }
 }
