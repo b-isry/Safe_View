@@ -194,6 +194,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       sensitivity: settings.sensitivity,
       categories: settings.enabledCategoryNames,
       backendUrl: settings.backendUrl,
+      profanityWords: settings.profanityWords,
     );
     if (!mounted) return;
     setState(() => _overlayCapturing = started);

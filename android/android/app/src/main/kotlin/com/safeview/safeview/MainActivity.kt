@@ -44,6 +44,8 @@ class MainActivity : FlutterActivity() {
         val sensitivity: Float,
         val categories: ArrayList<String>,
         val backendUrl: String,
+        val audioLanguage: String,
+        val profanityWords: ArrayList<String>,
     )
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -212,12 +214,18 @@ class MainActivity : FlutterActivity() {
         val categories =
             call.argument<List<String>>("categories") ?: listOf("nudity")
         val backendUrl = call.argument<String>("backendUrl") ?: "http://10.0.2.2:8000"
+        val audioLanguage = call.argument<String>("audioLanguage") ?: "en"
+        @Suppress("UNCHECKED_CAST")
+        val profanityWords =
+            call.argument<List<String>>("profanityWords") ?: emptyList()
 
         pendingStartResult = result
         pendingStartArgs = PendingCaptureArgs(
             sensitivity = sensitivity,
             categories = ArrayList(categories),
             backendUrl = backendUrl,
+            audioLanguage = audioLanguage,
+            profanityWords = ArrayList(profanityWords),
         )
 
         val projectionManager =
@@ -259,6 +267,11 @@ class MainActivity : FlutterActivity() {
                 putExtra(OverlayService.EXTRA_BACKEND_URL, args.backendUrl)
                 putExtra(OverlayService.EXTRA_PROJECTION_RESULT_CODE, resultCode)
                 putExtra(OverlayService.EXTRA_PROJECTION_DATA, data)
+                putExtra(OverlayService.EXTRA_AUDIO_LANGUAGE, args.audioLanguage)
+                putStringArrayListExtra(
+                    OverlayService.EXTRA_PROFANITY_WORDS,
+                    args.profanityWords,
+                )
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)

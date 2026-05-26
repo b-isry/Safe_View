@@ -26,8 +26,11 @@ export const ACTIVE_MODEL_CATEGORIES: readonly string[] = [
   "violence",
 ];
 
-/** BR-05: audio mute duration in milliseconds. */
+/** BR-05: subtitle / legacy mute duration in milliseconds. */
 export const MUTE_DURATION_MS = 1500;
+
+/** Reactive profanity mute + beep window (ms) — zero vault delay (BR-05 audio). */
+export const PROFANITY_MUTE_DURATION_MS = 1500;
 
 /** Whisper language codes supported for audio profanity detection. */
 export type AudioLanguage = "en" | "am";
@@ -242,10 +245,15 @@ export function isViolenceProtectionActive(settings: SafeViewSettings): boolean 
 
 /**
  * True when any frame-based vision category (nudity or violence) is enabled.
+ * Mutual exclusivity: vision is off while profanity audio is active (CPU guard).
  *
  * @param settings - Resolved SafeView settings.
  */
 export function isFrameProtectionActive(settings: SafeViewSettings): boolean {
+  if (settings.protectionEnabled && settings.categories.profanity) {
+    return false;
+  }
+
   return isNudityProtectionActive(settings) || isViolenceProtectionActive(settings);
 }
 

@@ -135,7 +135,7 @@ Example response:
 }
 ```
 
-`duration_ms` is always `1500` (BR-05). If Whisper failed to load at startup, `whisper_loaded` is `false` and `detected` is `false`.
+`duration_ms` is `1500` on MUTE (reactive, no vault); `0` on ALLOW. Uses whisper-`tiny` for CPU mutual exclusivity with vision. If Whisper failed to load at startup, `whisper_loaded` is `false` and `detected` is `false`.
 
 ## Clients
 

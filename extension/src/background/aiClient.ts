@@ -4,9 +4,10 @@
 import {
   DEFAULT_BACKEND_URL,
   DEFAULT_SENSITIVITY,
-  MUTE_DURATION_MS,
+  PROFANITY_MUTE_DURATION_MS,
   getCachedSettings,
 } from "./businessRules";
+import { isProfanityProtectionActive } from "../shared/settingsMessages";
 import {
   ANALYZE_IMAGE_TIMEOUT_MS,
   BACKEND_OFFLINE_FAILURE_STREAK,
@@ -20,7 +21,8 @@ import {
 /** JSON body returned by the SafeView backend POST /analyze-audio endpoint. */
 export interface AnalyzeAudioResponse {
   detected: boolean;
-  action: "MUTE" | "ALLOW";
+  action: "MUTE" | "ALLOW" | "BEEP";
+  audio_action?: string;
   duration_ms: number;
   whisper_loaded: boolean;
   confidence: number;
@@ -58,7 +60,7 @@ function buildSafeAudioDefaultResponse(): AnalyzeAudioResponse {
   return {
     detected: false,
     action: ACTION_ALLOW,
-    duration_ms: MUTE_DURATION_MS,
+    duration_ms: 0,
     whisper_loaded: false,
     confidence: 0,
   };
@@ -260,10 +262,14 @@ export async function analyzeImage(
     const baseUrl = backendUrl.replace(/\/$/, "");
     const endpoint = `${baseUrl}/analyze-image`;
 
+    const settings = getCachedSettings();
+    const filterProfanity = isProfanityProtectionActive(settings);
+
     const formData = new FormData();
     formData.append("frame", frame, "frame.jpg");
     formData.append("sensitivity", String(sensitivity));
     formData.append("category", category);
+    formData.append("filter_profanity", filterProfanity ? "true" : "false");
 
     let response: Response;
 
@@ -365,7 +371,8 @@ export async function analyzeImage(
 export async function analyzeAudio(
   audio: Blob,
   language: string,
-  sensitivity: number = DEFAULT_SENSITIVITY
+  sensitivity: number = DEFAULT_SENSITIVITY,
+  profanityWords?: string[]
 ): Promise<AnalyzeAudioResult> {
   const safeDefault = buildSafeAudioDefaultResponse();
 
@@ -374,10 +381,14 @@ export async function analyzeAudio(
     const baseUrl = backendUrl.replace(/\/$/, "");
     const endpoint = `${baseUrl}/analyze-audio`;
 
+    const words =
+      profanityWords ?? getCachedSettings().profanityWords ?? [];
+
     const formData = new FormData();
     formData.append("audio_chunk", audio, "chunk.webm");
     formData.append("language", language);
     formData.append("sensitivity", String(sensitivity));
+    formData.append("profanity_words", JSON.stringify(words));
 
     let response: Response;
 
@@ -441,9 +452,21 @@ export async function analyzeAudio(
     await markBackendOnline();
 
     const detected = Boolean(body.detected);
-    const action = body.action === ACTION_MUTE ? ACTION_MUTE : ACTION_ALLOW;
+    const audio_action =
+      typeof body.audio_action === "string" ? body.audio_action : undefined;
+    const actionRaw = typeof body.action === "string" ? body.action : ACTION_ALLOW;
+    const action =
+      actionRaw === "BEEP" || audio_action === "BEEP"
+        ? "BEEP"
+        : actionRaw === ACTION_MUTE
+          ? ACTION_MUTE
+          : ACTION_ALLOW;
     const duration_ms =
-      typeof body.duration_ms === "number" ? body.duration_ms : MUTE_DURATION_MS;
+      typeof body.duration_ms === "number" && body.duration_ms > 0
+        ? body.duration_ms
+        : detected
+          ? PROFANITY_MUTE_DURATION_MS
+          : 0;
     const whisper_loaded = Boolean(body.whisper_loaded);
     const confidence =
       typeof body.confidence === "number" ? body.confidence : 0;
@@ -452,6 +475,7 @@ export async function analyzeAudio(
       response: {
         detected,
         action,
+        audio_action: audio_action ?? action,
         duration_ms,
         whisper_loaded,
         confidence,

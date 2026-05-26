@@ -198,6 +198,8 @@ class OverlayService {
     required double sensitivity,
     required List<String> categories,
     required String backendUrl,
+    String audioLanguage = 'en',
+    List<String> profanityWords = const [],
   }) async {
     try {
       final result = await _methodChannel.invokeMethod<bool>(
@@ -206,6 +208,8 @@ class OverlayService {
           'sensitivity': sensitivity,
           'categories': categories,
           'backendUrl': backendUrl,
+          'audioLanguage': audioLanguage,
+          'profanityWords': profanityWords,
         },
       );
       return result ?? false;

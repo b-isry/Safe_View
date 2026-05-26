@@ -12,8 +12,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.media.AudioManager
 import android.media.Image
 import android.media.ImageReader
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -45,15 +47,21 @@ class OverlayService : Service() {
         const val EXTRA_BACKEND_URL = "backend_url"
         const val EXTRA_PROJECTION_RESULT_CODE = "projection_result_code"
         const val EXTRA_PROJECTION_DATA = "projection_data"
+        const val EXTRA_AUDIO_LANGUAGE = "audio_language"
+        const val EXTRA_PROFANITY_WORDS = "profanity_words"
         const val ACTION_STOP = "com.safeview.safeview.STOP_PROTECTION"
 
-        /** Categories with real models (stubs skipped per frame). */
-        private val ACTIVE_MODEL_CATEGORIES = listOf("nudity")
+        /** Vision categories sent to /analyze-image. */
+        private val VISION_CATEGORIES = listOf("nudity", "violence")
+
+        /** BR-05 profanity mute on Android (no delay vault). */
+        private const val ANDROID_PROFANITY_MUTE_MS = 1500L
     }
 
     private var windowManager: WindowManager? = null
     private var overlayView: OverlayView? = null
     private var captureHelper: ScreenCaptureHelper? = null
+    private var audioCaptureHelper: AudioPlaybackCaptureHelper? = null
 
     private var captureThread: HandlerThread? = null
     private var captureHandler: Handler? = null
@@ -62,9 +70,19 @@ class OverlayService : Service() {
 
     private var sensitivity: Float = 0.75f
     private var backendUrl: String = "http://10.0.2.2:8000"
-    private var categories: List<String> = listOf("nudity")
+    private var visionCategories: List<String> = listOf("nudity")
+    private var profanityEnabled: Boolean = false
+    private var audioLanguage: String = "en"
+    private var profanityWords: List<String> = emptyList()
+
+    private val audioManager: AudioManager by lazy {
+        getSystemService(AUDIO_SERVICE) as AudioManager
+    }
+    private var toneGenerator: ToneGenerator? = null
+    private var profanityMuteRestoreRunnable: Runnable? = null
 
     private var lastSampleElapsedMs: Long = 0L
+    private val isAudioAnalyzing = AtomicBoolean(false)
     private val isAnalyzing = AtomicBoolean(false)
     private val overlayVisible = AtomicBoolean(false)
 
@@ -78,7 +96,11 @@ class OverlayService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification())
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         captureHelper = ScreenCaptureHelper(this)
+        audioCaptureHelper = AudioPlaybackCaptureHelper(this)
         networkExecutor = Executors.newSingleThreadExecutor()
+        if (toneGenerator == null) {
+            toneGenerator = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+        }
         OverlayEventBridge.emitServiceStatus(OverlayEventBridge.STATUS_STARTED)
         Log.i(TAG, "OverlayService created — foreground notification active")
     }
@@ -92,10 +114,14 @@ class OverlayService : Service() {
 
         sensitivity = intent?.getFloatExtra(EXTRA_SENSITIVITY, 0.75f) ?: 0.75f
         backendUrl = intent?.getStringExtra(EXTRA_BACKEND_URL) ?: "http://10.0.2.2:8000"
-        categories = intent?.getStringArrayListExtra(EXTRA_CATEGORIES)
-            ?.filter { ACTIVE_MODEL_CATEGORIES.contains(it) }
-            ?.ifEmpty { ACTIVE_MODEL_CATEGORIES }
-            ?: ACTIVE_MODEL_CATEGORIES
+        val requestedCategories =
+            intent?.getStringArrayListExtra(EXTRA_CATEGORIES) ?: arrayListOf("nudity")
+        profanityEnabled = requestedCategories.contains("profanity")
+        visionCategories = requestedCategories
+            .filter { VISION_CATEGORIES.contains(it) }
+            .ifEmpty { listOf("nudity") }
+        audioLanguage = intent?.getStringExtra(EXTRA_AUDIO_LANGUAGE)?.lowercase() ?: "en"
+        profanityWords = intent?.getStringArrayListExtra(EXTRA_PROFANITY_WORDS) ?: emptyList()
 
         val resultCode = intent?.getIntExtra(EXTRA_PROJECTION_RESULT_CODE, -1) ?: -1
         @Suppress("DEPRECATION")
@@ -127,21 +153,123 @@ class OverlayService : Service() {
         captureThread = HandlerThread("SafeViewCapture").apply { start() }
         captureHandler = Handler(captureThread!!.looper)
 
-        captureHelper?.start(
-            resultCode = resultCode,
-            data = projectionData,
-            handler = captureHandler!!,
-            onImageAvailable = imageAvailableListener,
-        )
+        if (profanityEnabled) {
+            captureHelper?.startProjectionOnly(
+                resultCode = resultCode,
+                data = projectionData,
+                handler = captureHandler!!,
+            )
+            Log.i(TAG, "Audio-priority mode — screen frame capture disabled (CPU guard)")
+        } else {
+            captureHelper?.start(
+                resultCode = resultCode,
+                data = projectionData,
+                handler = captureHandler!!,
+                onImageAvailable = imageAvailableListener,
+            )
+        }
         lastSampleElapsedMs = 0L
         OverlayEventBridge.emitServiceStatus(OverlayEventBridge.STATUS_CAPTURING)
-        Log.i(TAG, "Capture pipeline started url=$backendUrl categories=$categories")
+        startAudioProfanityCaptureIfNeeded()
+        Log.i(
+            TAG,
+            "Capture pipeline started url=$backendUrl vision=$visionCategories profanity=$profanityEnabled",
+        )
+    }
+
+    /**
+     * Start AudioPlaybackCapture when profanity filter is enabled (API 29+).
+     */
+    private fun startAudioProfanityCaptureIfNeeded() {
+        if (!profanityEnabled) {
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Log.w(TAG, "Profanity audio requires API 29+")
+            return
+        }
+
+        val projection = captureHelper?.getMediaProjection()
+        if (projection == null) {
+            Log.w(TAG, "MediaProjection unavailable — profanity audio not started")
+            return
+        }
+
+        audioCaptureHelper?.start(projection) { wavBytes ->
+            if (!isAudioAnalyzing.compareAndSet(false, true)) {
+                return@start
+            }
+            networkExecutor?.execute {
+                try {
+                    analyzeAudioChunk(wavBytes)
+                } finally {
+                    isAudioAnalyzing.set(false)
+                }
+            }
+        }
+    }
+
+    /**
+     * POST a WAV chunk to /analyze-audio; mute playback + beep on MUTE (BR-05).
+     */
+    private fun analyzeAudioChunk(wavBytes: ByteArray) {
+        val response = BackendApiClient.analyzeAudio(
+            baseUrl = backendUrl,
+            audioBytes = wavBytes,
+            language = audioLanguage,
+            sensitivity = sensitivity,
+            profanityWords = profanityWords,
+            audioFormat = "wav",
+        ) ?: return
+
+        if (!response.shouldMute) {
+            return
+        }
+
+        Log.i(TAG, "Profanity detected in playback audio — muting for ${ANDROID_PROFANITY_MUTE_MS}ms")
+        applyProfanityMuteAndBeep()
+        OverlayEventBridge.emitDetection(
+            detected = true,
+            category = "profanity",
+            fromFallback = false,
+        )
+    }
+
+    /**
+     * Mute STREAM_MUSIC and play a short beep (lightweight BR-05, no delay vault).
+     */
+    private fun applyProfanityMuteAndBeep() {
+        mainHandler.post {
+            profanityMuteRestoreRunnable?.let { mainHandler.removeCallbacks(it) }
+
+            audioManager.adjustStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                AudioManager.ADJUST_MUTE,
+                0,
+            )
+            toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, ANDROID_PROFANITY_MUTE_MS.toInt())
+
+            profanityMuteRestoreRunnable = Runnable {
+                audioManager.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_UNMUTE,
+                    0,
+                )
+                profanityMuteRestoreRunnable = null
+            }
+            mainHandler.postDelayed(profanityMuteRestoreRunnable!!, ANDROID_PROFANITY_MUTE_MS)
+        }
     }
 
     /**
      * ImageReader callback — 500 ms gate, JPEG encode, backend POST (BR-02).
      */
     private fun onFrameAvailable(reader: ImageReader) {
+        if (profanityEnabled) {
+            reader.acquireLatestImage()?.close()
+            return
+        }
+
         val now = SystemClock.elapsedRealtime()
         if (now - lastSampleElapsedMs < ScreenCaptureHelper.SAMPLE_INTERVAL_MS) {
             reader.acquireLatestImage()?.close()
@@ -195,15 +323,15 @@ class OverlayService : Service() {
             message = "overlay frame ready for analysis",
             data = mapOf(
                 "jpegBytes" to jpegBytes.size,
-                "categories" to categories,
+                "categories" to visionCategories,
                 "sensitivity" to sensitivity,
             ),
         )
         // #endregion
         var blurRequired = false
-        var statusCategory = categories.firstOrNull() ?: "nudity"
+        var statusCategory = visionCategories.firstOrNull() ?: "nudity"
 
-        for (category in categories) {
+        for (category in visionCategories) {
             val response = BackendApiClient.analyzeImage(
                 baseUrl = backendUrl,
                 jpegBytes = jpegBytes,
@@ -268,15 +396,29 @@ class OverlayService : Service() {
             message = "overlay blur decision",
             data = mapOf(
                 "blurRequired" to blurRequired,
-                "categories" to categories,
+                "categories" to visionCategories,
             ),
         )
         // #endregion
     }
 
+    /**
+     * Show or hide overlay — safe scenes release immediately (0ms, cross-platform parity).
+     */
     private fun postOverlayChange(show: Boolean) {
-        mainHandler.post {
-            if (show) attachOverlayWindow() else detachOverlayWindow()
+        if (!show) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                detachOverlayWindow()
+            } else {
+                mainHandler.post { detachOverlayWindow() }
+            }
+            return
+        }
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            attachOverlayWindow()
+        } else {
+            mainHandler.post { attachOverlayWindow() }
         }
     }
 
@@ -397,15 +539,20 @@ class OverlayService : Service() {
     }
 
     private fun stopCapturePipeline() {
+        audioCaptureHelper?.stop()
         captureHelper?.stop()
         captureThread?.quitSafely()
         captureThread = null
         captureHandler = null
+        profanityMuteRestoreRunnable?.let { mainHandler.removeCallbacks(it) }
+        profanityMuteRestoreRunnable = null
     }
 
     private fun shutdown() {
         detachOverlayWindow()
         stopCapturePipeline()
+        toneGenerator?.release()
+        toneGenerator = null
         networkExecutor?.shutdownNow()
         networkExecutor = null
         OverlayEventBridge.emitServiceStatus(OverlayEventBridge.STATUS_STOPPED)

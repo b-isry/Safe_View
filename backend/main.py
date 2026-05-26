@@ -32,6 +32,35 @@ DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent / "debug-42ea0a.log"
 
 ALLOWED_CATEGORIES: List[str] = ["nudity", "violence", "all"]
 ALLOWED_AUDIO_LANGUAGES: List[str] = ["en", "am"]
+ALLOWED_AUDIO_FORMATS: List[str] = ["webm", "wav"]
+
+
+def _parse_profanity_words(raw: str) -> List[str]:
+    """
+    Parse profanity_words form field (JSON array or comma-separated).
+
+    Args:
+        raw: Form string from extension / Android client.
+
+    Returns:
+        list[str]: Normalized terms; empty when unset.
+    """
+    text = raw.strip()
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [
+                str(entry).strip()
+                for entry in parsed
+                if isinstance(entry, str) and str(entry).strip()
+            ]
+    except json.JSONDecodeError:
+        pass
+
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 AnalyzeFn = Callable[[Image.Image, float], Dict[str, Any]]
 
@@ -209,13 +238,28 @@ async def analyze_image(
     frame: UploadFile = File(...),
     sensitivity: float = Form(0.75),
     category: str = Form("nudity"),
+    filter_profanity: bool = Form(default=False),
 ) -> Dict[str, Any]:
     """
     Analyze a single JPEG frame for nudity and/or violence.
 
     Categories: nudity | violence | all
+
+    When filter_profanity is true, vision inference is skipped (CPU mutual exclusivity).
     """
     category_normalized = category.strip().lower() or "nudity"
+
+    if filter_profanity:
+        logger.info(
+            "[SafeView] analyze-image skipped — profanity audio priority (filter_profanity=true)",
+        )
+        return {
+            "category": category_normalized,
+            "detected": False,
+            "confidence": 0.0,
+            "action": "ALLOW",
+            "model_loaded": model_loader.MODEL_LOADED,
+        }
 
     if category_normalized not in ALLOWED_CATEGORIES:
         raise HTTPException(
@@ -277,13 +321,17 @@ async def analyze_audio(
     audio_chunk: UploadFile = File(...),
     language: str = Form(...),
     sensitivity: float = Form(...),
+    profanity_words: str = Form(default=""),
+    audio_format: str = Form(default="webm"),
 ) -> Dict[str, Any]:
     """
-    Transcribe a WebM audio chunk and detect profanity (optional; extension may disable).
+    Transcribe a WebM/WAV audio chunk and detect profanity (optional; extension may disable).
     """
     from models import profanity
 
     language_normalized = language.strip().lower()
+    format_normalized = audio_format.strip().lower() or "webm"
+    extra_words = _parse_profanity_words(profanity_words)
 
     if language_normalized not in ALLOWED_AUDIO_LANGUAGES:
         raise HTTPException(
@@ -300,13 +348,31 @@ async def analyze_audio(
             detail=f"Sensitivity must be between 0.0 and 1.0, got {sensitivity}.",
         )
 
+    if format_normalized not in ALLOWED_AUDIO_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid audio_format '{audio_format}'. "
+                f"Allowed: {', '.join(ALLOWED_AUDIO_FORMATS)}"
+            ),
+        )
+
     try:
         audio_bytes = await audio_chunk.read()
-        return profanity.analyze_audio(
+        print(">>> PROCESSING AUDIO CHUNK...")
+        print(f"!!! AUDIO RECEIVED: {len(audio_bytes)} !!!")
+        response = profanity.analyze_audio(
             audio_bytes,
             language_normalized,
             sensitivity,
+            extra_words=extra_words,
+            audio_format=format_normalized,
         )
+        transcribed_text = response.get("transcribed_text", "")
+        print(f"!!! WHISPER HEARD: '{transcribed_text}'")
+        if response.get("audio_action") == "BEEP" or response.get("detected"):
+            print("!!! BEEP !!!")
+        return response
     except HTTPException:
         raise
     except Exception as exc:
@@ -314,6 +380,6 @@ async def analyze_audio(
         return {
             "detected": False,
             "action": "ALLOW",
-            "duration_ms": profanity.MUTE_DURATION_MS,
+            "duration_ms": 0,
             "whisper_loaded": audio_processor.WHISPER_LOADED,
         }

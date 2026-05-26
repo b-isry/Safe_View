@@ -10,6 +10,7 @@ import {
   clearRegionBlur,
   BLUR_FILTER,
 } from "./blurOverlay";
+import { applyOrganicMosaic, clearAllMasks, clearMosaicForVideo } from "./organicMosaic";
 import {
   clearAllFullVideoBlurs,
   getBlurredVideoSet,
@@ -106,14 +107,17 @@ export function applyBlur(videoId: number, command: Partial<BlurCommandMessage> 
 
   if (mode === "regions" && detections.length > 0) {
     clearFullVideoBlur(video);
+    clearMosaicForVideo(video);
     regionBlurVideos.add(video);
     applyRegionBlur(video, detections);
+    applyOrganicMosaic(video, detections, false);
     return;
   }
 
   regionBlurVideos.delete(video);
   clearRegionBlur(video);
   applyFullVideoBlur(video);
+  applyOrganicMosaic(video, [], true);
 }
 
 export function clearBlur(videoId: number): void {
@@ -125,6 +129,7 @@ export function clearBlur(videoId: number): void {
   }
 
   regionBlurVideos.delete(video);
+  clearAllMasks();
   clearAllBlur(video);
 }
 
@@ -235,6 +240,7 @@ export function initBlurManager(): void {
 }
 
 export function resetBlurStateForNavigation(_reason: string): void {
+  clearAllMasks();
   for (const video of [...getBlurredVideoSet()]) {
     clearRegionBlur(video);
     clearImmediateLocalBlur(video);
@@ -287,5 +293,6 @@ export function clearImmediateLocalBlur(video: HTMLVideoElement): void {
 }
 
 export function clearAllBlurs(): void {
+  clearAllMasks();
   resetBlurStateForNavigation("clear_all");
 }

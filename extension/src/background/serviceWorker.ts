@@ -22,6 +22,7 @@ import {
 import type { AnalyzeImageResponse } from "../shared/apiTypes";
 import {
   MUTE_DURATION_MS,
+  PROFANITY_MUTE_DURATION_MS,
   SETTINGS_STORAGE_KEY,
   getCachedSettings,
   getEnabledCategories,
@@ -90,6 +91,12 @@ export const MESSAGE_ACTION_TAB_CAPTURE_SILENT_STREAM =
 /** Service worker → content script: native video element audio fallback. */
 export const MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK =
   "START_ELEMENT_AUDIO_FALLBACK";
+
+/** Alias for element audio pipeline start (bridge / docs). */
+export const MESSAGE_ACTION_START_AUDIO_PIPELINE = "START_AUDIO_PIPELINE";
+
+/** Content script → service worker: content script loaded and listening. */
+export const MESSAGE_TYPE_CONTENT_SCRIPT_READY = "CONTENT_SCRIPT_READY";
 
 /** Service worker → content script: stop element audio fallback. */
 export const MESSAGE_ACTION_STOP_ELEMENT_AUDIO_FALLBACK =
@@ -214,9 +221,6 @@ let activeAudioPipelineTabId: number | undefined;
 type AudioPipelineMode = "offscreen" | "element" | null;
 
 let audioPipelineMode: AudioPipelineMode = null;
-
-/** Profanity vault mute window — widened for CPU/timing slack (ms). */
-const PROFANITY_MUTE_DURATION_MS = 3500;
 
 /** Max in-flight /analyze-audio calls per tab (offscreen scout path). */
 const MAX_CONCURRENT_AUDIO = 2;
@@ -1372,6 +1376,11 @@ export async function handlePipelineAudioChunk(
   message: PipelineAudioChunkMessage,
   tabId: number
 ): Promise<void> {
+  const settings = await loadSettings();
+  if (!isProfanityProtectionActive(settings)) {
+    return;
+  }
+
   const current = audioProcessingCount.get(tabId) ?? 0;
   if (current >= MAX_CONCURRENT_AUDIO) {
     return;
@@ -1393,23 +1402,34 @@ export async function handlePipelineAudioChunk(
       return;
     }
 
+    const language = settings.language === "am" ? "am" : "en";
+
     const result = await analyzeAudio(
       audio,
-      "en" // pipeline always english — subtitle path handles language switching
+      language,
+      settings.sensitivity,
+      settings.profanityWords
     );
 
+    const audioAction =
+      result.response.audio_action ?? result.response.action ?? "ALLOW";
+
     console.info(
-      "[SafeView][Audio-5] Backend response: detected=%s, confidence=%s, action=%s, whisper_loaded=%s",
+      "[SafeView][Audio-5] Backend response: detected=%s, confidence=%s, action=%s, audio_action=%s, whisper_loaded=%s",
       result.response.detected,
       result.response.confidence,
       result.response.action,
+      audioAction,
       result.response.whisper_loaded
     );
 
     if (
       result.backendOnline &&
       !result.fromFallback &&
-      (result.response.detected || result.response.action === "MUTE")
+      (result.response.detected ||
+        result.response.action === "MUTE" ||
+        result.response.action === "BEEP" ||
+        audioAction === "BEEP")
     ) {
       const durationMs =
         result.response.duration_ms > 0
@@ -1417,13 +1437,11 @@ export async function handlePipelineAudioChunk(
           : PROFANITY_MUTE_DURATION_MS;
 
       console.info(
-        "[SafeView][Audio-6] Profanity confirmed — sending ELEMENT_MUTE_GAIN (%sms)",
+        "[SafeView][Audio-6] Profanity confirmed — BEEP/MUTE (audio_action=%s, %sms)",
+        audioAction,
         durationMs
       );
-      console.info(
-        "[SafeView] Profanity detected in pipeline — triggering gain mute"
-      );
-      await sendPipelineMuteGain(durationMs);
+      await sendPipelineMuteGain(durationMs, audioAction);
     }
   } catch (error) {
     console.error("[SafeView] Pipeline audio chunk handling failed:", error);
@@ -1459,7 +1477,12 @@ export async function handleAudioChunk(
   const language = message.language === "am" ? "am" : "en";
 
   try {
-    const result = await analyzeAudio(audio, language, settings.sensitivity);
+    const result = await analyzeAudio(
+      audio,
+      language,
+      settings.sensitivity,
+      settings.profanityWords
+    );
 
     if (
       !result.backendOnline ||
@@ -1518,6 +1541,86 @@ async function sendWithRetry(
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
+}
+
+/**
+ * Deliver a tab message with exponential backoff (content script may load late).
+ */
+/** Tabs that announced CONTENT_SCRIPT_READY (receiver is alive). */
+const contentScriptReadyTabIds = new Set<number>();
+
+/** Tab waiting for CONTENT_SCRIPT_READY before pipeline start. */
+let pendingPipelineTabId: number | undefined;
+
+function markContentScriptReady(tabId: number): void {
+  contentScriptReadyTabIds.add(tabId);
+}
+
+function markContentScriptNotReady(tabId: number): void {
+  contentScriptReadyTabIds.delete(tabId);
+}
+
+function isContentScriptReady(tabId: number): boolean {
+  return contentScriptReadyTabIds.has(tabId);
+}
+
+/**
+ * Send START_AUDIO_PIPELINE once — only call when content script is ready.
+ */
+async function sendStartAudioPipelineMessage(tabId: number): Promise<void> {
+  await chrome.tabs.sendMessage(tabId, {
+    action: MESSAGE_ACTION_START_AUDIO_PIPELINE,
+    tabId,
+  });
+}
+
+async function sendTabMessageWithExponentialBackoff(
+  tabId: number,
+  message: object,
+  maxAttempts = 6,
+  initialDelayMs = 300
+): Promise<void> {
+  let delayMs = initialDelayMs;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await chrome.tabs.sendMessage(tabId, message);
+      if (attempt > 1) {
+        const action =
+          typeof message === "object" &&
+          message !== null &&
+          "action" in message
+            ? String((message as { action: unknown }).action)
+            : "unknown";
+        console.info(
+          "[SafeView] Tab message delivered on attempt %s — action=%s",
+          attempt,
+          action
+        );
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts) {
+        break;
+      }
+
+      const detail =
+        error instanceof Error ? error.message : String(error);
+      console.warn(
+        "[SafeView] Tab message attempt %s/%s failed (%s) — retry in %sms",
+        attempt,
+        maxAttempts,
+        detail,
+        delayMs
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, 8000);
+    }
+  }
+
+  throw lastError;
 }
 
 async function triggerElementAudioFallback(
@@ -1587,11 +1690,15 @@ async function resetPipelineGainsForActiveTab(reason: string): Promise<void> {
  *
  * @param durationMs - BR-05 mute duration.
  */
-async function sendPipelineMuteGain(durationMs: number): Promise<void> {
+async function sendPipelineMuteGain(
+  durationMs: number,
+  audioAction = "BEEP"
+): Promise<void> {
   if (activeAudioPipelineTabId !== undefined) {
     try {
       await chrome.tabs.sendMessage(activeAudioPipelineTabId, {
         action: MESSAGE_ACTION_ELEMENT_MUTE_GAIN,
+        audio_action: audioAction,
         duration: durationMs,
         duration_ms: durationMs,
       });
@@ -1622,8 +1729,20 @@ export async function startAudioPipelineWithStream(
  * @param tabId - Chrome tab to route audio from.
  */
 export async function startAudioPipeline(tabId: number): Promise<void> {
+  await startAudioPipelineForReadyTab(tabId, "direct-start");
+}
+
+/**
+ * Start audio pipeline only after CONTENT_SCRIPT_READY (content-script-first handshake).
+ */
+async function startAudioPipelineForReadyTab(
+  tabId: number,
+  reason: string
+): Promise<void> {
+  await loadSettings();
   const settings = getCachedSettings();
-  if (!isProfanityProtectionActive(settings)) {
+
+  if (!settings.protectionEnabled || !settings.categories.profanity) {
     console.info(
       "[SafeView] Profanity off — not starting element audio pipeline."
     );
@@ -1631,15 +1750,102 @@ export async function startAudioPipeline(tabId: number): Promise<void> {
   }
 
   try {
-    await sendWithRetry(tabId, {
-      action: MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK,
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.url?.startsWith("http")) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  if (!isContentScriptReady(tabId)) {
+    pendingPipelineTabId = tabId;
+    console.info(
+      "[SafeView-Handshake] Tab %s not ready yet (%s) — waiting for CONTENT_SCRIPT_READY.",
       tabId,
-    });
+      reason
+    );
+    return;
+  }
+
+  if (activeAudioPipelineTabId !== undefined && activeAudioPipelineTabId !== tabId) {
+    try {
+      await chrome.tabs.sendMessage(activeAudioPipelineTabId, {
+        action: MESSAGE_ACTION_STOP_ELEMENT_AUDIO_FALLBACK,
+      });
+    } catch {
+      /* Previous tab may be closed. */
+    }
+  }
+
+  try {
+    console.info(
+      "[SafeView-Handshake] Starting audio pipeline (tab=%s, reason=%s)",
+      tabId,
+      reason
+    );
+    await sendStartAudioPipelineMessage(tabId);
     audioPipelineMode = "element";
     activeAudioPipelineTabId = tabId;
+    pendingPipelineTabId = undefined;
     console.info("[SafeView] Element audio pipeline started for tab %s.", tabId);
   } catch (error) {
-    console.error("[SafeView] Failed to start audio pipeline:", error);
+    markContentScriptNotReady(tabId);
+    console.warn(
+      "[SafeView] Failed to start audio pipeline (tab=%s) — receiver may have unloaded:",
+      tabId,
+      error
+    );
+  }
+}
+
+/**
+ * Content script announced it is loaded — safe to send tab messages.
+ */
+async function handleContentScriptReady(tabId: number): Promise<void> {
+  markContentScriptReady(tabId);
+
+  await loadSettings();
+  const settings = getCachedSettings();
+
+  if (!settings.protectionEnabled || !settings.categories.profanity) {
+    return;
+  }
+
+  const [activeTab] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true,
+  });
+
+  const isActiveTab = activeTab?.id === tabId;
+  const isPendingTab = pendingPipelineTabId === tabId;
+
+  if (isActiveTab || isPendingTab) {
+    await forwardSettingsUpdatedToTab(tabId, "content-script-ready");
+    await startAudioPipelineForReadyTab(tabId, "content-script-ready");
+  }
+}
+
+/**
+ * When user switches tabs, start pipeline only if that tab's content script is ready.
+ */
+async function handleTabActivated(tabId: number): Promise<void> {
+  await loadSettings();
+  const settings = getCachedSettings();
+
+  if (!settings.protectionEnabled || !settings.categories.profanity) {
+    return;
+  }
+
+  pendingPipelineTabId = tabId;
+
+  if (isContentScriptReady(tabId)) {
+    await startAudioPipelineForReadyTab(tabId, "tab-activated");
+  } else {
+    console.info(
+      "[SafeView-Handshake] Tab %s activated — waiting for CONTENT_SCRIPT_READY.",
+      tabId
+    );
   }
 }
 
@@ -1703,6 +1909,11 @@ function setupPipelineTabNavigationListener(): void {
   }
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === "loading") {
+      markContentScriptNotReady(tabId);
+      return;
+    }
+
     if (tabId !== activeAudioPipelineTabId || !changeInfo.url) {
       return;
     }
@@ -1719,20 +1930,26 @@ function setupTabActivationListener(): void {
   }
 
   chrome.tabs.onActivated.addListener((activeInfo) => {
-    void (async () => {
-      const isProtectionOn = await getProtectionState();
-      if (!isProtectionOn) {
-        return;
-      }
-
-      if (activeInfo.tabId === activeAudioPipelineTabId) {
-        return;
-      }
-
-      console.info('[SafeView] Tab switched — user must re-enable protection from popup for audio pipeline on new tab.');
-    })().catch((error) => {
+    void handleTabActivated(activeInfo.tabId).catch((error) => {
       console.error("[SafeView] Tab activation handler failed:", error);
     });
+  });
+}
+
+function setupContentScriptLifecycleListener(): void {
+  if (typeof process !== "undefined" && process.env.JEST_WORKER_ID !== undefined) {
+    return;
+  }
+
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    markContentScriptNotReady(tabId);
+    if (pendingPipelineTabId === tabId) {
+      pendingPipelineTabId = undefined;
+    }
+    if (activeAudioPipelineTabId === tabId) {
+      activeAudioPipelineTabId = undefined;
+      audioPipelineMode = null;
+    }
   });
 }
 
@@ -1800,8 +2017,6 @@ async function handleSettingsUpdated(
     void stopAudioPipeline("protection-off");
   } else if (!isProfanityProtectionActive(settings)) {
     void stopAudioPipeline("profanity-off");
-  } else if (senderTabId !== undefined) {
-    void startAudioPipeline(senderTabId);
   }
 
   let tabId = senderTabId;
@@ -1819,9 +2034,10 @@ async function handleSettingsUpdated(
     if (
       isProfanityProtectionActive(settings) &&
       settings.protectionEnabled &&
-      senderTabId === undefined
+      tabId !== undefined
     ) {
-      void startAudioPipeline(tabId);
+      pendingPipelineTabId = tabId;
+      void startAudioPipelineForReadyTab(tabId, `settings-updated-${reason}`);
     }
   }
 }
@@ -1855,6 +2071,20 @@ function setupProtectionToggleListener(): void {
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== "object") {
+    return false;
+  }
+
+  if (message.type === MESSAGE_TYPE_CONTENT_SCRIPT_READY) {
+    const tabId = sender.tab?.id;
+    sendResponse({ received: true, ready: true });
+
+    if (tabId !== undefined) {
+      console.info("[SafeView-Handshake] CONTENT_SCRIPT_READY from tab %s", tabId);
+      void handleContentScriptReady(tabId).catch((error) => {
+        console.error("[SafeView-Handshake] handleContentScriptReady failed:", error);
+      });
+    }
+
     return false;
   }
 
@@ -1934,7 +2164,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const durationMs =
       typeof message.duration_ms === "number" && message.duration_ms > 0
         ? message.duration_ms
-        : MUTE_DURATION_MS;
+        : PROFANITY_MUTE_DURATION_MS;
 
     sendResponse({ received: true });
     void sendPipelineMuteGain(durationMs);
@@ -2057,6 +2287,7 @@ startServiceWorkerKeepalive();
 setupProtectionToggleListener();
 setupTabActivationListener();
 setupPipelineTabNavigationListener();
+setupContentScriptLifecycleListener();
 
 console.info(
   "[SafeView] Service worker loaded (v%s, nudity + violence blur).",

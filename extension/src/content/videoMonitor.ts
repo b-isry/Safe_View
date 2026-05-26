@@ -10,7 +10,10 @@ import {
   SETTINGS_STORAGE_KEY,
   type SafeViewSettings,
 } from "../background/businessRules";
-import { MESSAGE_ACTION_SETTINGS_UPDATED } from "../shared/settingsMessages";
+import {
+  isProfanityProtectionActive,
+  MESSAGE_ACTION_SETTINGS_UPDATED,
+} from "../shared/settingsMessages";
 import {
   onVideoTrackedForSpeakerSuppression,
   prepareVideoCrossOrigin,
@@ -481,6 +484,154 @@ function canCaptureFrame(video: HTMLVideoElement): boolean {
 /**
  * True when the video is large enough and visibly on-screen (not a thumbnail/hidden ad).
  */
+const YOUTUBE_VIDEO_SELECTORS =
+  "video.html5-main-video, ytd-player video, .video-stream.html5-main-video";
+const VIDEO_TARGET_RESCAN_INTERVAL_MS = 1000;
+const VIDEO_TARGET_RESCAN_MAX_ATTEMPTS = 10;
+
+/**
+ * Query YouTube's primary player video (exhaustive selector list).
+ */
+export function queryPrimaryYouTubeVideo(): HTMLVideoElement | null {
+  const node = document.querySelector(YOUTUBE_VIDEO_SELECTORS);
+  return node instanceof HTMLVideoElement ? node : null;
+}
+
+function logVideoDiscoveryDebug(video: HTMLVideoElement | null | undefined): void {
+  console.log("[SafeView-DEBUG] Video found: " + (video ? "YES" : "NO"));
+}
+
+/**
+ * Discover candidate <video> elements (YouTube main player first, then all videos).
+ */
+function discoverVideoCandidates(): HTMLVideoElement[] {
+  const seen = new Set<HTMLVideoElement>();
+  const candidates: HTMLVideoElement[] = [];
+
+  const push = (video: HTMLVideoElement | null): void => {
+    if (!video || seen.has(video)) {
+      return;
+    }
+    seen.add(video);
+    candidates.push(video);
+  };
+
+  document.querySelectorAll(YOUTUBE_VIDEO_SELECTORS).forEach((node) => {
+    if (node instanceof HTMLVideoElement) {
+      push(node);
+    }
+  });
+
+  const ytMain = queryPrimaryYouTubeVideo();
+  if (ytMain) {
+    push(ytMain);
+  }
+
+  document.querySelectorAll("video").forEach((node) => {
+    if (node instanceof HTMLVideoElement) {
+      push(node);
+    }
+  });
+
+  return candidates;
+}
+
+/**
+ * Poll the DOM every 1s for up to 10s until a visible video appears (YouTube SPA).
+ */
+export function waitForVideoDiscovery(): Promise<HTMLVideoElement | null> {
+  return new Promise((resolve) => {
+    let attempts = 0;
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+
+    const tryFind = (): void => {
+      attempts += 1;
+
+      const ytPrimary = queryPrimaryYouTubeVideo();
+      const candidates = discoverVideoCandidates();
+      let video: HTMLVideoElement | undefined;
+
+      if (ytPrimary && isVideoVisibleInLayout(ytPrimary)) {
+        video = ytPrimary;
+      } else {
+        video = candidates.find((candidate) => isVideoVisibleInLayout(candidate));
+      }
+
+      logVideoDiscoveryDebug(video ?? null);
+
+      if (video) {
+        initAudioCaptureForElement(video);
+        if (intervalId !== null) {
+          clearInterval(intervalId);
+        }
+        resolve(video);
+        return;
+      }
+
+      if (attempts >= VIDEO_TARGET_RESCAN_MAX_ATTEMPTS) {
+        if (intervalId !== null) {
+          clearInterval(intervalId);
+        }
+        resolve(null);
+      }
+    };
+
+    tryFind();
+    intervalId = setInterval(tryFind, VIDEO_TARGET_RESCAN_INTERVAL_MS);
+  });
+}
+
+/**
+ * Re-scan the DOM for videos with retry (YouTube often injects the player late).
+ *
+ * @returns Number of tracked videos after rescan.
+ */
+export async function rescanVideosForTargeting(
+  maxAttempts = VIDEO_TARGET_RESCAN_MAX_ATTEMPTS
+): Promise<number> {
+  let domVisible = 0;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const candidates = discoverVideoCandidates();
+    domVisible = 0;
+
+    for (const video of candidates) {
+      if (!isVideoVisibleInLayout(video)) {
+        continue;
+      }
+
+      domVisible += 1;
+      initAudioCaptureForElement(video);
+    }
+
+    const tracked = videoIdToElement.size;
+    const primary = queryPrimaryYouTubeVideo();
+    logVideoDiscoveryDebug(
+      primary && isVideoVisibleInLayout(primary) ? primary : undefined
+    );
+    console.info(
+      "[SafeView] Video targeting rescan %s/%s — dom_visible=%s tracked=%s videos=%s",
+      attempt + 1,
+      maxAttempts,
+      domVisible,
+      tracked,
+      domVisible > 0 || tracked > 0 ? 1 : 0
+    );
+
+    if (domVisible > 0 || tracked > 0) {
+      return tracked;
+    }
+
+    if (attempt < maxAttempts - 1) {
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, VIDEO_TARGET_RESCAN_INTERVAL_MS);
+      });
+    }
+  }
+
+  return videoIdToElement.size;
+}
+
 function isVideoVisibleInLayout(video: HTMLVideoElement): boolean {
   if (!video.isConnected) {
     return false;
@@ -686,6 +837,10 @@ function handleFrameAnalysisDone(
  * Attach first-sample listeners and fire the first capture as soon as frame data exists.
  */
 function scheduleFirstSample(video: HTMLVideoElement, state: VideoTrackState): void {
+  if (isProfanityProtectionActiveCached()) {
+    return;
+  }
+
   if (state.firstSampleScheduled) {
     return;
   }
@@ -791,6 +946,78 @@ function isFrameProtectionActiveCached(): boolean {
 }
 
 /**
+ * True when profanity audio has CPU priority over vision capture.
+ */
+function isProfanityProtectionActiveCached(): boolean {
+  if (!cachedContentSettings) {
+    return false;
+  }
+
+  return isProfanityProtectionActive(cachedContentSettings);
+}
+
+/**
+ * Hard-stop all vision capture loops when profanity audio owns the CPU (i7 guard).
+ *
+ * @param reason - Diagnostic label for logs.
+ */
+export function hardStopVisionCaptureForAudioPriority(
+  reason: string,
+  force = false
+): void {
+  if (!force && !isProfanityProtectionActiveCached()) {
+    return;
+  }
+
+  globalCaptureGeneration += 1;
+
+  for (const video of [...videoIdToElement.values()]) {
+    const state = trackedVideos.get(video);
+    if (!state) {
+      continue;
+    }
+
+    if (state.intervalId !== null) {
+      clearInterval(state.intervalId);
+      state.intervalId = null;
+    }
+
+    if (state.rvfcHandle !== null && supportsCancelVideoFrameCallback(video)) {
+      try {
+        video.cancelVideoFrameCallback(state.rvfcHandle);
+      } catch {
+        /* Already cancelled. */
+      }
+      state.rvfcHandle = null;
+    }
+
+    if (state.firstSampleRetryId !== null) {
+      clearTimeout(state.firstSampleRetryId);
+      state.firstSampleRetryId = null;
+    }
+
+    if (state.analysisTimeoutId !== null) {
+      clearTimeout(state.analysisTimeoutId);
+      state.analysisTimeoutId = null;
+    }
+
+    state.usesVideoFrameCallback = false;
+    state.isCapturing = false;
+    state.captureSession += 1;
+  }
+
+  primaryCaptureVideo = null;
+  clearAllFullVideoBlurs();
+  resetAllAnalysisStates();
+
+  console.info(
+    "[SafeView][Capture] HARD STOP vision — audio CPU priority (%s) gen=%s",
+    reason,
+    globalCaptureGeneration
+  );
+}
+
+/**
  * Reset per-video analysis counters after settings change or nudity off.
  */
 function resetVideoAnalysisState(state: VideoTrackState): void {
@@ -828,6 +1055,10 @@ export function stopAllSampling(): void {
  * Fire an immediate first frame sample when frame data is ready.
  */
 export function triggerImmediateFirstSample(video: HTMLVideoElement): void {
+  if (isProfanityProtectionActiveCached()) {
+    return;
+  }
+
   const state = trackedVideos.get(video);
   if (!state) {
     return;
@@ -854,7 +1085,9 @@ function ensureVideoRegistered(video: HTMLVideoElement): void {
     }
 
     resetVideoAnalysisState(state);
-    if (isFrameProtectionActiveCached()) {
+    if (isProfanityProtectionActiveCached()) {
+      clearAllBlur(video);
+    } else if (isFrameProtectionActiveCached()) {
       if (findPrimaryVisibleVideo() === video) {
         applyFullVideoBlur(video);
         triggerImmediateFirstSample(video);
@@ -875,11 +1108,11 @@ function ensureVideoRegistered(video: HTMLVideoElement): void {
  * Scan the document for untracked <video> elements.
  */
 function monitorVideos(): void {
-  document.querySelectorAll("video").forEach((video) => {
+  for (const video of discoverVideoCandidates()) {
     if (video.dataset[SAFE_VIEW_TRACKED_DATASET] !== "true") {
       initAudioCaptureForElement(video);
     }
-  });
+  }
 }
 
 /**
@@ -995,6 +1228,11 @@ export function resetVideoCaptureForNavigation(reason: string): void {
  * @param reason - Diagnostic label.
  */
 function reconcilePrimaryCaptureLoop(reason: string): void {
+  if (isProfanityProtectionActiveCached()) {
+    hardStopVisionCaptureForAudioPriority(reason);
+    return;
+  }
+
   if (!isFrameProtectionActiveCached()) {
     stopAllSampling();
     primaryCaptureVideo = null;
@@ -1059,6 +1297,10 @@ function registerVideo(video: HTMLVideoElement): void {
 
   const videoId = nextVideoId++;
   const onFirstSampleReady = (): void => {
+    if (isProfanityProtectionActiveCached()) {
+      return;
+    }
+
     const current = trackedVideos.get(video);
     if (!current || findPrimaryVisibleVideo() !== video) {
       return;
@@ -1154,6 +1396,10 @@ function startVideoFrameCallbackSampling(
     _now: number,
     _metadata: VideoFrameCallbackMetadata
   ): void => {
+    if (isProfanityProtectionActiveCached()) {
+      return;
+    }
+
     const current = trackedVideos.get(video);
 
     if (!current || current.captureSession !== session) {
@@ -1211,6 +1457,10 @@ function startSampling(
   state: VideoTrackState,
   reason: string
 ): void {
+  if (isProfanityProtectionActiveCached()) {
+    return;
+  }
+
   if (state.intervalId !== null || state.usesVideoFrameCallback) {
     return;
   }
@@ -1231,6 +1481,10 @@ function startSampling(
   }
 
   state.intervalId = window.setInterval(() => {
+    if (isProfanityProtectionActiveCached()) {
+      return;
+    }
+
     const current = trackedVideos.get(video);
     if (!current || current.captureSession !== session) {
       return;
@@ -1332,7 +1586,7 @@ async function captureVideoFrameToBlob(
   captureMs: number;
   encodeMs: number;
 } | null> {
-  if (!isFrameProtectionActiveCached()) {
+  if (isProfanityProtectionActiveCached() || !isFrameProtectionActiveCached()) {
     return null;
   }
 
@@ -1421,7 +1675,7 @@ async function sampleFrame(
     return;
   }
 
-  if (!isFrameProtectionActiveCached()) {
+  if (isProfanityProtectionActiveCached() || !isFrameProtectionActiveCached()) {
     return;
   }
 
@@ -1798,6 +2052,26 @@ function teardownYouTubeNavigationListener(): void {
 export async function rescanAndApplyCurrentSettings(): Promise<void> {
   cachedContentSettings = await loadSettings();
 
+  if (!isMonitorRunning) {
+    startVideoMonitor();
+  }
+
+  const trackedCount = await rescanVideosForTargeting();
+  const domVisible = discoverVideoCandidates().filter((video) =>
+    isVideoVisibleInLayout(video)
+  ).length;
+
+  if (isProfanityProtectionActive(cachedContentSettings)) {
+    hardStopVisionCaptureForAudioPriority("settings-rescan-profanity", true);
+    console.info(
+      "[SafeView] Profanity rescan complete — dom_visible=%s tracked=%s primary=%s",
+      domVisible,
+      trackedCount,
+      findPrimaryVisibleVideo() ? "yes" : "no"
+    );
+    return;
+  }
+
   if (!isFrameProtectionActive(cachedContentSettings)) {
     stopAllSampling();
     clearAllFullVideoBlurs();
@@ -1806,23 +2080,11 @@ export async function rescanAndApplyCurrentSettings(): Promise<void> {
     return;
   }
 
-  if (!isMonitorRunning) {
-    startVideoMonitor();
-  }
-
-  const videos = Array.from(document.querySelectorAll("video"));
-  for (const video of videos) {
-    if (!isVideoVisibleInLayout(video)) {
-      continue;
-    }
-
-    ensureVideoRegistered(video);
-  }
-
   reconcilePrimaryCaptureLoop("settings-rescan");
   console.info(
-    "[SafeView] Settings rescan complete — %s visible video(s), primary=%s",
-    videos.length,
+    "[SafeView] Settings rescan complete — dom_visible=%s tracked=%s primary=%s",
+    domVisible,
+    trackedCount,
     primaryCaptureVideo ? "yes" : "no"
   );
 }
@@ -2008,15 +2270,14 @@ export function getVideoById(videoId: number): HTMLVideoElement | undefined {
   return videoIdToElement.get(videoId);
 }
 
-/**
- * Return the tracked <video> with the largest on-screen area (YouTube main player).
- */
-export function findPrimaryVisibleVideo(): HTMLVideoElement | undefined {
+function pickLargestVisibleVideo(
+  videos: Iterable<HTMLVideoElement>
+): HTMLVideoElement | undefined {
   let bestVideo: HTMLVideoElement | undefined;
   let bestArea = 0;
   let bestPlaying = false;
 
-  for (const video of videoIdToElement.values()) {
+  for (const video of videos) {
     if (!isVideoVisibleInLayout(video)) {
       continue;
     }
@@ -2040,6 +2301,23 @@ export function findPrimaryVisibleVideo(): HTMLVideoElement | undefined {
   }
 
   return bestVideo;
+}
+
+/**
+ * Return the tracked <video> with the largest on-screen area (YouTube main player).
+ */
+export function findPrimaryVisibleVideo(): HTMLVideoElement | undefined {
+  const tracked = pickLargestVisibleVideo(videoIdToElement.values());
+  if (tracked) {
+    return tracked;
+  }
+
+  const ytMain = queryPrimaryYouTubeVideo();
+  if (ytMain && isVideoVisibleInLayout(ytMain)) {
+    return ytMain;
+  }
+
+  return pickLargestVisibleVideo(discoverVideoCandidates());
 }
 
 /**

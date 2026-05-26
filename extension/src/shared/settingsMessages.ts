@@ -24,18 +24,15 @@ export function isViolenceProtectionActive(settings: SafeViewSettings): boolean 
   return settings.protectionEnabled && settings.categories.violence;
 }
 
-/**
- * True when any frame-based vision category (nudity or violence) is enabled.
- */
-export function isFrameProtectionActive(settings: SafeViewSettings): boolean {
-  return isNudityProtectionActive(settings) || isViolenceProtectionActive(settings);
-}
+export {
+  isFrameProtectionActive,
+} from "../background/businessRules";
 
 /**
- * Profanity audio pipeline is disabled by default (no active model in vision path).
+ * True when Whisper reactive profanity audio protection should run (CPU priority over vision).
  */
-export function isProfanityProtectionActive(_settings: SafeViewSettings): boolean {
-  return false;
+export function isProfanityProtectionActive(settings: SafeViewSettings): boolean {
+  return settings.protectionEnabled && settings.categories.profanity;
 }
 
 /**

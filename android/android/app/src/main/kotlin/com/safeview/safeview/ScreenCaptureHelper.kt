@@ -92,6 +92,33 @@ class ScreenCaptureHelper(
     }
 
     /**
+     * Active MediaProjection after [start], or null when capture is stopped.
+     */
+    fun getMediaProjection(): MediaProjection? = mediaProjection
+
+    /**
+     * Obtain MediaProjection only (no VirtualDisplay) for AudioPlaybackCapture.
+     * Used when profanity audio is active and screen frames must not run (CPU guard).
+     */
+    fun startProjectionOnly(resultCode: Int, data: Intent, handler: Handler) {
+        stop()
+
+        val projection = projectionManager().getMediaProjection(resultCode, data)
+            ?: throw IllegalStateException("MediaProjection consent invalid")
+        mediaProjection = projection
+        projection.registerCallback(
+            object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection stopped by system")
+                    stop()
+                }
+            },
+            handler,
+        )
+        Log.i(TAG, "MediaProjection started (audio-only, no screen frames)")
+    }
+
+    /**
      * Releases MediaProjection, VirtualDisplay, and ImageReader (BR-02).
      */
     fun stop() {

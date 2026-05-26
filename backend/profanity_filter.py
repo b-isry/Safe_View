@@ -9,7 +9,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,42 @@ def _load_blacklist(path: Path) -> Set[str]:
         for entry in raw
         if isinstance(entry, str) and str(entry).strip()
     }
+
+
+def _normalize_extra_words(extra_words: List[str] | None) -> Set[str]:
+    """
+    Lowercase/strip user-provided terms from the extension settings.
+
+    Args:
+        extra_words: Optional list from POST /analyze-audio profanity_words field.
+
+    Returns:
+        set[str]: Normalized terms to merge into the active blacklist.
+    """
+    if not extra_words:
+        return set()
+
+    return {
+        str(word).strip().lower()
+        for word in extra_words
+        if isinstance(word, str) and str(word).strip()
+    }
+
+
+def _merged_blacklist(language: str, extra_words: List[str] | None = None) -> Set[str]:
+    """
+    Combine server blacklist JSON with optional user-provided terms.
+
+    Args:
+        language: Whisper language code — "en" or "am".
+        extra_words: Optional extension profanity word list.
+
+    Returns:
+        set[str]: Union of file-backed and user terms.
+    """
+    merged = set(_blacklist_for_language(language))
+    merged.update(_normalize_extra_words(extra_words))
+    return merged
 
 
 def _blacklist_for_language(language: str) -> Set[str]:
@@ -125,87 +161,23 @@ def load_blacklists() -> None:
         )
 
 
-def detect_profanity(text: str, language: str) -> Dict[str, Optional[str] | bool]:
+def detect_profanity(
+    text: str,
+    language: str,
+    extra_words: List[str] | None = None,
+) -> Dict[str, Optional[str] | bool]:
     """
-    Scan transcribed text for profanity using language-specific blacklists.
-
-    Each whitespace-separated word is checked for substring matches against
-    blacklist terms (e.g. "fucking" matches "fuck"). Matched words are never
-    written to logs.
-
-    Args:
-        text: Transcribed audio or subtitle text (typically lowercased).
-        language: Language code "en" or "am".
-
-    Returns:
-        dict: detected, matched_word (first hit or None), action (MUTE or ALLOW).
+    Delegate to profanity_service.check_profanity (regex + substring, BEEP on hit).
     """
-    clean = text.strip().lower()
-    if not clean:
-        logger.info(
-            "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
-            False,
-            len(text),
-        )
-        return {
-            "detected": False,
-            "matched_word": None,
-            "action": ACTION_ALLOW,
-        }
+    import profanity_service
 
-    blacklist = _blacklist_for_language(language)
-    if not blacklist:
-        logger.info(
-            "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
-            False,
-            len(text),
-        )
-        return {
-            "detected": False,
-            "matched_word": None,
-            "action": ACTION_ALLOW,
-        }
-
-    for term in blacklist:
-        if term in clean:
-            logger.info("[SafeView] Profanity detected in transcript.")
-            logger.info(
-                "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
-                True,
-                len(text),
-            )
-            return {
-                "detected": True,
-                "matched_word": term,
-                "action": ACTION_MUTE,
-            }
-
-    for word in _WORD_SPLIT_RE.split(clean):
-        if not word:
-            continue
-        if _word_matches_blacklist(word, blacklist):
-            logger.info("[SafeView] Profanity detected.")
-            logger.info(
-                "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
-                True,
-                len(text),
-            )
-            return {
-                "detected": True,
-                "matched_word": word,
-                "action": ACTION_MUTE,
-            }
-
+    result = profanity_service.check_profanity(text, language, extra_words)
     logger.info(
         "[SafeView][Audio-B4] Profanity check: detected=%s, text_length=%s",
-        False,
+        result.get("detected"),
         len(text),
     )
-    return {
-        "detected": False,
-        "matched_word": None,
-        "action": ACTION_ALLOW,
-    }
+    return result
 
 
 load_blacklists()

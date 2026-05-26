@@ -1,16 +1,31 @@
 // SafeView — elementAudioPipeline.ts
-// Primary audio path: route native <video> through Web Audio delay vault + scout recorder.
+// Singleton Web Audio graph for YouTube — one MediaElementSource per <video>, shared gain + recorder tap.
 
-import { loadSettings, SETTINGS_STORAGE_KEY } from "../background/businessRules";
+import {
+  loadSettings,
+  PROFANITY_MUTE_DURATION_MS,
+  SETTINGS_STORAGE_KEY,
+} from "../background/businessRules";
 import {
   isProfanityProtectionActive,
   MESSAGE_ACTION_SETTINGS_UPDATED,
 } from "../shared/settingsMessages";
-import { findPrimaryVisibleVideo } from "./videoMonitor";
+import { showBeepTriggeredNotification } from "./beepNotification";
+import { clearReactiveProfanityMute, triggerWebBeep } from "./profanityReactive";
+import {
+  findPrimaryVisibleVideo,
+  hardStopVisionCaptureForAudioPriority,
+  rescanVideosForTargeting,
+  stopAllSampling,
+  waitForVideoDiscovery,
+} from "./videoMonitor";
 
 /** Service worker → content: start native video element audio graph. */
 export const MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK =
   "START_ELEMENT_AUDIO_FALLBACK";
+
+/** Alias used by the service worker bridge. */
+export const MESSAGE_ACTION_START_AUDIO_PIPELINE = "START_AUDIO_PIPELINE";
 
 /** Service worker → content: tear down element audio graph. */
 export const MESSAGE_ACTION_STOP_ELEMENT_AUDIO_FALLBACK =
@@ -26,139 +41,222 @@ export const MESSAGE_ACTION_RESET_PIPELINE_GAIN = "RESET_PIPELINE_GAIN";
 const MESSAGE_ACTION_AUDIO_CHUNK_PIPELINE = "AUDIO_CHUNK_PIPELINE";
 
 const AUDIO_WEBM_OPUS_MIME = "audio/webm;codecs=opus";
-const DELAY_SECONDS = 4.5;
 const SCOUT_CHUNK_MS = 3000;
-const SCOUT_REQUEST_DATA_MS = 1000;
-const MIN_BLOB_BYTES = 5000;
-const MUTE_HOLD_MS = 3500;
-const VOLUME_HAMMER_MS = 200;
+/** Whisper needs real audio — ignore WebM header-only blobs (~254 bytes). */
+const MIN_BLOB_BYTES = 10000;
+const MUTE_HOLD_MS = PROFANITY_MUTE_DURATION_MS;
+const RECORDER_START_DELAY_MS = 500;
+const AUDIO_PIPELINE_RETRY_MS = 1000;
+const MAX_AUDIO_PIPELINE_RETRIES = 5;
+const VIDEO_WAIT_ATTEMPTS = 10;
+const HAVE_FUTURE_DATA = 3;
 
 /** Matches videoMonitor.ts SAFE_VIEW_TRACKED_DATASET (data-safe-view-tracked). */
 const SAFE_VIEW_TRACKED_DATASET = "safeViewTracked";
 
+/** Per-video singleton graph (survives YouTube SPA navigation). */
+interface VideoAudioSingleton {
+  context: AudioContext;
+  sourceNode: MediaElementAudioSourceNode;
+  singletonGain: GainNode;
+  streamDestination: MediaStreamAudioDestinationNode;
+}
+
+const initializedSources = new WeakMap<HTMLVideoElement, VideoAudioSingleton>();
+
 let pipelineTabId: number | undefined;
 let audioContext: AudioContext | null = null;
-let gainNode: GainNode | null = null;
+let singletonGain: GainNode | null = null;
 let mediaElementSource: MediaElementAudioSourceNode | null = null;
 let boundVideo: HTMLVideoElement | null = null;
 let streamDestination: MediaStreamAudioDestinationNode | null = null;
 let scoutRecorder: MediaRecorder | null = null;
-let scoutRequestDataIntervalId: ReturnType<typeof setInterval> | null = null;
 let scoutChunkStopIntervalId: ReturnType<typeof setInterval> | null = null;
-let gainRestoreTimeoutId: ReturnType<typeof setTimeout> | null = null;
-let volumeGuardVideo: HTMLVideoElement | null = null;
-let volumeChangeHandler: ((this: HTMLVideoElement, ev: Event) => void) | null = null;
-let volumeHammerIntervalId: ReturnType<typeof setInterval> | null = null;
-let nativeSilenceLockActive = false;
+let audioStartRetryTimeoutId: ReturnType<typeof setTimeout> | null = null;
+let singletonMuteRestoreTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
-/**
- * Set crossOrigin before routing media through Web Audio (CORS analyzer safety).
- *
- * @param video - Target HTMLVideoElement.
- */
+function syncModuleRefs(graph: VideoAudioSingleton, video: HTMLVideoElement): void {
+  audioContext = graph.context;
+  mediaElementSource = graph.sourceNode;
+  singletonGain = graph.singletonGain;
+  streamDestination = graph.streamDestination;
+  boundVideo = video;
+}
+
+function isYouTubeHost(): boolean {
+  const host = window.location.hostname.toLowerCase();
+  return (
+    host === "youtube.com" ||
+    host === "www.youtube.com" ||
+    host === "m.youtube.com" ||
+    host.endsWith(".youtube.com")
+  );
+}
+
+function shouldSkipCaptureStream(): boolean {
+  return isYouTubeHost();
+}
+
+function toAudioOnlyStream(stream: MediaStream): MediaStream {
+  const audioTracks = stream.getAudioTracks();
+  if (stream.getVideoTracks().length === 0) {
+    return stream;
+  }
+  return new MediaStream(audioTracks);
+}
+
 export function prepareVideoCrossOrigin(video: HTMLVideoElement): void {
-  if (video.crossOrigin !== "anonymous") {
+  if (!isYouTubeHost() && video.crossOrigin !== "anonymous") {
     video.crossOrigin = "anonymous";
   }
 }
 
-function resolveRecorderMimeType(): string {
-  if (MediaRecorder.isTypeSupported(AUDIO_WEBM_OPUS_MIME)) {
-    return AUDIO_WEBM_OPUS_MIME;
+/**
+ * Wire source → singletonGain → speakers AND recorder (never bypass gain for recorder).
+ */
+function wireSingletonGraph(graph: VideoAudioSingleton): void {
+  try {
+    graph.sourceNode.disconnect();
+  } catch {
+    /* Not connected yet. */
   }
 
-  return "audio/webm";
+  try {
+    graph.singletonGain.disconnect();
+  } catch {
+    /* Not connected yet. */
+  }
+
+  graph.sourceNode.connect(graph.singletonGain);
+  graph.singletonGain.connect(graph.context.destination);
+  graph.singletonGain.connect(graph.streamDestination);
 }
 
 /**
- * Bind the video element to Web Audio once per element (MediaElementSource is single-use).
+ * Get or create the singleton Web Audio graph for this video (no rebind on navigation).
  */
-function forceNativeVideoSilent(video: HTMLVideoElement): void {
-  if (!video.muted || video.volume > 0) {
-    video.muted = true;
-    video.volume = 0;
+function getOrCreateSingletonGraph(
+  video: HTMLVideoElement
+): VideoAudioSingleton | null {
+  const existing = initializedSources.get(video);
+  if (existing && existing.context.state !== "closed") {
+    wireSingletonGraph(existing);
+    syncModuleRefs(existing, video);
+    return existing;
+  }
+
+  try {
+    if (!audioContext || audioContext.state === "closed") {
+      audioContext = new AudioContext();
+    }
+
+    const context = audioContext;
+    const sourceNode = context.createMediaElementSource(video);
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(1, context.currentTime);
+    const destination = context.createMediaStreamDestination();
+
+    const graph: VideoAudioSingleton = {
+      context,
+      sourceNode,
+      singletonGain: gain,
+      streamDestination: destination,
+    };
+
+    wireSingletonGraph(graph);
+    initializedSources.set(video, graph);
+    syncModuleRefs(graph, video);
+
+    console.info("[SafeView] Singleton audio graph created for video element.");
+    return graph;
+  } catch (error) {
+    const cached = initializedSources.get(video);
+    if (cached) {
+      console.info("[SafeView] Reusing cached singleton graph after create error.");
+      wireSingletonGraph(cached);
+      syncModuleRefs(cached, video);
+      return cached;
+    }
+
+    console.error("[SafeView] Singleton audio graph failed:", error);
+    return null;
   }
 }
 
 /**
- * Lock native <video> output silent so only the Web Audio vault path is audible.
- *
- * @param video - Primary video element tapped by MediaElementSource.
+ * Mute playback + recorder tap via singleton gain; play reactive beep (BR-05).
  */
-function startNativeVideoSilenceLock(video: HTMLVideoElement): void {
-  stopNativeVideoSilenceLock();
+export function applySingletonProfanityMute(
+  durationMs: number = MUTE_HOLD_MS
+): void {
+  const video = boundVideo ?? findPrimaryVisibleVideo();
+  const graph = video ? initializedSources.get(video) : undefined;
+  const gain = graph?.singletonGain ?? singletonGain;
 
-  volumeGuardVideo = video;
-  nativeSilenceLockActive = true;
-  forceNativeVideoSilent(video);
+  if (gain) {
+    const ctx = gain.context;
+    const now = ctx.currentTime;
+    const holdSeconds = durationMs / 1000;
 
-  volumeChangeHandler = () => {
-    if (!nativeSilenceLockActive || volumeGuardVideo !== video) {
-      return;
+    if (singletonMuteRestoreTimeoutId !== null) {
+      clearTimeout(singletonMuteRestoreTimeoutId);
+      singletonMuteRestoreTimeoutId = null;
     }
 
-    if (!video.muted || video.volume > 0) {
-      video.muted = true;
-      video.volume = 0;
-    }
-  };
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.setValueAtTime(1, now + holdSeconds);
 
-  video.addEventListener("volumechange", volumeChangeHandler);
+    singletonMuteRestoreTimeoutId = window.setTimeout(() => {
+      singletonMuteRestoreTimeoutId = null;
+      const restoreNow = gain.context.currentTime;
+      gain.gain.cancelScheduledValues(restoreNow);
+      gain.gain.setValueAtTime(1, restoreNow);
+    }, durationMs);
 
-  volumeHammerIntervalId = window.setInterval(() => {
-    if (!nativeSilenceLockActive || volumeGuardVideo !== video) {
-      return;
-    }
-
-    video.muted = true;
-    video.volume = 0;
-  }, VOLUME_HAMMER_MS);
-
-  console.info("[SafeView][Audio-Vault] Native video silence lock active (volume guard + hammer).");
-}
-
-function stopNativeVideoSilenceLock(): void {
-  nativeSilenceLockActive = false;
-
-  if (volumeHammerIntervalId !== null) {
-    clearInterval(volumeHammerIntervalId);
-    volumeHammerIntervalId = null;
-  }
-
-  if (volumeGuardVideo && volumeChangeHandler) {
-    volumeGuardVideo.removeEventListener("volumechange", volumeChangeHandler);
-  }
-
-  volumeGuardVideo = null;
-  volumeChangeHandler = null;
-}
-
-function bindVideoSource(
-  video: HTMLVideoElement,
-  context: AudioContext
-): MediaElementAudioSourceNode {
-  if (mediaElementSource && boundVideo === video && mediaElementSource.context === context) {
-    return mediaElementSource;
-  }
-
-  if (mediaElementSource && boundVideo === video) {
-    throw new Error(
-      "[SafeView] Video already bound to a previous AudioContext — reload the page."
+    console.info(
+      "[SafeView] Singleton gain mute (0) for %sms — audio_action BEEP/MUTE",
+      durationMs
     );
   }
 
-  const source = context.createMediaElementSource(video);
-  mediaElementSource = source;
-  boundVideo = video;
-  return source;
+  if (video) {
+    console.log("!!! TRIGGERING BEEP NOW !!!");
+    triggerWebBeep(video, durationMs);
+  }
+}
+
+export function resetElementPipelineGain(): void {
+  const video = boundVideo ?? findPrimaryVisibleVideo();
+  const graph = video ? initializedSources.get(video) : undefined;
+  const gain = graph?.singletonGain ?? singletonGain;
+
+  if (!gain) {
+    return;
+  }
+
+  const now = gain.context.currentTime;
+  gain.gain.cancelScheduledValues(now);
+  gain.gain.setValueAtTime(1, now);
+}
+
+function resolveRecorderMimeType(): string | null {
+  const candidates = [
+    AUDIO_WEBM_OPUS_MIME,
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+  ];
+
+  for (const mime of candidates) {
+    if (MediaRecorder.isTypeSupported(mime)) {
+      return mime;
+    }
+  }
+
+  return null;
 }
 
 function stopScoutRecorderLoop(): void {
-  if (scoutRequestDataIntervalId !== null) {
-    clearInterval(scoutRequestDataIntervalId);
-    scoutRequestDataIntervalId = null;
-  }
-
   if (scoutChunkStopIntervalId !== null) {
     clearInterval(scoutChunkStopIntervalId);
     scoutChunkStopIntervalId = null;
@@ -168,7 +266,11 @@ function stopScoutRecorderLoop(): void {
 function stopScoutRecorder(): void {
   stopScoutRecorderLoop();
 
-  if (scoutRecorder && scoutRecorder.state !== "inactive") {
+  if (!scoutRecorder) {
+    return;
+  }
+
+  if (scoutRecorder.state === "recording") {
     try {
       scoutRecorder.stop();
     } catch {
@@ -179,22 +281,72 @@ function stopScoutRecorder(): void {
   scoutRecorder = null;
 }
 
-function startScoutRecorder(stream: MediaStream, tabId: number): void {
-  stopScoutRecorder();
+async function waitForRecorderPrerequisites(
+  video: HTMLVideoElement,
+  context: AudioContext | null
+): Promise<boolean> {
+  if (video.readyState < HAVE_FUTURE_DATA) {
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        video.removeEventListener("loadeddata", done);
+        video.removeEventListener("canplay", done);
+        resolve();
+      };
 
-  scoutRecorder = new MediaRecorder(stream, {
-    mimeType: resolveRecorderMimeType(),
+      video.addEventListener("loadeddata", done, { once: true });
+      video.addEventListener("canplay", done, { once: true });
+      window.setTimeout(done, 4000);
+    });
+  }
+
+  if (video.readyState < HAVE_FUTURE_DATA) {
+    console.warn(
+      "[SafeView] Scout recorder — video.readyState=%s (need >= %s)",
+      video.readyState,
+      HAVE_FUTURE_DATA
+    );
+    return false;
+  }
+
+  if (video.paused) {
+    try {
+      await video.play();
+    } catch {
+      console.warn("[SafeView] Scout recorder — video.play() blocked (user gesture?).");
+    }
+  }
+
+  if (context) {
+    if (context.state !== "running") {
+      await context.resume();
+    }
+
+    if (context.state !== "running") {
+      console.warn(
+        "[SafeView] Scout recorder — AudioContext state=%s (need running)",
+        context.state
+      );
+      return false;
+    }
+  }
+
+  await new Promise((resolve) => {
+    window.setTimeout(resolve, RECORDER_START_DELAY_MS);
   });
 
-  scoutRecorder.ondataavailable = async (event: BlobEvent) => {
-    if (!event.data || event.data.size < 5000) {
+  return true;
+}
+
+function attachScoutRecorderHandlers(recorder: MediaRecorder, tabId: number): void {
+  recorder.ondataavailable = (event: BlobEvent) => {
+    const chunkSize = event.data?.size ?? 0;
+    console.log("[SafeView-DATA] Captured Audio: " + chunkSize + " bytes");
+
+    if (!event.data || chunkSize < MIN_BLOB_BYTES) {
       return;
     }
 
-    console.info(
-      "[SafeView][Audio-chunk] Standalone WebM file, size=%s bytes",
-      event.data.size
-    );
+    console.log("[SafeView-FLOW] Forwarding to Backend via Service Worker");
 
     const reader = new FileReader();
     reader.onload = () => {
@@ -207,12 +359,6 @@ function startScoutRecorder(stream: MediaStream, tabId: number): void {
         return;
       }
 
-      console.info(
-        "[SafeView][Audio-3] Sending chunk to SW, tabId=%s, base64Len=%s",
-        tabId,
-        base64.length
-      );
-
       void chrome.runtime
         .sendMessage({
           action: MESSAGE_ACTION_AUDIO_CHUNK_PIPELINE,
@@ -224,73 +370,236 @@ function startScoutRecorder(stream: MediaStream, tabId: number): void {
     reader.readAsDataURL(event.data);
   };
 
-  scoutRecorder.start();
-  console.log(
-    "[SafeView] Audio Stream Tracks:",
-    stream.getAudioTracks().length
-  );
-  console.info(
-    "[SafeView][Audio-5] Scout recorder started, mimeType=%s, chunkMs=%s, requestDataMs=%s, minBytes=%s, tracks=%s",
-    scoutRecorder.mimeType,
-    SCOUT_CHUNK_MS,
-    SCOUT_REQUEST_DATA_MS,
-    MIN_BLOB_BYTES,
-    stream.getAudioTracks().length
-  );
-
-  scoutRequestDataIntervalId = setInterval(() => {
-    if (scoutRecorder && scoutRecorder.state === "recording") {
-      scoutRecorder.requestData();
-    }
-  }, SCOUT_REQUEST_DATA_MS);
-
-  scoutChunkStopIntervalId = setInterval(() => {
-    if (scoutRecorder && scoutRecorder.state === "recording") {
-      scoutRecorder.stop();
-      scoutRecorder.start();
-    }
-  }, SCOUT_CHUNK_MS);
+  recorder.onerror = (event: Event) => {
+    console.error("[SafeView] MediaRecorder error:", event);
+  };
 }
 
-/**
- * Disconnect delay/gain/scout nodes but keep MediaElementSource + AudioContext for restart.
- */
-function teardownProcessingGraph(): void {
+function tryStartMediaRecorder(
+  stream: MediaStream,
+  mimeType: string | undefined,
+  timesliceMs: number
+): MediaRecorder | null {
+  const attempts: Array<{ mime?: string; timeslice: number }> = [
+    { mime: mimeType ?? undefined, timeslice: timesliceMs },
+    { mime: undefined, timeslice: timesliceMs },
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const recorder = attempt.mime
+        ? new MediaRecorder(stream, { mimeType: attempt.mime })
+        : new MediaRecorder(stream);
+
+      recorder.start(attempt.timeslice);
+      return recorder;
+    } catch {
+      /* Try next combination. */
+    }
+  }
+
+  return null;
+}
+
+async function startScoutRecorder(
+  stream: MediaStream,
+  tabId: number,
+  video: HTMLVideoElement,
+  context: AudioContext | null
+): Promise<boolean> {
   stopScoutRecorder();
 
-  if (streamDestination) {
-    try {
-      streamDestination.disconnect();
-    } catch {
-      /* Already disconnected. */
-    }
-    streamDestination = null;
+  const audioOnly = toAudioOnlyStream(stream);
+  const audioTracks = audioOnly.getAudioTracks();
+  if (audioTracks.length === 0) {
+    console.warn("[SafeView] Scout recorder — stream has no audio tracks.");
+    return false;
   }
 
-  if (mediaElementSource) {
-    try {
-      mediaElementSource.disconnect();
-    } catch {
-      /* Already disconnected. */
-    }
+  const ready = await waitForRecorderPrerequisites(video, context);
+  if (!ready) {
+    return false;
   }
 
-  if (gainNode) {
-    try {
-      gainNode.disconnect();
-    } catch {
-      /* Already disconnected. */
-    }
-    gainNode = null;
+  const mimeType = resolveRecorderMimeType();
+  scoutRecorder = tryStartMediaRecorder(
+    audioOnly,
+    mimeType ?? undefined,
+    SCOUT_CHUNK_MS
+  );
+
+  if (!scoutRecorder) {
+    console.error("[SafeView] scoutRecorder.start() failed after MIME attempts.");
+    scoutRecorder = null;
+    return false;
   }
+
+  attachScoutRecorderHandlers(scoutRecorder, tabId);
+
+  scoutChunkStopIntervalId = window.setInterval(() => {
+    if (!scoutRecorder || scoutRecorder.state !== "recording") {
+      return;
+    }
+
+    try {
+      scoutRecorder.stop();
+      scoutRecorder.start(SCOUT_CHUNK_MS);
+    } catch (error) {
+      console.warn("[SafeView] scoutRecorder stop/restart failed:", error);
+    }
+  }, SCOUT_CHUNK_MS);
+
+  console.info(
+    "[SafeView][Audio-5] Scout recorder started mime=%s tracks=%s state=%s timeslice=%sms",
+    scoutRecorder.mimeType,
+    audioTracks.length,
+    scoutRecorder.state,
+    SCOUT_CHUNK_MS
+  );
+
+  return true;
 }
 
-/**
- * Start element-path pipeline: source → delay → gain → destination; scout via streamDest.
- *
- * @param tabId - Tab id for scout chunk routing.
- * @returns True when the graph started successfully.
- */
+function stopRecorderOnly(): void {
+  stopScoutRecorder();
+}
+
+function destroySingletonGraphFully(): void {
+  stopScoutRecorder();
+
+  if (singletonMuteRestoreTimeoutId !== null) {
+    clearTimeout(singletonMuteRestoreTimeoutId);
+    singletonMuteRestoreTimeoutId = null;
+  }
+
+  void audioContext?.close();
+
+  audioContext = null;
+  singletonGain = null;
+  mediaElementSource = null;
+  boundVideo = null;
+  streamDestination = null;
+}
+
+async function createWebAudioScoutStream(
+  video: HTMLVideoElement
+): Promise<MediaStream | null> {
+  prepareVideoCrossOrigin(video);
+
+  if (video.readyState < HAVE_FUTURE_DATA) {
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        video.removeEventListener("loadeddata", done);
+        video.removeEventListener("canplay", done);
+        resolve();
+      };
+      video.addEventListener("loadeddata", done, { once: true });
+      video.addEventListener("canplay", done, { once: true });
+      window.setTimeout(done, 4000);
+    });
+  }
+
+  const graph = getOrCreateSingletonGraph(video);
+  if (!graph) {
+    return null;
+  }
+
+  if (graph.context.state !== "running") {
+    await graph.context.resume();
+  }
+
+  const tracks = graph.streamDestination.stream.getAudioTracks();
+  if (tracks.length === 0) {
+    console.warn("[SafeView] Web Audio scout stream has no audio tracks.");
+    return null;
+  }
+
+  if (initializedSources.has(video)) {
+    console.info(
+      "[SafeView] Reusing singleton scout stream (%s track(s)).",
+      tracks.length
+    );
+  } else {
+    console.info(
+      "[SafeView] Scout stream via MediaElementSource → singletonGain → MediaStreamDestination (%s track(s)).",
+      tracks.length
+    );
+  }
+
+  return graph.streamDestination.stream;
+}
+
+type ScoutStreamSource = "captureStream" | "webAudio";
+
+interface ScoutStreamResult {
+  stream: MediaStream;
+  source: ScoutStreamSource;
+}
+
+async function createScoutMediaStream(
+  video: HTMLVideoElement,
+  forceWebAudio = false
+): Promise<ScoutStreamResult | null> {
+  const skipCapture = forceWebAudio || shouldSkipCaptureStream();
+
+  if (!skipCapture && typeof video.captureStream === "function") {
+    try {
+      const captured = video.captureStream();
+      const tracks = captured.getAudioTracks();
+      if (tracks.length > 0 && tracks.some((t) => t.readyState !== "ended")) {
+        console.info(
+          "[SafeView] Scout stream via captureStream (%s audio track(s)).",
+          tracks.length
+        );
+        return {
+          stream: toAudioOnlyStream(captured),
+          source: "captureStream",
+        };
+      }
+    } catch (error) {
+      console.warn(
+        "[SafeView] captureStream failed — falling back to Web Audio:",
+        error
+      );
+    }
+  } else if (skipCapture) {
+    console.info(
+      "[SafeView] Skipping captureStream on YouTube — singleton Web Audio pipeline."
+    );
+  }
+
+  const webAudioStream = await createWebAudioScoutStream(video);
+  if (!webAudioStream) {
+    return null;
+  }
+
+  return { stream: webAudioStream, source: "webAudio" };
+}
+
+async function waitForPrimaryVideo(): Promise<HTMLVideoElement | undefined> {
+  const discovered = await waitForVideoDiscovery();
+  if (discovered) {
+    console.info("[SafeView][Audio] Video found — videos=1");
+    return discovered;
+  }
+
+  await rescanVideosForTargeting(VIDEO_WAIT_ATTEMPTS);
+  const video = findPrimaryVisibleVideo();
+  if (video) {
+    console.info("[SafeView][Audio] Video found after rescan — videos=1");
+    return video;
+  }
+
+  console.warn("[SafeView][Audio] No visible video after %ss — videos=0", VIDEO_WAIT_ATTEMPTS);
+  return undefined;
+}
+
+function enforceVisionCpuGuard(reason: string): void {
+  hardStopVisionCaptureForAudioPriority(reason, true);
+  stopAllSampling();
+  console.info("[SafeView][Capture] Vision sampling halted — audio pipeline owns CPU (%s).", reason);
+}
+
 export async function startElementAudioFallback(tabId: number): Promise<boolean> {
   console.info(
     "[SafeView][Audio-1] startElementAudioFallback called, tabId=%s",
@@ -306,176 +615,127 @@ export async function startElementAudioFallback(tabId: number): Promise<boolean>
     return false;
   }
 
-  teardownProcessingGraph();
+  enforceVisionCpuGuard("audio-pipeline-start");
+  stopRecorderOnly();
 
-  const video = findPrimaryVisibleVideo();
+  const video = await waitForPrimaryVideo();
   if (!video) {
-    console.warn("[SafeView] Element audio fallback — no visible video.");
+    console.warn(
+      "[SafeView] Element audio fallback — no visible video after %ss.",
+      VIDEO_WAIT_ATTEMPTS
+    );
     return false;
   }
 
-  prepareVideoCrossOrigin(video);
-
   try {
-    if (!audioContext || audioContext.state === "closed") {
-      audioContext = new AudioContext();
-      mediaElementSource = null;
-      boundVideo = null;
+    let scoutResult = await createScoutMediaStream(video);
+    if (!scoutResult) {
+      return false;
     }
 
-    console.info(
-      "[SafeView][Audio-3] AudioContext created, state=%s",
-      audioContext.state
+    const contextForRecorder =
+      audioContext && audioContext.state !== "closed" ? audioContext : null;
+
+    let started = await startScoutRecorder(
+      scoutResult.stream,
+      tabId,
+      video,
+      contextForRecorder
     );
 
-    console.info(
-      "[SafeView][Audio-Buffer] Vault delay=%ss, standalone record=%sms",
-      DELAY_SECONDS,
-      SCOUT_CHUNK_MS
-    );
-
-    const sourceNode = bindVideoSource(video, audioContext);
-
-    const delayNode = audioContext.createDelay(DELAY_SECONDS + 0.1);
-    delayNode.delayTime.value = DELAY_SECONDS;
-    gainNode = audioContext.createGain();
-    gainNode.gain.setValueAtTime(1, audioContext.currentTime);
-
-    sourceNode.connect(delayNode);
-    delayNode.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-
-    const streamDest = audioContext.createMediaStreamDestination();
-    streamDestination = streamDest;
-    sourceNode.connect(streamDest);
-
-    console.log(
-      "[SafeView] Audio Stream Tracks:",
-      streamDest.stream.getAudioTracks().length
-    );
-
-    if (streamDest.stream.getAudioTracks().length === 0) {
+    if (!started && scoutResult.source === "captureStream") {
       console.warn(
-        "[SafeView] MediaStreamDestination has zero audio tracks — scout recording may be empty."
+        "[SafeView] MediaRecorder rejected captureStream — retrying singleton Web Audio."
       );
+      stopRecorderOnly();
+      scoutResult = await createScoutMediaStream(video, true);
+      if (scoutResult) {
+        started = await startScoutRecorder(
+          scoutResult.stream,
+          tabId,
+          video,
+          audioContext && audioContext.state !== "closed" ? audioContext : null
+        );
+      }
     }
 
-    await audioContext.resume();
-
-    startScoutRecorder(streamDest.stream, tabId);
-
-    startNativeVideoSilenceLock(video);
-
-    console.info("[SafeView][Audio-4] Playback audio playing (element path)");
+    if (!started) {
+      return false;
+    }
 
     pipelineTabId = tabId;
-
-    console.info(
-      "[SafeView] Element audio pipeline active — source→delay→gain→destination (tab %s).",
-      tabId
-    );
+    enforceVisionCpuGuard("audio-pipeline-active");
+    console.log("[SafeView-FINAL] Audio Pipeline Active & Stream Captured");
     return true;
   } catch (error) {
     console.error("[SafeView] Element audio fallback failed:", error);
-    stopElementAudioFallback();
+    stopRecorderOnly();
     return false;
   }
 }
 
-/**
- * Immediately restore element-path gain to 1.0 and cancel pending mute restores.
- */
-export function resetElementPipelineGain(): void {
-  if (gainRestoreTimeoutId !== null) {
-    clearTimeout(gainRestoreTimeoutId);
-    gainRestoreTimeoutId = null;
+function scheduleAudioPipelineRetry(tabId: number, attempt: number): void {
+  if (audioStartRetryTimeoutId !== null) {
+    clearTimeout(audioStartRetryTimeoutId);
+    audioStartRetryTimeoutId = null;
   }
 
-  if (gainNode && audioContext) {
-    gainNode.gain.cancelScheduledValues(audioContext.currentTime);
-    gainNode.gain.setValueAtTime(1.0, audioContext.currentTime);
-  }
-}
-
-/**
- * Mute element-path output using the Web Audio hardware clock.
- *
- * @param durationSeconds - Hold duration before smooth restore.
- */
-export function applyElementGainMute(durationSeconds: number = MUTE_HOLD_MS / 1000): void {
-  console.info(
-    "[SafeView][Audio-7] applyElementGainMute called, gainNode exists=%s, audioContext exists=%s, durationSeconds=%s",
-    !!gainNode,
-    !!audioContext,
-    durationSeconds
-  );
-
-  const video = boundVideo ?? findPrimaryVisibleVideo();
-  if (video instanceof HTMLVideoElement) {
-    video.muted = true;
-    video.volume = 0;
-  }
-
-  if (!gainNode || !audioContext) {
-    console.info("[SafeView][Audio-8] Vault gain mute skipped — no gain node.");
+  if (attempt >= MAX_AUDIO_PIPELINE_RETRIES) {
+    console.warn("[SafeView] Element audio pipeline — max retries reached.");
     return;
   }
 
-  if (gainRestoreTimeoutId !== null) {
-    clearTimeout(gainRestoreTimeoutId);
-    gainRestoreTimeoutId = null;
-  }
+  audioStartRetryTimeoutId = window.setTimeout(() => {
+    audioStartRetryTimeoutId = null;
+    void (async () => {
+      const settings = await loadSettings();
+      if (!isProfanityProtectionActive(settings)) {
+        return;
+      }
 
-  const now = audioContext.currentTime;
-  gainNode.gain.cancelScheduledValues(now);
-  gainNode.gain.setValueAtTime(0, now);
-  console.info(
-    "[SafeView][Audio-8] Gain set to 0 at time=%s, will restore at=%s",
-    now,
-    now + durationSeconds
-  );
+      console.info(
+        "[SafeView][Audio] Retrying element audio pipeline (attempt %s/%s).",
+        attempt + 1,
+        MAX_AUDIO_PIPELINE_RETRIES
+      );
 
-  gainRestoreTimeoutId = window.setTimeout(() => {
-    gainRestoreTimeoutId = null;
-    if (!gainNode || !audioContext) {
-      return;
-    }
-
-    gainNode.gain.setTargetAtTime(1, audioContext.currentTime, 0.05);
-    console.info("[SafeView][Audio-10] Vault gain restored.");
-  }, durationSeconds * 1000);
-
-  console.info("[SafeView] Element-path gain muted.");
+      const started = await startElementAudioFallback(tabId);
+      if (!started) {
+        scheduleAudioPipelineRetry(tabId, attempt + 1);
+      }
+    })();
+  }, AUDIO_PIPELINE_RETRY_MS);
 }
 
-/**
- * Tear down element audio graph and release capture state.
- */
-export function stopElementAudioFallback(): void {
-  stopNativeVideoSilenceLock();
-  teardownProcessingGraph();
+async function startElementAudioFallbackWithRetry(tabId: number): Promise<void> {
+  const started = await startElementAudioFallback(tabId);
+  if (!started) {
+    scheduleAudioPipelineRetry(tabId, 0);
+  }
+}
 
-  if (gainRestoreTimeoutId !== null) {
-    clearTimeout(gainRestoreTimeoutId);
-    gainRestoreTimeoutId = null;
+export function stopElementAudioFallback(): void {
+  if (audioStartRetryTimeoutId !== null) {
+    clearTimeout(audioStartRetryTimeoutId);
+    audioStartRetryTimeoutId = null;
   }
 
-  void audioContext?.close();
-
-  audioContext = null;
-  gainNode = null;
-  mediaElementSource = null;
-  boundVideo = null;
+  clearReactiveProfanityMute();
+  stopRecorderOnly();
+  resetElementPipelineGain();
   pipelineTabId = undefined;
 }
 
+export function destroyElementAudioPipeline(): void {
+  stopElementAudioFallback();
+  destroySingletonGraphFully();
+}
+
 function handleYouTubeNavigateFinishGainReset(): void {
+  clearReactiveProfanityMute();
   resetElementPipelineGain();
 }
 
-/**
- * Reset gain when videoMonitor registers a new tracked <video>.
- */
 function setupTrackedVideoGainResetObserver(): void {
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
@@ -488,6 +748,7 @@ function setupTrackedVideoGainResetObserver(): void {
         target instanceof HTMLVideoElement &&
         target.dataset[SAFE_VIEW_TRACKED_DATASET] === "true"
       ) {
+        clearReactiveProfanityMute();
         resetElementPipelineGain();
         break;
       }
@@ -501,9 +762,29 @@ function setupTrackedVideoGainResetObserver(): void {
   });
 }
 
-/**
- * Listen for element-fallback commands from the service worker.
- */
+function handleProfanityMuteMessage(payload: Record<string, unknown>): void {
+  const durationMs =
+    typeof payload.duration === "number" && payload.duration > 0
+      ? payload.duration
+      : typeof payload.duration_ms === "number" && payload.duration_ms > 0
+        ? payload.duration_ms
+        : MUTE_HOLD_MS;
+
+  const audioAction =
+    typeof payload.audio_action === "string" ? payload.audio_action : "";
+
+  if (
+    payload.action === MESSAGE_ACTION_ELEMENT_MUTE_GAIN ||
+    audioAction === "BEEP" ||
+    audioAction === "MUTE"
+  ) {
+    if (audioAction === "BEEP") {
+      showBeepTriggeredNotification();
+    }
+    applySingletonProfanityMute(durationMs);
+  }
+}
+
 export function initElementAudioPipelineListener(): void {
   document.addEventListener("yt-navigate-finish", handleYouTubeNavigateFinishGainReset);
   setupTrackedVideoGainResetObserver();
@@ -523,14 +804,14 @@ export function initElementAudioPipelineListener(): void {
 
     const payload = message as Record<string, unknown>;
 
-    if (payload.action === MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK) {
+    if (
+      payload.action === MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK ||
+      payload.action === MESSAGE_ACTION_START_AUDIO_PIPELINE
+    ) {
+      console.log("[SafeView-Handshake] Connection established with Background.");
       const tabId = payload.tabId;
       if (typeof tabId === "number") {
-        void startElementAudioFallback(tabId).then((started) => {
-          if (!started) {
-            stopElementAudioFallback();
-          }
-        });
+        void startElementAudioFallbackWithRetry(tabId);
       }
       return;
     }
@@ -541,13 +822,7 @@ export function initElementAudioPipelineListener(): void {
     }
 
     if (payload.action === MESSAGE_ACTION_ELEMENT_MUTE_GAIN) {
-      const durationMs =
-        typeof payload.duration === "number" && payload.duration > 0
-          ? payload.duration
-          : typeof payload.duration_ms === "number" && payload.duration_ms > 0
-            ? payload.duration_ms
-            : MUTE_HOLD_MS;
-      applyElementGainMute(durationMs / 1000);
+      handleProfanityMuteMessage(payload);
       return;
     }
 
@@ -564,18 +839,19 @@ export function initElementAudioPipelineListener(): void {
   });
 }
 
-/**
- * Stop the audio pipeline when profanity is disabled; no-op when still enabled.
- */
 export async function applyProfanityAudioSettings(reason: string): Promise<void> {
   const settings = await loadSettings();
-  if (!isProfanityProtectionActive(settings)) {
-    console.info(
-      "[SafeView][Audio] Profanity off (%s) — stopping element audio pipeline.",
-      reason
-    );
-    stopElementAudioFallback();
+
+  if (isProfanityProtectionActive(settings)) {
+    enforceVisionCpuGuard(reason);
+    return;
   }
+
+  console.info(
+    "[SafeView][Audio] Profanity off (%s) — stopping element audio pipeline.",
+    reason
+  );
+  destroyElementAudioPipeline();
 }
 
 export function getElementPipelineTabId(): number | undefined {
@@ -583,5 +859,9 @@ export function getElementPipelineTabId(): number | undefined {
 }
 
 export function isElementAudioPipelineActive(): boolean {
-  return pipelineTabId !== undefined && audioContext !== null;
+  return (
+    pipelineTabId !== undefined &&
+    scoutRecorder !== null &&
+    scoutRecorder.state === "recording"
+  );
 }

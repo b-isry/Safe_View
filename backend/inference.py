@@ -18,8 +18,9 @@ import vision_service
 
 logger = logging.getLogger(__name__)
 
-# BR-01: confidence floor regardless of user sensitivity setting
+# BR-01: nudity floor — Class 2 only, 0.90 minimum (vision_service).
 CONFIDENCE_FLOOR = vision_service.VISION_THRESHOLD
+NUDITY_CLASS_ID = vision_service.NUDITY_CLASS_ID
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -78,7 +79,7 @@ def _confidence_from_logits(logits: torch.Tensor) -> float:
     """
     Map model logits to P(nudity) for the loaded head.
 
-    The checkpoint uses a 2-class linear head; P(nudity) = sigmoid(positive - negative).
+    Multi-class heads: only SAFEVIEW Class 2 (Nudity). Binary heads: legacy sigmoid pair.
 
     Args:
         logits: Raw model output (1, C).
@@ -86,11 +87,31 @@ def _confidence_from_logits(logits: torch.Tensor) -> float:
     Returns:
         float: Nudity probability in [0.0, 1.0].
     """
-    if logits.shape[-1] == 2:
+    num_classes = int(logits.shape[-1])
+
+    if num_classes > NUDITY_CLASS_ID:
+        probs = torch.softmax(logits[0], dim=-1)
+        return probs[NUDITY_CLASS_ID].item()
+
+    if num_classes == 2:
         score = logits[0, POSITIVE_CLASS_INDEX] - logits[0, NEGATIVE_CLASS_INDEX]
         return torch.sigmoid(score).item()
 
     return torch.sigmoid(logits.reshape(-1)[0]).item()
+
+
+def _label_from_logits(logits: torch.Tensor) -> str:
+    """Return NSFW only when Class 2 is the restricted nudity label."""
+    num_classes = int(logits.shape[-1])
+    if num_classes > NUDITY_CLASS_ID:
+        class_id = int(torch.argmax(logits[0], dim=-1).item())
+        if class_id == NUDITY_CLASS_ID:
+            return "NSFW"
+        return "SFW"
+
+    if logits[0, POSITIVE_CLASS_INDEX].item() > logits[0, NEGATIVE_CLASS_INDEX].item():
+        return "NSFW"
+    return "SFW"
 
 
 def run_inference_raw(tensor: torch.Tensor) -> Dict[str, Any]:
@@ -118,12 +139,7 @@ def run_inference_raw(tensor: torch.Tensor) -> Dict[str, Any]:
         with torch.inference_mode():
             logits = model(tensor)
             confidence = _confidence_from_logits(logits)
-            label = (
-                "NSFW"
-                if logits[0, POSITIVE_CLASS_INDEX].item()
-                > logits[0, NEGATIVE_CLASS_INDEX].item()
-                else "SFW"
-            )
+            label = _label_from_logits(logits)
             del logits
     except Exception as exc:
         logger.error("[SafeView] Inference failed: %s", exc)
@@ -171,13 +187,8 @@ def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
         with torch.inference_mode():
             logits = model(tensor)
             confidence = _confidence_from_logits(logits)
-            label = (
-                "NSFW"
-                if logits[0, POSITIVE_CLASS_INDEX].item()
-                > logits[0, NEGATIVE_CLASS_INDEX].item()
-                else "SFW"
-            )
-            detected = confidence >= effective_threshold
+            label = _label_from_logits(logits)
+            detected = confidence >= effective_threshold and label == "NSFW"
             action = ACTION_BLUR if detected else ACTION_ALLOW
             del logits
         forward_ms = (time.perf_counter() - forward_started) * 1000.0

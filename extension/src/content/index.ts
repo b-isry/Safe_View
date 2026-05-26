@@ -25,3 +25,14 @@ function initContentScript(): void {
 }
 
 initContentScript();
+
+void chrome.runtime
+  .sendMessage({ type: "CONTENT_SCRIPT_READY" })
+  .then(() => {
+    console.log("[SafeView-Handshake] Connection established with Background.");
+  })
+  .catch(() => {
+    console.warn(
+      "[SafeView-Handshake] Background not reachable yet — will retry on next navigation."
+    );
+  });
