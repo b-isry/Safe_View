@@ -14,6 +14,7 @@ import {
   UNSAFE_TTL_MS,
   VIOLENCE_THRESHOLD,
 } from "./latencyPolicy";
+export { shouldBlurWebsiteImage } from "../shared/imageBlurDecision";
 
 export type BlurLabel = "NSFW" | "SFW";
 

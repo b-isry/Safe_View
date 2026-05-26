@@ -1,11 +1,11 @@
 // SafeView — stableBlurPolicy.ts
 // Purpose: Hysteresis, hold time, and sampling constants for classifier full-frame blur.
 
-/** Score at or above this turns blur ON (aligned with backend UNSAFE_THRESHOLD). */
-export const BLUR_ON_THRESHOLD = 0.7;
+/** Score at or above this turns blur ON (≥ 50% NSFW confidence). */
+export const BLUR_ON_THRESHOLD = 0.5;
 
-/** Score at or below this counts as definitely safe. */
-export const BLUR_OFF_THRESHOLD = 0.6;
+/** Score below this counts as definitely safe (< 50%). */
+export const BLUR_OFF_THRESHOLD = 0.5;
 
 /** Consecutive safe frames required before CLEAR. */
 export const SAFE_FRAMES_TO_CLEAR = 3;

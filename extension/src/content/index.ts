@@ -4,24 +4,47 @@
 // Purpose: Content script entry — video sampling and blur on every page.
 // Loaded via manifest content_scripts only — never assign raw strings to HTMLScriptElement.src.
 
+import { ensureVisionProtectionDefaults } from "../background/businessRules";
 import { initAudioMuteListener } from "./audioMonitor";
 import { initBlurManager } from "./blurManager";
 import { initElementAudioPipelineListener } from "./elementAudioPipeline";
+import { startStaticImageMonitor } from "./imageMonitor";
 import { startVideoMonitor } from "./videoMonitor";
 
 /**
  * Bootstrap SafeView: monitor videos, send frames to service worker, apply blur on BLUR.
  */
 function initContentScript(): void {
+  console.info(
+    "[SafeView] Content script boot on %s (v%s)",
+    location.href,
+    chrome.runtime.getManifest().version
+  );
+
   initBlurManager();
   initAudioMuteListener();
   initElementAudioPipelineListener();
   startVideoMonitor();
+  startStaticImageMonitor();
 
   console.info(
-    "[SafeView] Content script ready (v%s).",
-    chrome.runtime.getManifest().version
+    "[SafeView] Content script ready (video + images) — use this page's DevTools Console for [SafeView] logs."
   );
 }
 
-initContentScript();
+void ensureVisionProtectionDefaults()
+  .then(() => {
+    try {
+      initContentScript();
+    } catch (error) {
+      console.error("[SafeView] Content script failed to start:", error);
+    }
+  })
+  .catch((error) => {
+    console.error("[SafeView] Failed to apply default settings:", error);
+    try {
+      initContentScript();
+    } catch (bootError) {
+      console.error("[SafeView] Content script failed to start:", bootError);
+    }
+  });

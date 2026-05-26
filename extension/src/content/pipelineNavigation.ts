@@ -72,7 +72,7 @@ export function handlePipelineNavigationBoundary(reason: string): void {
       reason,
       youtubeVideoId: lastYouTubeWatchVideoId ?? undefined,
     })
-    .catch(() => {});
+    .catch(() => { });
 
   console.info("[SafeView] Pipeline navigation reset (%s).", reason);
 }

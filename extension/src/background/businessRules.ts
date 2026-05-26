@@ -61,6 +61,9 @@ export interface SafeViewSettings {
 /** Storage keys for SafeView settings. */
 export const SETTINGS_STORAGE_KEY = "safeview_settings";
 
+/** One-time migration: enable protection + nudity without using the popup. */
+export const VISION_DEFAULTS_MIGRATION_KEY = "safeview_vision_defaults_v2";
+
 /** Default settings applied when nothing is stored yet. */
 export const DEFAULT_SETTINGS: SafeViewSettings = {
   protectionEnabled: true,
@@ -68,7 +71,7 @@ export const DEFAULT_SETTINGS: SafeViewSettings = {
   sensitivity: DEFAULT_SENSITIVITY,
   categories: {
     nudity: true,
-    violence: true,
+    violence: false,
     kissing: false,
     profanity: false,
     lgbtq: false,
@@ -151,9 +154,45 @@ export function getCachedSettings(): SafeViewSettings {
 }
 
 /**
+ * Persist default protection + nudity on first install or when storage is empty.
+ * Also runs a one-time migration so older installs work without opening the popup.
+ */
+export async function ensureVisionProtectionDefaults(): Promise<void> {
+  try {
+    const stored = await chrome.storage.local.get([
+      SETTINGS_STORAGE_KEY,
+      VISION_DEFAULTS_MIGRATION_KEY,
+    ]);
+    const raw = stored[SETTINGS_STORAGE_KEY] as
+      | Partial<SafeViewSettings>
+      | undefined;
+    const migrated = stored[VISION_DEFAULTS_MIGRATION_KEY] === true;
+
+    if (!raw && !migrated) {
+      await saveSettings({ ...DEFAULT_SETTINGS });
+      await chrome.storage.local.set({ [VISION_DEFAULTS_MIGRATION_KEY]: true });
+      return;
+    }
+
+    if (migrated) {
+      return;
+    }
+
+    const settings = mergeSettings(raw);
+    settings.protectionEnabled = true;
+    settings.categories.nudity = true;
+    await saveSettings(settings);
+    await chrome.storage.local.set({ [VISION_DEFAULTS_MIGRATION_KEY]: true });
+  } catch (error) {
+    console.error("[SafeView] Failed to apply vision defaults:", error);
+  }
+}
+
+/**
  * Hydrate settings cache and listen for options-page updates.
  */
 export async function initSettingsCache(): Promise<void> {
+  await ensureVisionProtectionDefaults();
   cachedSettings = await loadSettings();
 
   if (settingsCacheListenerRegistered) {

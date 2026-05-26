@@ -14,6 +14,7 @@ module.exports = {
         "**/businessRules.test.ts",
         "**/serviceWorker.test.ts",
         "**/blurDecision.test.ts",
+        "**/imageBlurDecision.test.ts",
         "**/stableBlurDecision.test.ts",
         "**/aiClient.test.ts",
         "**/options.test.ts",
@@ -23,7 +24,11 @@ module.exports = {
       displayName: "jsdom",
       preset: "ts-jest",
       testEnvironment: "jsdom",
-      testMatch: ["**/videoMonitor.test.ts", "**/blurManager.test.ts"],
+      testMatch: [
+        "**/videoMonitor.test.ts",
+        "**/blurManager.test.ts",
+        "**/staticImageMonitor.test.ts",
+      ],
     },
   ],
 };

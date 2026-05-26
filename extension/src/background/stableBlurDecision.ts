@@ -133,9 +133,10 @@ export function decideStableBlur(
   const isUnsafe =
     response.model_loaded !== false && score >= BLUR_ON_THRESHOLD;
 
-  const isDefinitelySafe = score <= BLUR_OFF_THRESHOLD;
+  const isDefinitelySafe = score < BLUR_OFF_THRESHOLD;
 
-  const isBorderline = score > BLUR_OFF_THRESHOLD && score < BLUR_ON_THRESHOLD;
+  const isBorderline =
+    score >= BLUR_OFF_THRESHOLD && score < BLUR_ON_THRESHOLD;
 
   if (isUnsafe) {
     next.unsafeStreak += 1;

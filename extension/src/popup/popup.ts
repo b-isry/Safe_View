@@ -246,26 +246,17 @@ async function handleProtectionToggle(): Promise<void> {
     const settings = await loadSettings();
     const turningOn = protectionToggle.checked;
 
-    if (turningOn) {
+    settings.protectionEnabled = turningOn;
+    await saveSettings(settings);
+    await notifySettingsUpdated(turningOn ? "protection_on" : "protection_off");
+
+    if (turningOn && isProfanityProtectionActive(settings)) {
       const [tab] = await chrome.tabs.query({
         active: true,
         currentWindow: true,
       });
       const tabId = tab?.id;
-
-      if (tabId === undefined) {
-        protectionToggle.checked = false;
-        settings.protectionEnabled = false;
-        await saveSettings(settings);
-        await refreshPopup(false);
-        return;
-      }
-
-      settings.protectionEnabled = true;
-      await saveSettings(settings);
-      await notifySettingsUpdated("protection_on");
-
-      if (isProfanityProtectionActive(settings)) {
+      if (tabId !== undefined) {
         try {
           await chrome.runtime.sendMessage({
             action: MESSAGE_ACTION_START_PIPELINE_WITH_STREAM,
@@ -278,10 +269,6 @@ async function handleProtectionToggle(): Promise<void> {
           );
         }
       }
-    } else {
-      settings.protectionEnabled = false;
-      await saveSettings(settings);
-      await notifySettingsUpdated("protection_off");
     }
 
     await refreshPopup(false);
