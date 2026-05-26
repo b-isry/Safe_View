@@ -33,9 +33,19 @@ import {
   clearAllFullVideoBlurs,
 } from "./fullVideoBlur";
 import {
+  handleStaticImageFrameAnalysisDone,
+  isStaticImageId,
+  rescanStaticImages,
+  stopStaticImageMonitor,
+} from "./imageMonitor";
+import {
   onYouTubeWatchIdBoundary,
   seedYouTubeWatchVideoId,
 } from "./pipelineNavigation";
+import {
+  MESSAGE_ACTION_FRAME_ANALYSIS_DONE,
+  MESSAGE_ACTION_FRAME_SAMPLE,
+} from "../shared/contentMessages";
 import {
   BACKEND_TIMEOUT_MS,
   ENCODE_ADAPTIVE_THRESHOLD_MS,
@@ -89,11 +99,11 @@ const FIRST_SAMPLE_RETRY_MS = 120;
 /** Reject near-black frames (transitions, fades, failed decode). */
 const MIN_FRAME_LUMINANCE = 12;
 
-/** chrome.runtime message action sent to the service worker with a frame blob. */
-export const MESSAGE_ACTION_FRAME_SAMPLE = "FRAME_SAMPLE";
-
-/** Service worker → content script: one frame analysis cycle finished. */
-export const MESSAGE_ACTION_FRAME_ANALYSIS_DONE = "FRAME_ANALYSIS_DONE";
+/** Re-export for tests and legacy imports. */
+export {
+  MESSAGE_ACTION_FRAME_ANALYSIS_DONE,
+  MESSAGE_ACTION_FRAME_SAMPLE,
+} from "../shared/contentMessages";
 
 /** Downscaled scene snapshot width (pixels). */
 const SCENE_SNAPSHOT_WIDTH = 32;
@@ -1800,6 +1810,7 @@ export async function rescanAndApplyCurrentSettings(): Promise<void> {
 
   if (!isFrameProtectionActive(cachedContentSettings)) {
     stopAllSampling();
+    stopStaticImageMonitor();
     clearAllFullVideoBlurs();
     resetAllAnalysisStates();
     console.info("[SafeView] Nudity protection off — sampling stopped, blur cleared.");
@@ -1820,6 +1831,7 @@ export async function rescanAndApplyCurrentSettings(): Promise<void> {
   }
 
   reconcilePrimaryCaptureLoop("settings-rescan");
+  await rescanStaticImages();
   console.info(
     "[SafeView] Settings rescan complete — %s visible video(s), primary=%s",
     videos.length,
@@ -1889,21 +1901,34 @@ function setupRuntimeMessageListener(): void {
           decision?: string;
           reason?: string;
         };
-        handleFrameAnalysisDone(
-          payload.videoId,
-          payload.requestId,
-          framePayload.decision,
-          framePayload.reason,
-          (message as { frameSeq?: number }).frameSeq,
-          (message as {
-            stableMeta?: {
-              score: number;
-              safeStreak: number;
-              unsafeStreak: number;
-              isBlurred: boolean;
-            };
-          }).stableMeta
-        );
+        const stableMeta = (message as {
+          stableMeta?: {
+            score: number;
+            safeStreak: number;
+            unsafeStreak: number;
+            isBlurred: boolean;
+          };
+        }).stableMeta;
+
+        if (isStaticImageId(payload.videoId)) {
+          handleStaticImageFrameAnalysisDone(
+            payload.videoId,
+            payload.requestId,
+            framePayload.decision,
+            framePayload.reason,
+            (message as { frameSeq?: number }).frameSeq,
+            stableMeta
+          );
+        } else {
+          handleFrameAnalysisDone(
+            payload.videoId,
+            payload.requestId,
+            framePayload.decision,
+            framePayload.reason,
+            (message as { frameSeq?: number }).frameSeq,
+            stableMeta
+          );
+        }
       }
       return;
     }

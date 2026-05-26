@@ -53,10 +53,7 @@ describe("businessRules BR-01", () => {
         kissing: false,
       },
     };
-    expect(getEnabledCategories(settingsOn)).toEqual([
-      "nudity",
-      "violence",
-    ]);
+    expect(getEnabledCategories(settingsOn)).toEqual(["nudity"]);
     expect(getEnabledCategories(settingsOff)).toEqual([]);
   });
 

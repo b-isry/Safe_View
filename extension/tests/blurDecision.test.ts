@@ -97,7 +97,7 @@ describe("blurDecision", () => {
     });
   });
 
-  it("demo stable KEEP on borderline frame after blur", () => {
+  it("demo stable BLUR when score stays at or above 50%", () => {
     const blurred = evaluateDemoBlurSwitch({
       ...demoBase,
       frameSeq: 10,
@@ -119,14 +119,14 @@ describe("blurDecision", () => {
         nowMs: demoBase.nowMs! + 200,
         response: {
           model_loaded: true,
-          action: "BLUR",
-          detected: true,
-          confidence: 0.69,
+          action: "ALLOW",
+          detected: false,
+          confidence: 0.68,
         },
       })
     ).toMatchObject({
-      action: "KEEP",
-      reason: "borderline_keep_existing_blur",
+      action: "BLUR",
+      reason: "unsafe_above_blur_on_threshold",
     });
   });
 

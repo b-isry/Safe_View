@@ -10,6 +10,7 @@ import {
   applyBlurStateUpdates,
   logBlurEvaluation,
   normalizeBlurLabel,
+  shouldBlurWebsiteImage,
   type BlurLabel,
   type ContentTypeGate,
 } from "./blurDecision";
@@ -38,6 +39,10 @@ import {
   isProfanityProtectionActive,
   MESSAGE_ACTION_SETTINGS_UPDATED,
 } from "../shared/settingsMessages";
+import {
+  IMAGE_CACHE_TTL_MS,
+  MAX_CONCURRENT_IMAGE_BACKEND,
+} from "../shared/imageNudityPolicy";
 
 /** Content script → service worker: JPEG frame sample. */
 export const MESSAGE_ACTION_FRAME_SAMPLE = "FRAME_SAMPLE";
@@ -134,12 +139,20 @@ export interface FrameSampleMessage {
   sessionId?: number;
   /** Media src at capture time. */
   videoSrc?: string;
+  /** `image` for static <img> samples; default is video. */
+  mediaType?: "video" | "image";
   /** video.currentTime at capture time. */
   videoTime?: number;
   /** drawImage + blank-check duration (ms). */
   captureMs?: number;
   /** canvas.toBlob duration (ms). */
   encodeMs?: number;
+  /**
+   * When set (images only), service worker fetches bytes — bypasses page CORS for CDN URLs.
+   */
+  imageFetchUrl?: string;
+  /** Page URL used as Referer when fetching imageFetchUrl. */
+  pageUrl?: string;
 }
 
 /**
@@ -357,6 +370,107 @@ function frameFromMessage(message: FrameSampleMessage): Blob | null {
   }
 
   return null;
+}
+
+/**
+ * Fetch image bytes in the extension context (not subject to page CORS).
+ *
+ * @param url - Absolute image URL (e.g. CDN).
+ * @param pageUrl - Tab page URL for Referer (signed CDN URLs).
+ */
+export async function fetchImageBlobInServiceWorker(
+  url: string,
+  pageUrl?: string
+): Promise<Blob | null> {
+  if (!url || url.startsWith("data:") || url.startsWith("blob:")) {
+    return null;
+  }
+
+  const headers: Record<string, string> = {
+    Accept: "image/*,*/*;q=0.8",
+  };
+  if (pageUrl) {
+    headers.Referer = pageUrl;
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      credentials: "include",
+      redirect: "follow",
+      headers,
+    });
+
+    if (!response.ok) {
+      console.warn(
+        "[SafeView][Image] SW fetch HTTP %s url=%s",
+        response.status,
+        url.slice(0, 80)
+      );
+      return null;
+    }
+
+    const blob = await response.blob();
+    if (blob.size === 0) {
+      return null;
+    }
+
+    console.info(
+      "[SafeView][Image] SW fetch ok bytes=%s type=%s",
+      blob.size,
+      blob.type || "unknown"
+    );
+
+    const type =
+      blob.type && blob.type.startsWith("image/")
+        ? blob.type
+        : DEFAULT_FRAME_MIME_TYPE;
+    return blob.type === type ? blob : new Blob([blob], { type });
+  } catch (error) {
+    console.warn("[SafeView][Image] SW fetch failed:", error);
+    return null;
+  }
+}
+
+/**
+ * Resolve JPEG bytes from message payload or extension-context URL fetch.
+ */
+async function resolveFrameBlobFromMessage(
+  message: FrameSampleMessage
+): Promise<Blob | null> {
+  const inline = frameFromMessage(message);
+  if (inline) {
+    return inline;
+  }
+
+  if (
+    message.mediaType === "image" &&
+    typeof message.imageFetchUrl === "string" &&
+    message.imageFetchUrl.length > 0
+  ) {
+    console.info(
+      "[SafeView][Image] SW fetching cross-origin url=%s",
+      message.imageFetchUrl.slice(0, 80)
+    );
+    return fetchImageBlobInServiceWorker(
+      message.imageFetchUrl,
+      message.pageUrl
+    );
+  }
+
+  return null;
+}
+
+function hasResolvableFrame(message: FrameSampleMessage): boolean {
+  if (hasDecodableFrameBytes(message)) {
+    return true;
+  }
+
+  return (
+    message.mediaType === "image" &&
+    typeof message.imageFetchUrl === "string" &&
+    message.imageFetchUrl.length > 0
+  );
 }
 
 /**
@@ -802,8 +916,14 @@ async function sendFrameAnalysisDone(
       frameSeq,
       stableMeta,
     });
-  } catch {
-    /* Tab may have navigated away. */
+  } catch (error) {
+    console.warn(
+      "[SafeView][Image] Could not deliver FRAME_ANALYSIS_DONE to tab %s image=%s (%s): %s",
+      tabId,
+      videoId,
+      decision,
+      error instanceof Error ? error.message : String(error)
+    );
   }
 }
 
@@ -845,6 +965,7 @@ async function processFrameSample(
 
   const videoSrc = message.videoSrc ?? "";
   if (
+    message.mediaType !== "image" &&
     videoSrc.length > 0 &&
     pipeline.lastVideoSrc.length > 0 &&
     videoSrc !== pipeline.lastVideoSrc
@@ -879,16 +1000,23 @@ async function processFrameSample(
 
   const swReceivedAt = Date.now();
   const settings = getCachedSettings();
-  const frame = frameFromMessage(message);
+  const frame = await resolveFrameBlobFromMessage(message);
 
   if (!frame) {
-    console.warn("[SafeView] FRAME_SAMPLE ignored — invalid frame buffer.");
+    console.warn("[SafeView] FRAME_SAMPLE ignored — no frame bytes or URL fetch failed.");
+    const invalidDecision = message.mediaType === "image" ? "CLEAR" : "HOLD";
+    const invalidReason =
+      message.mediaType === "image" ? "image_fetch_failed" : "invalid_frame";
     await sendFrameAnalysisDone(
       tabId,
       message.videoId,
       requestId,
-      "HOLD",
-      "invalid_frame"
+      invalidDecision,
+      invalidReason,
+      message.frameSeq,
+      message.mediaType === "image"
+        ? { score: 0, safeStreak: 0, unsafeStreak: 0, isBlurred: false }
+        : undefined
     );
     return;
   }
@@ -967,11 +1095,71 @@ async function processFrameSample(
           : "ALLOW",
       label: outcome.label,
       model_loaded: outcome.modelLoaded,
-      detections: outcome.violenceDetections ?? [],
+      detections: [],
       content_type: outcome.contentType,
       gate_reason: outcome.gateReason,
       supports_boxes: false,
     };
+
+    if (message.mediaType === "image") {
+      const blur = shouldBlurWebsiteImage(nudityResponse);
+      const imageDecision = blur ? "BLUR" : "CLEAR";
+      const imageReason = !outcome.backendTrusted
+        ? "backend_offline"
+        : blur
+          ? `image_nudity_${outcome.score.toFixed(2)}`
+          : `image_safe_${outcome.score.toFixed(2)}`;
+
+      pipeline.lastProcessedFrameSeq = frameSeq;
+
+      if (imageDecision === "BLUR") {
+        await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, {
+          blurMode: "full",
+        });
+        console.info(
+          "[SafeView][Image] Sent BLUR to tab=%s image=%s score=%s",
+          tabId,
+          message.videoId,
+          outcome.score.toFixed(2)
+        );
+      } else {
+        await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId);
+      }
+
+      if (!outcome.backendTrusted) {
+        console.warn(
+          "[SafeView][Image] Backend offline — score=0 (start uvicorn on %s)",
+          getCachedSettings().backendUrl
+        );
+      } else {
+        console.info(
+          "[SafeView][Image] Analyzed score=%s decision=%s",
+          outcome.score.toFixed(2),
+          imageDecision
+        );
+      }
+
+      const imageUrl = imageUrlFromMessage(message);
+      if (imageUrl.length > 0) {
+        setImageUrlAnalysisCache(imageUrl, outcome.score, blur);
+      }
+
+      await sendFrameAnalysisDone(
+        tabId,
+        message.videoId,
+        requestId,
+        imageDecision,
+        imageReason,
+        frameSeq,
+        {
+          score: outcome.score,
+          safeStreak: 0,
+          unsafeStreak: 0,
+          isBlurred: blur,
+        }
+      );
+      return;
+    }
 
     const demoEvaluation = DEMO_CLASSIFIER_SWITCH
       ? evaluateDemoBlurSwitch({
@@ -1242,15 +1430,161 @@ async function processFrameSample(
   );
 }
 
+interface QueuedImageFrameJob {
+  message: FrameSampleMessage;
+  tabId: number;
+}
+
+interface ImageUrlAnalysisCacheEntry {
+  score: number;
+  shouldBlur: boolean;
+  cachedAt: number;
+}
+
+const imageUrlAnalysisCache = new Map<string, ImageUrlAnalysisCacheEntry>();
+
+function imageUrlFromMessage(message: FrameSampleMessage): string {
+  const fetchUrl = message.imageFetchUrl?.trim() ?? "";
+  if (fetchUrl.length > 0) {
+    return fetchUrl;
+  }
+  return message.videoSrc?.trim() ?? "";
+}
+
+function getImageUrlAnalysisCache(url: string): ImageUrlAnalysisCacheEntry | null {
+  const entry = imageUrlAnalysisCache.get(url);
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() - entry.cachedAt > IMAGE_CACHE_TTL_MS) {
+    imageUrlAnalysisCache.delete(url);
+    return null;
+  }
+  return entry;
+}
+
+function setImageUrlAnalysisCache(
+  url: string,
+  score: number,
+  shouldBlur: boolean
+): void {
+  imageUrlAnalysisCache.set(url, {
+    score,
+    shouldBlur,
+    cachedAt: Date.now(),
+  });
+}
+
+async function deliverCachedImageAnalysis(
+  message: FrameSampleMessage,
+  tabId: number,
+  requestId: number,
+  entry: ImageUrlAnalysisCacheEntry
+): Promise<void> {
+  const frameSeq = message.frameSeq ?? 0;
+  const blur = entry.shouldBlur;
+  const imageDecision = blur ? "BLUR" : "CLEAR";
+  const imageReason = blur
+    ? `image_cache_${entry.score.toFixed(2)}`
+    : `image_cache_safe_${entry.score.toFixed(2)}`;
+
+  if (blur) {
+    await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, {
+      blurMode: "full",
+    });
+  } else {
+    await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId);
+  }
+
+  await sendFrameAnalysisDone(
+    tabId,
+    message.videoId,
+    requestId,
+    imageDecision,
+    imageReason,
+    frameSeq,
+    {
+      score: entry.score,
+      safeStreak: 0,
+      unsafeStreak: 0,
+      isBlurred: blur,
+    }
+  );
+}
+
+const imageFrameJobQueue: QueuedImageFrameJob[] = [];
+const imageFrameQueuedByVideoId = new Map<number, QueuedImageFrameJob>();
+let imageBackendJobsInFlight = 0;
+
+function pumpImageFrameQueue(): void {
+  while (
+    imageBackendJobsInFlight < MAX_CONCURRENT_IMAGE_BACKEND &&
+    imageFrameJobQueue.length > 0
+  ) {
+    const job = imageFrameJobQueue.shift()!;
+    imageFrameQueuedByVideoId.delete(job.message.videoId);
+    imageBackendJobsInFlight += 1;
+
+    void (async () => {
+      try {
+        await handleFrameSampleForVideo(job.message, job.tabId);
+      } finally {
+        imageBackendJobsInFlight -= 1;
+        pumpImageFrameQueue();
+      }
+    })();
+  }
+}
+
+function enqueueImageFrameSample(
+  message: FrameSampleMessage,
+  tabId: number
+): void {
+  const existing = imageFrameQueuedByVideoId.get(message.videoId);
+  if (existing) {
+    const index = imageFrameJobQueue.indexOf(existing);
+    if (index >= 0) {
+      imageFrameJobQueue.splice(index, 1);
+    }
+  }
+
+  const job: QueuedImageFrameJob = { message, tabId };
+  imageFrameQueuedByVideoId.set(message.videoId, job);
+  imageFrameJobQueue.push(job);
+  void pumpImageFrameQueue();
+}
+
 /**
  * Handle one FRAME_SAMPLE message: backend inference then BLUR/CLEAR (push via tabs.sendMessage).
  *
- * Only one /analyze-image request in flight per video — pending frames are dropped.
+ * Video: one /analyze-image in flight per video id.
+ * Images: global queue with bounded parallelism (see MAX_CONCURRENT_IMAGE_BACKEND).
  *
  * @param message - Frame sample from the content script.
  * @param tabId - Sender tab id captured before the runtime message channel closes.
  */
 export async function handleFrameSample(
+  message: FrameSampleMessage,
+  tabId: number
+): Promise<void> {
+  if (message.mediaType === "image") {
+    const imageUrl = imageUrlFromMessage(message);
+    if (imageUrl.length > 0) {
+      const cached = getImageUrlAnalysisCache(imageUrl);
+      if (cached) {
+        const requestId = message.requestId ?? 0;
+        await deliverCachedImageAnalysis(message, tabId, requestId, cached);
+        return;
+      }
+    }
+    enqueueImageFrameSample(message, tabId);
+    return;
+  }
+
+  await handleFrameSampleForVideo(message, tabId);
+}
+
+async function handleFrameSampleForVideo(
   message: FrameSampleMessage,
   tabId: number
 ): Promise<void> {
@@ -1880,7 +2214,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const normalized = getFrameBytesFromMessage(frameMessage);
     const hasFrameBytes = hasDecodableFrameBytes(frameMessage);
 
-    if (typeof frameMessage.videoId !== "number" || !hasFrameBytes) {
+    const canProcess =
+      typeof frameMessage.videoId === "number" && hasResolvableFrame(frameMessage);
+
+    if (!canProcess) {
       console.warn(
         "[SafeView] Invalid FRAME_SAMPLE payload (payloadLen=%s).",
         payloadLen
@@ -1890,13 +2227,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     sendResponse({ received: true });
-    console.info(
-      "[SafeView] FRAME_SAMPLE received — tab=%s video=%s payloadLen=%s normalized=%s",
-      tabId ?? "?",
-      frameMessage.videoId,
-      payloadLen,
-      normalized?.byteLength ?? 0
-    );
+    if (frameMessage.mediaType === "image") {
+      console.debug(
+        "[SafeView] FRAME_SAMPLE image tab=%s id=%s payloadLen=%s",
+        tabId ?? "?",
+        frameMessage.videoId,
+        payloadLen
+      );
+    } else {
+      console.info(
+        "[SafeView] FRAME_SAMPLE received — tab=%s video=%s payloadLen=%s normalized=%s",
+        tabId ?? "?",
+        frameMessage.videoId,
+        payloadLen,
+        normalized?.byteLength ?? 0
+      );
+    }
     if (tabId !== undefined) {
       void handleFrameSample(frameMessage, tabId).catch((error) => {
         console.error("[SafeView] FRAME_SAMPLE handler error:", error);
@@ -2053,6 +2399,12 @@ function startServiceWorkerKeepalive(): void {
 
 void loadBackendStatusFromStorage();
 void initSettingsCache();
+
+chrome.runtime.onInstalled?.addListener((details) => {
+  console.info("[SafeView] Extension installed/updated (%s)", details.reason);
+  void initSettingsCache();
+});
+
 startServiceWorkerKeepalive();
 setupProtectionToggleListener();
 setupTabActivationListener();

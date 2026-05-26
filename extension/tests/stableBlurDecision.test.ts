@@ -19,11 +19,11 @@ const unsafeResponse = {
   confidence: 0.85,
 };
 
-const borderlineResponse = {
+const belowThresholdResponse = {
   model_loaded: true,
-  action: "BLUR" as const,
-  detected: true,
-  confidence: 0.69,
+  action: "ALLOW" as const,
+  detected: false,
+  confidence: 0.49,
 };
 
 const safeResponse = {
@@ -45,13 +45,20 @@ describe("stableBlurDecision", () => {
     expect(result.state.isBlurred).toBe(true);
   });
 
-  it("KEEP borderline score while already blurred", () => {
+  it("CLEAR when score drops below 50% after blur", () => {
     let state = createStableBlurState();
-    state = decideStableBlur(unsafeResponse, state, { nowMs: 10_000 }).state;
-    const result = decideStableBlur(borderlineResponse, state, { nowMs: 10_500 });
-    expect(result.command).toBe("KEEP");
-    expect(result.reason).toBe("borderline_keep_existing_blur");
-    expect(result.state.isBlurred).toBe(true);
+    const t0 = 30_000;
+    state = decideStableBlur(unsafeResponse, state, { nowMs: t0 }).state;
+    for (let i = 1; i < SAFE_FRAMES_TO_CLEAR; i += 1) {
+      state = decideStableBlur(belowThresholdResponse, state, {
+        nowMs: t0 + MIN_BLUR_HOLD_MS,
+      }).state;
+    }
+    const cleared = decideStableBlur(belowThresholdResponse, state, {
+      nowMs: t0 + MIN_BLUR_HOLD_MS + 100,
+    });
+    expect(cleared.command).toBe("CLEAR");
+    expect(cleared.state.isBlurred).toBe(false);
   });
 
   it("CLEAR only after safe streak and minimum hold", () => {
@@ -81,11 +88,27 @@ describe("stableBlurDecision", () => {
     expect(cleared.state.isBlurred).toBe(false);
   });
 
-  it("borderline below ON threshold does not turn blur on when unblurred", () => {
+  it("score below 50% does not turn blur on when unblurred", () => {
     const state = createStableBlurState();
-    const result = decideStableBlur(borderlineResponse, state, { nowMs: 1_000 });
+    const result = decideStableBlur(belowThresholdResponse, state, { nowMs: 1_000 });
     expect(result.command).toBe("CLEAR");
     expect(result.state.isBlurred).toBe(false);
+  });
+
+  it("BLUR at exactly 50% confidence", () => {
+    const state = createStableBlurState();
+    const result = decideStableBlur(
+      {
+        model_loaded: true,
+        action: "ALLOW",
+        detected: false,
+        confidence: 0.5,
+      },
+      state,
+      { nowMs: 1_000 }
+    );
+    expect(result.command).toBe("BLUR");
+    expect(result.state.isBlurred).toBe(true);
   });
 
   it("BLUR on high score when backend gate returned ALLOW (score-primary demo)", () => {
@@ -132,9 +155,10 @@ describe("stableBlurDecision", () => {
     expect(result.reason).toBe("backend_unavailable_keep_blur");
   });
 
-  it("uses hysteresis band between BLUR_OFF and BLUR_ON", () => {
-    expect(BLUR_ON_THRESHOLD).toBeGreaterThan(BLUR_OFF_THRESHOLD);
-    expect(borderlineResponse.confidence).toBeGreaterThan(BLUR_OFF_THRESHOLD);
-    expect(borderlineResponse.confidence).toBeLessThan(BLUR_ON_THRESHOLD);
+  it("uses 50% as blur on/off split", () => {
+    expect(BLUR_ON_THRESHOLD).toBe(0.5);
+    expect(BLUR_OFF_THRESHOLD).toBe(0.5);
+    expect(belowThresholdResponse.confidence).toBeLessThan(BLUR_OFF_THRESHOLD);
+    expect(unsafeResponse.confidence).toBeGreaterThanOrEqual(BLUR_ON_THRESHOLD);
   });
 });

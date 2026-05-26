@@ -30,6 +30,7 @@ jest.mock("../src/background/businessRules", () => {
     loadSettings: (...args: unknown[]) => mockLoadSettings(...args),
     getCachedSettings: () => mockGetCachedSettings(),
     initSettingsCache: jest.fn().mockResolvedValue(undefined),
+    ensureVisionProtectionDefaults: jest.fn().mockResolvedValue(undefined),
     getEnabledCategories: (...args: unknown[]) => mockGetEnabledCategories(...args),
   };
 });
@@ -38,6 +39,7 @@ Object.defineProperty(globalThis, "chrome", {
   value: {
     runtime: {
       onMessage: { addListener: jest.fn() },
+      onInstalled: { addListener: jest.fn() },
       sendMessage: jest.fn(),
       getManifest: jest.fn().mockReturnValue({ version: "0.1.3" }),
     },
@@ -189,12 +191,12 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("does not blur uncertain score in the middle band", async () => {
+  it("does not blur when score is below 50% threshold", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: false,
-        confidence: 0.65,
+        confidence: 0.49,
         action: "ALLOW",
         label: "NSFW",
         model_loaded: true,
@@ -224,12 +226,12 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("blurs when score is at or above demo blur-on threshold (0.70)", async () => {
+  it("blurs when score is at or above 50% threshold", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: true,
-        confidence: 0.75,
+        confidence: 0.68,
         action: "BLUR",
         label: "NSFW",
         model_loaded: true,

@@ -267,12 +267,35 @@ export async function analyzeImage(
 
     let response: Response;
 
-    try {
-      response = await fetch(endpoint, {
+    const postAnalyze = (url: string): Promise<Response> =>
+      fetch(url, {
         method: "POST",
         body: formData,
         signal: combinedSignal,
       });
+
+    try {
+      try {
+        response = await postAnalyze(endpoint);
+      } catch (firstError) {
+        if (signal?.aborted) {
+          throw firstError;
+        }
+
+        const fallbackEndpoint = endpoint.replace(
+          "://localhost",
+          "://127.0.0.1"
+        );
+        if (fallbackEndpoint !== endpoint) {
+          console.warn(
+            "[SafeView] Retrying analyze-image via 127.0.0.1 (%s)",
+            fallbackEndpoint
+          );
+          response = await postAnalyze(fallbackEndpoint);
+        } else {
+          throw firstError;
+        }
+      }
     } catch (error) {
       if (signal?.aborted) {
         throw error;

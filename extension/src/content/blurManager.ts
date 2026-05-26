@@ -4,9 +4,11 @@
 import type { DetectionBox } from "../shared/apiTypes";
 import {
   applyFullVideoBlur,
+  applyImageBlur,
   applyRegionBlur,
   clearAllBlur,
   clearFullVideoBlur,
+  clearImageBlur,
   clearRegionBlur,
   BLUR_FILTER,
 } from "./blurOverlay";
@@ -14,6 +16,10 @@ import {
   clearAllFullVideoBlurs,
   getBlurredVideoSet,
 } from "./fullVideoBlur";
+import {
+  getImageById,
+  isStaticImageId,
+} from "./imageMonitor";
 import {
   findPrimaryVisibleVideo,
   getVideoById,
@@ -74,11 +80,35 @@ function injectOverlayStyles(): void {
       background: rgba(255, 255, 255, 0.01);
       pointer-events: none;
     }
+    .sv-image-blur-overlay {
+      position: fixed;
+      pointer-events: none;
+      z-index: 2147483646;
+      box-sizing: border-box;
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      background: rgba(13, 27, 42, 0.45);
+      border-radius: 2px;
+    }
   `;
   document.documentElement.appendChild(style);
 }
 
-function resolveBlurTarget(videoId: number): HTMLVideoElement | undefined {
+function resolveBlurTarget(
+  videoId: number
+): HTMLVideoElement | HTMLImageElement | undefined {
+  if (isStaticImageId(videoId)) {
+    const img = getImageById(videoId);
+    if (!img) {
+      return undefined;
+    }
+    if (!img.isConnected) {
+      clearImageBlur(img);
+      return undefined;
+    }
+    return img;
+  }
+
   const byId = getVideoById(videoId);
   if (!byId) {
     return undefined;
@@ -96,8 +126,25 @@ function resolveBlurTarget(videoId: number): HTMLVideoElement | undefined {
 
 export function applyBlur(videoId: number, command: Partial<BlurCommandMessage> = {}): void {
   injectOverlayStyles();
-  const video = resolveBlurTarget(videoId);
-  if (!video) {
+  const target = resolveBlurTarget(videoId);
+  if (!target) {
+    if (videoId >= 1_000_000) {
+      console.warn(
+        "[SafeView][Image] BLUR command ignored — image id=%s not in tab registry (reload page?)",
+        videoId
+      );
+    }
+    return;
+  }
+
+  if (target instanceof HTMLImageElement) {
+    applyImageBlur(target);
+    console.info(
+      "[SafeView][Image] BLUR command applied to <img> id=%s (%sx%s)",
+      videoId,
+      Math.round(target.getBoundingClientRect().width),
+      Math.round(target.getBoundingClientRect().height)
+    );
     return;
   }
 
@@ -105,18 +152,26 @@ export function applyBlur(videoId: number, command: Partial<BlurCommandMessage> 
   const detections = command.detections ?? [];
 
   if (mode === "regions" && detections.length > 0) {
-    clearFullVideoBlur(video);
-    regionBlurVideos.add(video);
-    applyRegionBlur(video, detections);
+    clearFullVideoBlur(target);
+    regionBlurVideos.add(target);
+    applyRegionBlur(target, detections);
     return;
   }
 
-  regionBlurVideos.delete(video);
-  clearRegionBlur(video);
-  applyFullVideoBlur(video);
+  regionBlurVideos.delete(target);
+  clearRegionBlur(target);
+  applyFullVideoBlur(target);
 }
 
 export function clearBlur(videoId: number): void {
+  if (isStaticImageId(videoId)) {
+    const img = getImageById(videoId);
+    if (img) {
+      clearImageBlur(img);
+    }
+    return;
+  }
+
   pruneDisconnectedBlurredVideos();
 
   const video = resolveBlurTarget(videoId);
