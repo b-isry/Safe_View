@@ -151,8 +151,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Load nudity and violence models once before serving requests."""
     logging.basicConfig(level=logging.INFO)
     model_loader.load_model()
-    if not violence_loader.MODEL_LOADED:
-        violence_loader.load_model()
+    violence_loader.load_model()
     logger.info(
         "[SafeView] Backend ready — nudity_loaded=%s violence_loaded=%s whisper_loaded=%s",
         model_loader.MODEL_LOADED,
@@ -239,12 +238,26 @@ async def analyze_image(
         image = Image.open(BytesIO(frame_bytes))
 
         if category_normalized == "all":
+            nudity_started = time.perf_counter()
             nudity_result = await asyncio.to_thread(
                 nudity.analyze, image, sensitivity
             )
+            nudity_ms = (time.perf_counter() - nudity_started) * 1000.0
+            logger.info(
+                "[SafeView][Latency] analyze-image category=nudity inference=%.1fms",
+                nudity_ms,
+            )
+
+            violence_started = time.perf_counter()
             violence_result = await asyncio.to_thread(
                 violence.analyze, image, sensitivity
             )
+            violence_ms = (time.perf_counter() - violence_started) * 1000.0
+            logger.info(
+                "[SafeView][Latency] analyze-image category=violence inference=%.1fms",
+                violence_ms,
+            )
+
             merged = api_schema.merge_category_results(nudity_result, violence_result)
             return merged
 

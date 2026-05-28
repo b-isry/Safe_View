@@ -14,7 +14,7 @@ import paths
 logger = logging.getLogger(__name__)
 
 MODEL_FILENAME = paths.VIOLENCE_MODEL_PATH.name
-MODEL_NAME = "violence_yolo"
+MODEL_NAME = "violence"
 VIOLENCE_MODEL_PATH = paths.VIOLENCE_MODEL_PATH
 VIOLENCE_CLASS_NAMES = ("fight", "weapon", "blood")
 
@@ -71,11 +71,17 @@ def load_model() -> None:
         _model = YOLO(str(weights_path))
         MODEL_LOADED = True
         _loaded_path = weights_path
+        model_names = getattr(_model, "names", None) or {}
+        if isinstance(model_names, dict) and model_names:
+            class_summary = ", ".join(
+                f"{idx}:{name}" for idx, name in sorted(model_names.items())
+            )
+        else:
+            class_summary = ", ".join(VIOLENCE_CLASS_NAMES)
         logger.info(
-            "[SafeView] Loaded %s from %s (classes: %s).",
-            MODEL_NAME,
+            "[SafeView] Loaded violence_yolo from %s (classes: %s).",
             weights_path,
-            ", ".join(VIOLENCE_CLASS_NAMES),
+            class_summary,
         )
     except Exception as exc:
         logger.error(
@@ -89,13 +95,14 @@ def load_model() -> None:
 
 
 def get_model() -> Optional[Any]:
-    """Return the cached YOLO model, or None if loading failed."""
+    """Return the cached YOLO model, automatically loading it if needed."""
+    global MODEL_LOADED, _model
+    if not MODEL_LOADED and _model is None:
+        logger.info("[SafeView] Lazy-loading violence model on demand...")
+        load_model()
     return _model
 
 
 def get_loaded_path() -> Optional[Path]:
     """Return the path used for the loaded weights, if any."""
     return _loaded_path
-
-
-load_model()

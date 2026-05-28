@@ -20,14 +20,25 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
     """
     Detect violent content with YOLO; returns normalized bounding boxes when present.
     """
-    if not violence_loader.MODEL_LOADED or violence_loader.get_model() is None:
+    if violence_loader.get_model() is None:
         logger.warning(
-            "[SafeView] Violence analyze called but weights are not loaded; failing open.",
+            "[SafeView] Violence analyze called but weights could not be loaded; failing open.",
         )
         return _fail_open_response()
 
     try:
         raw = violence_inference.run_detection(image, sensitivity)
+        if raw["detected"]:
+            classes = ", ".join(
+                str(entry.get("class", "?")) for entry in raw.get("detections", [])
+            )
+            logger.info(
+                "[SafeView][Violence] detected label=%s confidence=%.3f boxes=%s classes=%s",
+                raw["label"],
+                float(raw["confidence"]),
+                len(raw.get("detections", [])),
+                classes or "-",
+            )
         return {
             "category": CATEGORY,
             "detected": raw["detected"],

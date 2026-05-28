@@ -14,8 +14,11 @@ import violence_loader
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_VIOLENCE_THRESHOLD = 0.50
-YOLO_MIN_BOX_CONF = 0.1
+# violence.pt scores are typically low (often 0.08–0.15 on real positives).
+DEFAULT_VIOLENCE_THRESHOLD = 0.08
+YOLO_MIN_BOX_CONF = 0.05
+# Map user sensitivity (0–1) to an effective box threshold (~0.08 strict → ~0.20 lenient).
+VIOLENCE_THRESHOLD_SPREAD = 0.12
 
 ACTION_BLUR = "BLUR"
 ACTION_ALLOW = "ALLOW"
@@ -27,13 +30,13 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
 
     Args:
         image: RGB frame from the client.
-        sensitivity: User sensitivity; effective threshold is max(0.50, sensitivity) capped at 1.0.
+        sensitivity: User sensitivity from 0.0 (lenient/less alerts) to 1.0 (strict/more alerts).
 
     Returns:
         dict with detected, confidence, action, label, detections (with box when available).
     """
     model = violence_loader.get_model()
-    if model is None or not violence_loader.MODEL_LOADED:
+    if model is None:
         return {
             "confidence": 0.0,
             "detected": False,
@@ -43,7 +46,17 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             "gate_reason": "violence_model_not_loaded",
         }
 
-    effective_threshold = max(DEFAULT_VIOLENCE_THRESHOLD, min(1.0, float(sensitivity)))
+    sensitivity_clamped = min(1.0, max(0.0, float(sensitivity)))
+    effective_threshold = DEFAULT_VIOLENCE_THRESHOLD + (
+        (1.0 - sensitivity_clamped) * VIOLENCE_THRESHOLD_SPREAD
+    )
+    
+    # Cap the threshold range up to 0.18 so the user slider is functional.
+    effective_threshold = max(
+        DEFAULT_VIOLENCE_THRESHOLD,
+        min(0.18, effective_threshold),
+    )
+    
     rgb_image = image.convert("RGB")
     width, height = rgb_image.size
 
@@ -52,6 +65,7 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             rgb_image,
             verbose=False,
             conf=YOLO_MIN_BOX_CONF,
+            iou=0.45,
         )
     except Exception as exc:
         logger.error("[SafeView] Violence inference failed: %s", exc)
@@ -74,14 +88,21 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
         if boxes is not None and len(boxes):
             for index in range(len(boxes)):
                 confidence = float(boxes.conf[index].item())
-                if confidence < effective_threshold:
-                    continue
-
                 class_id = int(boxes.cls[index].item())
                 if isinstance(names, dict):
                     class_name = names.get(class_id, str(class_id))
                 else:
                     class_name = str(class_id)
+
+                logger.debug(
+                    "[SafeView] YOLO detection class=%s confidence=%.3f (threshold=%.3f)",
+                    class_name,
+                    confidence,
+                    effective_threshold,
+                )
+
+                if confidence < effective_threshold:
+                    continue
 
                 x1, y1, x2, y2 = boxes.xyxy[index].tolist()
                 norm_box = [
