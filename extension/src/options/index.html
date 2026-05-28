@@ -56,29 +56,54 @@
 
       <section class="options__section" aria-labelledby="sensitivityHeading">
         <h2 id="sensitivityHeading" class="options__section-title">
-          Sensitivity
+          Detection thresholds
         </h2>
         <div class="options__card">
-          <label class="options__label" for="sensitivitySlider"
-            >Detection threshold</label
-          >
-          <input
-            type="range"
-            id="sensitivitySlider"
-            class="options__slider"
-            min="0"
-            max="2"
-            step="1"
-            value="1"
-          />
-          <div class="options__slider-labels" aria-hidden="true">
-            <span>Low (0.60)</span>
-            <span>Medium (0.75)</span>
-            <span>High (0.90)</span>
+          <div class="options__threshold-row">
+            <label class="options__label" for="nuditySensitivitySlider">
+              Nudity threshold
+            </label>
+            <input
+              type="range"
+              id="nuditySensitivitySlider"
+              class="options__slider"
+              min="0"
+              max="0.9"
+              step="0.01"
+              value="0.75"
+            />
+            <div class="options__slider-labels" aria-hidden="true">
+              <span>0.00</span>
+              <span>0.45</span>
+              <span>0.90</span>
+            </div>
+            <p id="nuditySensitivityValue" class="options__hint">
+              Nudity threshold 0.75
+            </p>
           </div>
-          <p id="sensitivityValue" class="options__hint">
-            Medium — effective floor 0.75 (BR-01)
-          </p>
+
+          <div class="options__threshold-row">
+            <label class="options__label" for="violenceSensitivitySlider">
+              Violence threshold
+            </label>
+            <input
+              type="range"
+              id="violenceSensitivitySlider"
+              class="options__slider"
+              min="0"
+              max="0.9"
+              step="0.01"
+              value="0.75"
+            />
+            <div class="options__slider-labels" aria-hidden="true">
+              <span>0.00</span>
+              <span>0.45</span>
+              <span>0.90</span>
+            </div>
+            <p id="violenceSensitivityValue" class="options__hint">
+              Violence threshold 0.75
+            </p>
+          </div>
         </div>
       </section>
 

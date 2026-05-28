@@ -32,10 +32,10 @@ export function isFrameProtectionActive(settings: SafeViewSettings): boolean {
 }
 
 /**
- * Profanity audio pipeline is disabled by default (no active model in vision path).
+ * True when profanity audio protection should be active on the current page.
  */
-export function isProfanityProtectionActive(_settings: SafeViewSettings): boolean {
-  return false;
+export function isProfanityProtectionActive(settings: SafeViewSettings): boolean {
+  return settings.protectionEnabled && settings.categories.profanity;
 }
 
 /**

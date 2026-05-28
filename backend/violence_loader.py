@@ -24,11 +24,9 @@ _loaded_path: Optional[Path] = None
 
 
 def resolve_weights_path() -> Optional[Path]:
-    """Return violence.pt, or last.pt as fallback when present."""
+    """Return the canonical violence.pt weights path when present."""
     if VIOLENCE_MODEL_PATH.is_file():
         return VIOLENCE_MODEL_PATH
-    if paths.VIOLENCE_MODEL_FALLBACK_PATH.is_file():
-        return paths.VIOLENCE_MODEL_FALLBACK_PATH
     return None
 
 
@@ -54,11 +52,9 @@ def load_model() -> None:
     weights_path = resolve_weights_path()
     if weights_path is None:
         logger.error(
-            "[SafeView] %s not found at %s (fallback %s also missing). "
-            "Violence detection will fail open.",
+            "[SafeView] %s not found at %s. Violence detection will fail open.",
             MODEL_FILENAME,
             VIOLENCE_MODEL_PATH,
-            paths.VIOLENCE_MODEL_FALLBACK_PATH,
         )
         _model = None
         MODEL_LOADED = False

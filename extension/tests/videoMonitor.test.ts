@@ -284,6 +284,7 @@ describe("videoMonitor", () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     const createdCanvas = (document.createElement as jest.Mock).mock.results.find(
       (result) => result.value instanceof HTMLCanvasElement

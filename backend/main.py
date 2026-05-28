@@ -122,8 +122,8 @@ def _build_health_models() -> Dict[str, Any]:
         resolved = violence_loader.resolve_weights_path()
         if resolved is None:
             violence_error = (
-                f"{paths.VIOLENCE_MODEL_PATH.name} not found "
-                f"(fallback {paths.VIOLENCE_MODEL_FALLBACK_PATH.name} also missing)"
+                f"{paths.VIOLENCE_MODEL_PATH.name} not found at "
+                f"{paths.VIOLENCE_MODEL_PATH}"
             )
         else:
             violence_error = "violence weights failed to load — see server logs"
@@ -144,6 +144,70 @@ def _build_health_models() -> Dict[str, Any]:
             error=violence_error,
         ),
     }
+
+
+def _log_analyze_image_result(
+    *,
+    category: str,
+    result: Dict[str, Any],
+    sensitivity: float,
+    inference_ms: float,
+) -> None:
+    """Log test-facing image analysis details without image data."""
+    categories = result.get("categories")
+    if isinstance(categories, dict):
+        for name, entry in categories.items():
+            if isinstance(entry, dict):
+                _log_analyze_image_result(
+                    category=str(name),
+                    result=entry,
+                    sensitivity=sensitivity,
+                    inference_ms=inference_ms,
+                )
+
+    logger.info(
+        (
+            "[SafeView][TEST][Backend][Image] category=%s sensitivity=%.2f "
+            "detected=%s action=%s confidence=%.3f model_loaded=%s "
+            "detections=%s gate=%s inference_ms=%.1f"
+        ),
+        category,
+        sensitivity,
+        bool(result.get("detected", False)),
+        result.get("action", "ALLOW"),
+        float(result.get("confidence", 0.0)),
+        bool(result.get("model_loaded", False)),
+        len(result.get("detections", []) or []),
+        result.get("gate_reason") or "-",
+        inference_ms,
+    )
+
+
+def _log_analyze_audio_result(
+    *,
+    result: Dict[str, Any],
+    language: str,
+    sensitivity: float,
+    audio_bytes: int,
+    inference_ms: float,
+) -> None:
+    """Log test-facing audio analysis details without transcript/profanity words."""
+    logger.info(
+        (
+            "[SafeView][TEST][Backend][Audio] language=%s sensitivity=%.2f "
+            "bytes=%s detected=%s action=%s confidence=%.3f duration_ms=%s "
+            "whisper_loaded=%s inference_ms=%.1f"
+        ),
+        language,
+        sensitivity,
+        audio_bytes,
+        bool(result.get("detected", False)),
+        result.get("action", "ALLOW"),
+        float(result.get("confidence", 0.0)),
+        result.get("duration_ms", 0),
+        bool(result.get("whisper_loaded", False)),
+        inference_ms,
+    )
 
 
 @asynccontextmanager
@@ -239,25 +303,40 @@ async def analyze_image(
         image = Image.open(BytesIO(frame_bytes))
 
         if category_normalized == "all":
+            inference_started = time.perf_counter()
             nudity_result = await asyncio.to_thread(
                 nudity.analyze, image, sensitivity
             )
             violence_result = await asyncio.to_thread(
                 violence.analyze, image, sensitivity
             )
+            inference_ms = (time.perf_counter() - inference_started) * 1000.0
             merged = api_schema.merge_category_results(nudity_result, violence_result)
+            _log_analyze_image_result(
+                category="all",
+                result=merged,
+                sensitivity=sensitivity,
+                inference_ms=inference_ms,
+            )
             return merged
 
         analyze_fn = CATEGORY_ANALYZERS[category_normalized]
         inference_started = time.perf_counter()
         result = await asyncio.to_thread(analyze_fn, image, sensitivity)
         inference_ms = (time.perf_counter() - inference_started) * 1000.0
+        normalized = api_schema.normalize_analyze_response(result, category_normalized)
         logger.info(
             "[SafeView][Latency] analyze-image category=%s inference=%.1fms",
             category_normalized,
             inference_ms,
         )
-        return api_schema.normalize_analyze_response(result, category_normalized)
+        _log_analyze_image_result(
+            category=category_normalized,
+            result=normalized,
+            sensitivity=sensitivity,
+            inference_ms=inference_ms,
+        )
+        return normalized
     except HTTPException:
         raise
     except Exception as exc:
@@ -301,12 +380,22 @@ async def analyze_audio(
         )
 
     try:
+        inference_started = time.perf_counter()
         audio_bytes = await audio_chunk.read()
-        return profanity.analyze_audio(
+        result = profanity.analyze_audio(
             audio_bytes,
             language_normalized,
             sensitivity,
         )
+        inference_ms = (time.perf_counter() - inference_started) * 1000.0
+        _log_analyze_audio_result(
+            result=result,
+            language=language_normalized,
+            sensitivity=sensitivity,
+            audio_bytes=len(audio_bytes),
+            inference_ms=inference_ms,
+        )
+        return result
     except HTTPException:
         raise
     except Exception as exc:

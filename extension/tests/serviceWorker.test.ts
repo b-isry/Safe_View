@@ -58,6 +58,8 @@ const defaultSettings = {
   protectionEnabled: true,
   backendUrl: "http://localhost:8000",
   sensitivity: 0.75,
+  nuditySensitivity: 0.75,
+  violenceSensitivity: 0.75,
   categories: {
     nudity: true,
     violence: false,
@@ -226,12 +228,12 @@ describe("serviceWorker", () => {
     );
   });
 
-  it("blurs when score is at or above 50% threshold", async () => {
+  it("blurs when score is at or above UI sensitivity", async () => {
     mockAnalyzeImage.mockResolvedValue({
       response: {
         category: "nudity",
         detected: true,
-        confidence: 0.68,
+        confidence: 0.75,
         action: "BLUR",
         label: "NSFW",
         model_loaded: true,

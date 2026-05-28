@@ -9,10 +9,8 @@ import {
 } from "./stableBlurDecision";
 import {
   AFTER_UNSAFE_SAFE_CLEAR_STREAK,
-  NUDITY_THRESHOLD,
   UNSAFE_LOCK_MS,
   UNSAFE_TTL_MS,
-  VIOLENCE_THRESHOLD,
 } from "./latencyPolicy";
 export { shouldBlurWebsiteImage } from "../shared/imageBlurDecision";
 
@@ -42,6 +40,7 @@ export interface FrameBlurState {
   nudityAction: "BLUR" | "ALLOW" | null;
   violenceAction?: "BLUR" | "ALLOW" | null;
   violenceDetections?: DetectionBox[];
+  sensitivity: number;
   contentType: ContentTypeGate | null;
   gateReason: string | null;
   frameSeq: number;
@@ -66,7 +65,7 @@ export function shouldBlurFrame(
     AnalyzeImageResponse,
     "model_loaded" | "action" | "detected" | "confidence"
   >,
-  threshold: number = NUDITY_THRESHOLD
+  threshold: number
 ): boolean {
   return shouldBlurResponse(response, threshold);
 }
@@ -90,50 +89,27 @@ export function shouldBlurResponse(
   return response.confidence >= threshold;
 }
 
-function violenceHasBoxes(detections: DetectionBox[] | undefined): boolean {
-  if (!detections?.length) {
-    return false;
-  }
-  return detections.some(
-    (entry) =>
-      Array.isArray(entry.box) &&
-      entry.box.length === 4 &&
-      entry.box[2] > entry.box[0] &&
-      entry.box[3] > entry.box[1]
-  );
-}
-
 function resolveBlurMode(state: FrameBlurState): {
   blur: boolean;
   mode: BlurMode;
   detections: DetectionBox[];
   reason: string;
 } {
+  const threshold = Math.max(0, Math.min(1, state.sensitivity));
+  const violenceBlur =
+    state.violenceAction === "BLUR" && state.violenceDetected === true;
+
+  if (violenceBlur) {
+    return { blur: true, mode: "full", detections: [], reason: "violence_full" };
+  }
+
   const nudityBlur =
     state.nudityAction === "BLUR" &&
     state.nudityDetected &&
-    state.score >= NUDITY_THRESHOLD;
+    state.score >= threshold;
 
   if (nudityBlur) {
     return { blur: true, mode: "full", detections: [], reason: "nudity_full" };
-  }
-
-  const violenceBlur =
-    state.violenceAction === "BLUR" &&
-    state.violenceDetected === true &&
-    (state.violenceScore ?? 0) >= VIOLENCE_THRESHOLD;
-
-  if (violenceBlur) {
-    const detections = state.violenceDetections ?? [];
-    if (violenceHasBoxes(detections)) {
-      return {
-        blur: true,
-        mode: "regions",
-        detections,
-        reason: "violence_regions",
-      };
-    }
-    return { blur: true, mode: "full", detections: [], reason: "violence_full_fallback" };
   }
 
   return { blur: false, mode: "none", detections: [], reason: "safe" };
@@ -265,6 +241,7 @@ export interface DemoBlurSwitchInput {
   resultGeneration: number;
   currentGeneration: number;
   backendTrusted: boolean;
+  sensitivity: number;
 }
 
 /**
@@ -289,6 +266,7 @@ export function evaluateDemoBlurSwitch(
     resultGeneration: input.resultGeneration,
     currentGeneration: input.currentGeneration,
     backendTrusted: input.backendTrusted,
+    sensitivity: input.sensitivity,
     nowMs: input.nowMs,
   });
 

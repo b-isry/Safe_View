@@ -665,6 +665,57 @@ export interface FrameAnalysisOutcome {
 }
 
 /**
+ * Test-facing trace for each enabled visual protection.
+ */
+function logVisionTestTrace(
+  outcome: FrameAnalysisOutcome,
+  settings: SafeViewSettings,
+  meta: {
+    tabId: number;
+    videoId: number;
+    frameSeq: number;
+    backendMs: number;
+  }
+): void {
+  const base =
+    "tab=%s video=%s frame=%s threshold=%s backendMs=%s backendTrusted=%s modelLoaded=%s";
+
+  if (outcome.categories.includes("nudity")) {
+    console.info(
+      `[SafeView][TEST][Nudity] result ${base} detected=%s action=%s score=%s gate=%s`,
+      meta.tabId,
+      meta.videoId,
+      meta.frameSeq,
+      settings.nuditySensitivity.toFixed(2),
+      meta.backendMs,
+      outcome.backendTrusted,
+      outcome.modelLoaded,
+      outcome.nudityDetected,
+      outcome.nudityAction ?? "none",
+      outcome.score.toFixed(3),
+      outcome.gateReason ?? "-"
+    );
+  }
+
+  if (outcome.categories.includes("violence")) {
+    console.info(
+      `[SafeView][TEST][Violence] result ${base} detected=%s action=%s score=%s boxes=%s blurMode=full`,
+      meta.tabId,
+      meta.videoId,
+      meta.frameSeq,
+      settings.violenceSensitivity.toFixed(2),
+      meta.backendMs,
+      outcome.backendTrusted,
+      outcome.modelLoaded,
+      outcome.violenceDetected,
+      outcome.violenceAction ?? "none",
+      outcome.violenceScore.toFixed(3),
+      outcome.violenceDetections.length
+    );
+  }
+}
+
+/**
  * Run enabled /analyze-image checks (nudity and/or violence).
  */
 export async function analyzeFrameAgainstEnabledCategories(
@@ -673,9 +724,7 @@ export async function analyzeFrameAgainstEnabledCategories(
   signal?: AbortSignal
 ): Promise<FrameAnalysisOutcome> {
   const runNudity = isNudityProtectionActive(settings);
-  const runViolence = DEMO_CLASSIFIER_SWITCH
-    ? false
-    : isViolenceProtectionActive(settings);
+  const runViolence = isViolenceProtectionActive(settings);
 
   const empty: FrameAnalysisOutcome = {
     label: "SFW",
@@ -697,10 +746,10 @@ export async function analyzeFrameAgainstEnabledCategories(
     return empty;
   }
 
-  if (DEMO_CLASSIFIER_SWITCH && runNudity) {
+  if (DEMO_CLASSIFIER_SWITCH && runNudity && !runViolence) {
     const nudityResult = await analyzeImage(
       frame,
-      settings.sensitivity,
+      settings.nuditySensitivity,
       "nudity",
       signal
     );
@@ -744,25 +793,17 @@ export async function analyzeFrameAgainstEnabledCategories(
     categories.push("violence");
   }
 
-  const useAll = runNudity && runViolence;
-
   let nudityResult: Awaited<ReturnType<typeof analyzeImage>> = null;
   let violenceResult: Awaited<ReturnType<typeof analyzeImage>> = null;
 
-  if (useAll) {
-    const allResult = await analyzeImage(frame, settings.sensitivity, "all", signal);
-    nudityResult = allResult;
-    violenceResult = allResult;
-  } else {
-    [nudityResult, violenceResult] = await Promise.all([
-      runNudity
-        ? analyzeImage(frame, settings.sensitivity, "nudity", signal)
-        : Promise.resolve(null),
-      runViolence
-        ? analyzeImage(frame, settings.sensitivity, "violence", signal)
-        : Promise.resolve(null),
-    ]);
-  }
+  [nudityResult, violenceResult] = await Promise.all([
+    runNudity
+      ? analyzeImage(frame, settings.nuditySensitivity, "nudity", signal)
+      : Promise.resolve(null),
+    runViolence
+      ? analyzeImage(frame, settings.violenceSensitivity, "violence", signal)
+      : Promise.resolve(null),
+  ]);
 
   const results = [nudityResult, violenceResult].filter(
     (entry): entry is NonNullable<typeof entry> => entry !== null
@@ -775,7 +816,6 @@ export async function analyzeFrameAgainstEnabledCategories(
   const backendTrusted = results.every(
     (entry) => entry.backendOnline && !entry.fromFallback
   );
-  const modelLoaded = results.every((entry) => Boolean(entry.response.model_loaded));
 
   if (!backendTrusted) {
     return { ...empty, categories, backendTrusted: false, modelLoaded: false };
@@ -783,14 +823,6 @@ export async function analyzeFrameAgainstEnabledCategories(
 
   let nudityResponse = nudityResult?.response;
   let violenceResponse = violenceResult?.response;
-
-  if (useAll && nudityResult?.response.categories) {
-    nudityResponse = nudityResult.response.categories.nudity ?? nudityResponse;
-    violenceResponse = nudityResult.response.categories.violence ?? violenceResponse;
-  } else if (useAll) {
-    nudityResponse = nudityResult?.response;
-    violenceResponse = nudityResult?.response;
-  }
 
   const nudityScore = nudityResponse?.confidence ?? 0;
   const violenceScore = violenceResponse?.confidence ?? 0;
@@ -802,6 +834,9 @@ export async function analyzeFrameAgainstEnabledCategories(
   const contentType = nudityResponse?.content_type ?? null;
   const gateReason =
     nudityResponse?.gate_reason ?? contentType?.gate_reason ?? null;
+  const modelLoaded =
+    (runNudity && Boolean(nudityResponse?.model_loaded)) ||
+    (runViolence && Boolean(violenceResponse?.model_loaded));
 
   return {
     label: displayLabel,
@@ -1085,6 +1120,13 @@ async function processFrameSample(
     const frameSeq = message.frameSeq ?? 0;
     const nowMs = Date.now();
 
+    logVisionTestTrace(outcome, settings, {
+      tabId,
+      videoId: message.videoId,
+      frameSeq,
+      backendMs: inferenceMs,
+    });
+
     const nudityResponse: AnalyzeImageResponse = {
       category: "nudity",
       detected: outcome.nudityDetected,
@@ -1102,7 +1144,10 @@ async function processFrameSample(
     };
 
     if (message.mediaType === "image") {
-      const blur = shouldBlurWebsiteImage(nudityResponse);
+      const blur = shouldBlurWebsiteImage(
+        nudityResponse,
+        settings.nuditySensitivity
+      );
       const imageDecision = blur ? "BLUR" : "CLEAR";
       const imageReason = !outcome.backendTrusted
         ? "backend_offline"
@@ -1161,7 +1206,11 @@ async function processFrameSample(
       return;
     }
 
-    const demoEvaluation = DEMO_CLASSIFIER_SWITCH
+    const forceViolenceFullBlur =
+      outcome.violenceDetected && outcome.violenceAction === "BLUR";
+
+    const demoEvaluation =
+      DEMO_CLASSIFIER_SWITCH && !forceViolenceFullBlur && !pipeline.unsafeSeen
       ? evaluateDemoBlurSwitch({
         response: nudityResponse,
         frameSeq,
@@ -1171,13 +1220,20 @@ async function processFrameSample(
         resultGeneration: generationAtStart,
         currentGeneration: pipeline.generation,
         backendTrusted: outcome.backendTrusted,
+        sensitivity: settings.nuditySensitivity,
         stableState: pipeline.stableBlur,
         nowMs,
       })
       : null;
 
-    const evaluation = demoEvaluation
-      ?? evaluateBlurState({
+    const evaluation = forceViolenceFullBlur
+      ? {
+        action: "BLUR" as const,
+        reason: "violence_full",
+        blurMode: "full" as const,
+        detections: [],
+      }
+      : (demoEvaluation ?? evaluateBlurState({
         score: outcome.score,
         violenceScore: outcome.violenceScore,
         nudityDetected: outcome.nudityDetected,
@@ -1195,6 +1251,7 @@ async function processFrameSample(
               ? "ALLOW"
               : null,
         violenceDetections: outcome.violenceDetections,
+        sensitivity: settings.nuditySensitivity,
         contentType: outcome.contentType,
         gateReason: outcome.gateReason,
         frameSeq,
@@ -1211,7 +1268,7 @@ async function processFrameSample(
         unsafeLockUntil: pipeline.unsafeLockUntil,
         lastUnsafeAt: pipeline.lastUnsafeAt,
         nowMs,
-      });
+      }));
 
     if (demoEvaluation?.stableState) {
       pipeline.stableBlur = demoEvaluation.stableState;
@@ -1282,7 +1339,7 @@ async function processFrameSample(
       return;
     }
 
-    if (!DEMO_CLASSIFIER_SWITCH) {
+    if (!DEMO_CLASSIFIER_SWITCH || forceViolenceFullBlur || pipeline.unsafeSeen) {
       const updates = applyBlurStateUpdates(
         {
           unsafeSeen: pipeline.unsafeSeen,
@@ -1348,14 +1405,20 @@ async function processFrameSample(
       );
       await sendBlurCommand(tabId, MESSAGE_ACTION_BLUR, message.videoId, {
         ...trace,
-        blurMode: DEMO_CLASSIFIER_SWITCH
-          ? "full"
-          : evaluation.action === "BLUR" && evaluation.blurMode === "regions"
-            ? "regions"
-            : "full",
+        blurMode: "full",
         detections:
-          evaluation.action === "BLUR" ? evaluation.detections : undefined,
+          evaluation.action === "BLUR" && evaluation.blurMode === "regions"
+            ? evaluation.detections
+            : undefined,
       });
+      console.info(
+        "[SafeView][TEST][VisionCommand] sent action=BLUR mode=full reason=%s nudityDetected=%s violenceDetected=%s nudityScore=%s violenceScore=%s",
+        evaluation.reason,
+        outcome.nudityDetected,
+        outcome.violenceDetected,
+        outcome.score.toFixed(3),
+        outcome.violenceScore.toFixed(3)
+      );
     } else if (evaluation.action === "CLEAR") {
       logPipelineLatency(
         tabId,
@@ -1367,6 +1430,14 @@ async function processFrameSample(
         inferenceMs
       );
       await sendBlurCommand(tabId, MESSAGE_ACTION_CLEAR, message.videoId, trace);
+      console.info(
+        "[SafeView][TEST][VisionCommand] sent action=CLEAR reason=%s nudityDetected=%s violenceDetected=%s nudityScore=%s violenceScore=%s",
+        evaluation.reason,
+        outcome.nudityDetected,
+        outcome.violenceDetected,
+        outcome.score.toFixed(3),
+        outcome.violenceScore.toFixed(3)
+      );
     }
   } catch (error) {
     if (isAbortError(error)) {
@@ -1394,6 +1465,7 @@ async function processFrameSample(
         resultGeneration: generationAtStart,
         currentGeneration: pipeline.generation,
         backendTrusted: false,
+        sensitivity: getCachedSettings().nuditySensitivity,
         stableState: pipeline.stableBlur,
         nowMs: Date.now(),
       });
@@ -1706,8 +1778,22 @@ export async function handlePipelineAudioChunk(
   message: PipelineAudioChunkMessage,
   tabId: number
 ): Promise<void> {
+  const settings = await loadSettings();
+  if (!isProfanityProtectionActive(settings)) {
+    console.info(
+      "[SafeView][TEST][Profanity] skipped reason=disabled tab=%s",
+      tabId
+    );
+    return;
+  }
+
   const current = audioProcessingCount.get(tabId) ?? 0;
   if (current >= MAX_CONCURRENT_AUDIO) {
+    console.info(
+      "[SafeView][TEST][Profanity] skipped reason=max_in_flight tab=%s inFlight=%s",
+      tabId,
+      current
+    );
     return;
   }
 
@@ -1719,24 +1805,46 @@ export async function handlePipelineAudioChunk(
     const audioBase64 = resolvePipelineAudioBase64(message);
     if (!audioBase64) {
       console.warn("[SafeView] AUDIO_CHUNK_PIPELINE missing audio payload.");
+      console.info(
+        "[SafeView][TEST][Profanity] skipped reason=missing_payload tab=%s",
+        tabId
+      );
       return;
     }
 
     const audio = base64ToBlob(audioBase64, "audio/webm");
     if (!audio) {
+      console.info(
+        "[SafeView][TEST][Profanity] skipped reason=decode_failed tab=%s payloadLen=%s",
+        tabId,
+        audioBase64.length
+      );
       return;
     }
 
+    console.info(
+      "[SafeView][TEST][Profanity] chunk tab=%s language=%s sensitivity=%s payloadLen=%s blobBytes=%s",
+      tabId,
+      settings.language,
+      settings.nuditySensitivity.toFixed(2),
+      audioBase64.length,
+      audio.size
+    );
+
     const result = await analyzeAudio(
       audio,
-      "en" // pipeline always english — subtitle path handles language switching
+      settings.language
     );
 
     console.info(
-      "[SafeView][Audio-5] Backend response: detected=%s, confidence=%s, action=%s, whisper_loaded=%s",
+      "[SafeView][TEST][Profanity] backend tab=%s online=%s fallback=%s detected=%s confidence=%s action=%s durationMs=%s whisperLoaded=%s",
+      tabId,
+      result.backendOnline,
+      result.fromFallback,
       result.response.detected,
       result.response.confidence,
       result.response.action,
+      result.response.duration_ms,
       result.response.whisper_loaded
     );
 
@@ -1751,13 +1859,24 @@ export async function handlePipelineAudioChunk(
           : PROFANITY_MUTE_DURATION_MS;
 
       console.info(
-        "[SafeView][Audio-6] Profanity confirmed — sending ELEMENT_MUTE_GAIN (%sms)",
+        "[SafeView][Audio-6] Profanity confirmed — sending gain mute (%sms)",
         durationMs
       );
       console.info(
         "[SafeView] Profanity detected in pipeline — triggering gain mute"
       );
       await sendPipelineMuteGain(durationMs);
+      console.info(
+        "[SafeView][TEST][Profanity] command=MUTE_GAIN tab=%s durationMs=%s path=%s",
+        tabId,
+        durationMs,
+        audioPipelineMode ?? "unknown"
+      );
+    } else {
+      console.info(
+        "[SafeView][TEST][Profanity] command=ALLOW tab=%s reason=no_detection",
+        tabId
+      );
     }
   } catch (error) {
     console.error("[SafeView] Pipeline audio chunk handling failed:", error);
@@ -1780,6 +1899,10 @@ export async function handleAudioChunk(
   const settings = await loadSettings();
 
   if (!settings.protectionEnabled || !settings.categories.profanity) {
+    console.info(
+      "[SafeView][TEST][Profanity] skipped reason=disabled tab=%s path=content_audio_chunk",
+      tabId
+    );
     return;
   }
 
@@ -1787,19 +1910,49 @@ export async function handleAudioChunk(
 
   if (!audio) {
     console.warn("[SafeView] AUDIO_CHUNK ignored — invalid audio buffer.");
+    console.info(
+      "[SafeView][TEST][Profanity] skipped reason=invalid_audio tab=%s video=%s path=content_audio_chunk",
+      tabId,
+      message.videoId
+    );
     return;
   }
 
   const language = message.language === "am" ? "am" : "en";
 
   try {
-    const result = await analyzeAudio(audio, language, settings.sensitivity);
+    console.info(
+      "[SafeView][TEST][Profanity] chunk tab=%s video=%s language=%s sensitivity=%s path=content_audio_chunk",
+      tabId,
+      message.videoId,
+      language,
+      settings.nuditySensitivity.toFixed(2)
+    );
+    const result = await analyzeAudio(audio, language, settings.nuditySensitivity);
+
+    console.info(
+      "[SafeView][TEST][Profanity] backend tab=%s video=%s online=%s fallback=%s detected=%s confidence=%s action=%s durationMs=%s whisperLoaded=%s path=content_audio_chunk",
+      tabId,
+      message.videoId,
+      result.backendOnline,
+      result.fromFallback,
+      result.response.detected,
+      result.response.confidence,
+      result.response.action,
+      result.response.duration_ms,
+      result.response.whisper_loaded
+    );
 
     if (
       !result.backendOnline ||
       result.fromFallback ||
       (!result.response.detected && result.response.action !== "MUTE")
     ) {
+      console.info(
+        "[SafeView][TEST][Profanity] command=ALLOW tab=%s video=%s reason=no_detection path=content_audio_chunk",
+        tabId,
+        message.videoId
+      );
       return;
     }
 
@@ -1810,6 +1963,12 @@ export async function handleAudioChunk(
 
     console.info("[SafeView] Profanity detected — sending MUTE to tab.");
     await sendMuteCommand(tabId, message.videoId, durationMs);
+    console.info(
+      "[SafeView][TEST][Profanity] command=MUTE tab=%s video=%s durationMs=%s path=content_audio_chunk",
+      tabId,
+      message.videoId,
+      durationMs
+    );
   } catch (error) {
     console.error("[SafeView] Audio chunk handling failed — failing open:", error);
   }
@@ -1852,6 +2011,58 @@ async function sendWithRetry(
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
+}
+
+/**
+ * Ensure the offscreen document that owns tab-capture audio is available.
+ */
+async function ensureOffscreenAudioDocument(): Promise<void> {
+  if (!chrome.offscreen?.createDocument) {
+    throw new Error("chrome.offscreen is unavailable");
+  }
+
+  const hasDocument =
+    typeof chrome.offscreen.hasDocument === "function"
+      ? await chrome.offscreen.hasDocument()
+      : false;
+
+  if (hasDocument) {
+    return;
+  }
+
+  await chrome.offscreen.createDocument({
+    url: OFFSCREEN_AUDIO_PROCESSOR_URL,
+    reasons: [chrome.offscreen.Reason.USER_MEDIA],
+    justification:
+      "Capture tab audio for local Whisper profanity detection and delayed mute.",
+  });
+}
+
+/**
+ * Request a tab-capture stream id from the user-gesture popup message.
+ */
+async function getTabCaptureStreamId(tabId: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
+      const error = chrome.runtime.lastError;
+      if (error || !streamId) {
+        reject(new Error(error?.message ?? "Could not create tab capture stream"));
+        return;
+      }
+
+      resolve(streamId);
+    });
+  });
+}
+
+async function setTabSpeakerSuppressed(
+  tabId: number,
+  suppress: boolean
+): Promise<void> {
+  await sendWithRetry(tabId, {
+    action: MESSAGE_ACTION_SET_TAB_SPEAKER_SUPPRESSED,
+    suppress,
+  });
 }
 
 async function triggerElementAudioFallback(
@@ -1922,7 +2133,7 @@ async function resetPipelineGainsForActiveTab(reason: string): Promise<void> {
  * @param durationMs - BR-05 mute duration.
  */
 async function sendPipelineMuteGain(durationMs: number): Promise<void> {
-  if (activeAudioPipelineTabId !== undefined) {
+  if (audioPipelineMode === "element" && activeAudioPipelineTabId !== undefined) {
     try {
       await chrome.tabs.sendMessage(activeAudioPipelineTabId, {
         action: MESSAGE_ACTION_ELEMENT_MUTE_GAIN,
@@ -1956,24 +2167,36 @@ export async function startAudioPipelineWithStream(
  * @param tabId - Chrome tab to route audio from.
  */
 export async function startAudioPipeline(tabId: number): Promise<void> {
-  const settings = getCachedSettings();
+  const settings = await loadSettings();
   if (!isProfanityProtectionActive(settings)) {
     console.info(
-      "[SafeView] Profanity off — not starting element audio pipeline."
+      "[SafeView] Profanity off — not starting audio pipeline."
     );
     return;
   }
 
   try {
-    await sendWithRetry(tabId, {
-      action: MESSAGE_ACTION_START_ELEMENT_AUDIO_FALLBACK,
+    await ensureOffscreenAudioDocument();
+    const streamId = await getTabCaptureStreamId(tabId);
+    await chrome.runtime.sendMessage({
+      action: MESSAGE_ACTION_INIT_AUDIO_PIPELINE,
+      streamId,
       tabId,
     });
-    audioPipelineMode = "element";
+    audioPipelineMode = "offscreen";
     activeAudioPipelineTabId = tabId;
-    console.info("[SafeView] Element audio pipeline started for tab %s.", tabId);
+    try {
+      await setTabSpeakerSuppressed(tabId, true);
+    } catch (suppressError) {
+      console.warn("[SafeView] Could not suppress native tab speakers:", suppressError);
+    }
+    console.info("[SafeView] Offscreen audio pipeline started for tab %s.", tabId);
   } catch (error) {
-    console.error("[SafeView] Failed to start audio pipeline:", error);
+    console.warn(
+      "[SafeView] Offscreen audio pipeline failed; trying element fallback:",
+      error
+    );
+    await triggerElementAudioFallback(tabId, "offscreen-start-failed");
   }
 }
 
@@ -1987,13 +2210,24 @@ export async function stopAudioPipeline(reason = "unknown"): Promise<void> {
 
   const pipelineTabId = activeAudioPipelineTabId;
 
-  if (pipelineTabId !== undefined) {
+  if (pipelineTabId !== undefined && audioPipelineMode === "element") {
     try {
       await chrome.tabs.sendMessage(pipelineTabId, {
         action: MESSAGE_ACTION_STOP_ELEMENT_AUDIO_FALLBACK,
       });
     } catch {
       /* Tab may have closed. */
+    }
+  }
+
+  if (audioPipelineMode === "offscreen") {
+    await stopOffscreenPipelineOnly();
+    if (pipelineTabId !== undefined) {
+      try {
+        await setTabSpeakerSuppressed(pipelineTabId, false);
+      } catch {
+        /* Content script may not be reachable during shutdown. */
+      }
     }
   }
 
@@ -2018,14 +2252,6 @@ async function sendMuteGainToOffscreen(
   } catch (error) {
     console.warn("[SafeView] Could not deliver MUTE_GAIN to offscreen:", error);
   }
-}
-
-/**
- * Read whether protection is enabled from storage (BR-04).
- */
-async function getProtectionState(): Promise<boolean> {
-  const settings = await loadSettings();
-  return settings.protectionEnabled;
 }
 
 /**
@@ -2054,8 +2280,8 @@ function setupTabActivationListener(): void {
 
   chrome.tabs.onActivated.addListener((activeInfo) => {
     void (async () => {
-      const isProtectionOn = await getProtectionState();
-      if (!isProtectionOn) {
+      const settings = await loadSettings();
+      if (!settings.protectionEnabled || !isProfanityProtectionActive(settings)) {
         return;
       }
 
@@ -2063,7 +2289,11 @@ function setupTabActivationListener(): void {
         return;
       }
 
-      console.info('[SafeView] Tab switched — user must re-enable protection from popup for audio pipeline on new tab.');
+      console.info(
+        "[SafeView] Tab switched — auto-starting profanity audio pipeline for tab %s.",
+        activeInfo.tabId
+      );
+      void startAudioPipeline(activeInfo.tabId);
     })().catch((error) => {
       console.error("[SafeView] Tab activation handler failed:", error);
     });
@@ -2289,11 +2519,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === MESSAGE_ACTION_TAB_CAPTURE_INIT_FAILED) {
     sendResponse({ received: true });
-    const failMessage = message as { error?: string };
+    const failMessage = message as { error?: string; tabId?: number };
     console.error(
       "[SafeView] TAB_CAPTURE_INIT_FAILED received, error=%s",
       failMessage.error ?? "(none)"
     );
+    if (typeof failMessage.tabId === "number") {
+      void triggerElementAudioFallback(
+        failMessage.tabId,
+        "offscreen-init-failed"
+      ).catch((error) => {
+        console.warn("[SafeView] Element fallback after tab-capture failure failed:", error);
+      });
+    }
     return false;
   }
 

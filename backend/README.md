@@ -6,6 +6,8 @@ Shared FastAPI AI server for the browser extension and Android app. Runs on `htt
 
 - Python 3.10 or newer
 - Team model weights: `dino_v3_linear.pth` (provided by the project team)
+- Violence weights: `violence.pt` (Ultralytics YOLO, placed under `backend/models/`)
+- System `ffmpeg` on `PATH` for pydub/Whisper WebM-to-WAV conversion
 
 ## Setup (virtual environment)
 
@@ -34,10 +36,22 @@ Copy the team weights into this exact path (filename must match):
 ```
 backend/
 └── models/
-    └── dino_v3_linear.pth
+    ├── dino_v3_linear.pth
+    └── violence.pt
 ```
 
 If the file is missing, the server still starts but nudity requests **fail open** (`detected: false`, `model_loaded: false` in responses).
+If `violence.pt` is missing, violence requests also **fail open** and `/health` reports `models.violence.loaded: false`.
+
+## Audio profanity prerequisites
+
+`openai-whisper` and `pydub` are installed from `requirements.txt`. Whisper uses ffmpeg through pydub to decode browser `audio/webm` chunks, so install ffmpeg separately and confirm it is available on `PATH`:
+
+```powershell
+ffmpeg -version
+```
+
+The backend loads profanity terms from `backend/data/blacklist_en.json` and `backend/data/blacklist_am.json`. Detection logs only boolean status and transcript length; it does not log matched profanity words.
 
 ## Run the server
 
@@ -76,8 +90,9 @@ Tests cover:
 
 - `GET /health` response shape
 - `POST /analyze-image` with a blank JPEG
-- BR-01 confidence floor (`max(0.75, sensitivity)`)
-- Stub categories always return `detected: false`
+- UI sensitivity is used directly as the detection threshold
+- `POST /analyze-image` with `category=violence` and `category=all`
+- `POST /analyze-audio` fail-open behavior for silent chunks
 
 ## API quick reference
 
@@ -86,6 +101,11 @@ Tests cover:
 ```json
 {
   "status": "ok",
+  "backend": "running",
+  "models": {
+    "nudity": { "loaded": true },
+    "violence": { "loaded": true }
+  },
   "model": "dino_v3_linear",
   "model_loaded": true,
   "whisper_loaded": true
@@ -99,8 +119,8 @@ Multipart form fields:
 | Field         | Type   | Description                                      |
 |---------------|--------|--------------------------------------------------|
 | `frame`       | file   | JPEG image bytes                                 |
-| `sensitivity` | float  | 0.0–1.0 (BR-01 floor: effective ≥ 0.75)          |
-| `category`    | string | `nudity`, `violence`, `kissing`, `profanity`, `lgbtq` |
+| `sensitivity` | float  | 0.0–1.0 detection threshold from the UI          |
+| `category`    | string | `nudity`, `violence`, `all` |
 
 Example response:
 
@@ -130,12 +150,12 @@ Example response:
 {
   "detected": true,
   "action": "MUTE",
-  "duration_ms": 1500,
+  "duration_ms": 3500,
   "whisper_loaded": true
 }
 ```
 
-`duration_ms` is always `1500` (BR-05). If Whisper failed to load at startup, `whisper_loaded` is `false` and `detected` is `false`.
+If Whisper failed to load at startup or ffmpeg cannot decode the WebM chunk, `whisper_loaded` is `false` or detection fails open with `detected: false`.
 
 ## Clients
 

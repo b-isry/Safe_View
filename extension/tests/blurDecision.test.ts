@@ -9,11 +9,12 @@ import {
 } from "../src/background/blurDecision";
 import { createStableBlurState } from "../src/background/stableBlurDecision";
 import {
-  BLUR_ON_THRESHOLD,
   MIN_BLUR_HOLD_MS,
   SAFE_FRAMES_TO_CLEAR,
 } from "../src/shared/stableBlurPolicy";
 import { UNSAFE_LOCK_MS } from "../src/background/latencyPolicy";
+
+const UI_SENSITIVITY = 0.5;
 
 const baseState = {
   score: 0,
@@ -22,6 +23,7 @@ const baseState = {
   nudityAction: null as "BLUR" | "ALLOW" | null,
   violenceAction: null as "BLUR" | "ALLOW" | null,
   violenceDetections: [],
+  sensitivity: UI_SENSITIVITY,
   contentType: null,
   gateReason: null,
   frameSeq: 10,
@@ -48,6 +50,7 @@ const demoBase = {
   resultGeneration: 3,
   currentGeneration: 3,
   backendTrusted: true,
+  sensitivity: UI_SENSITIVITY,
   stableState: createStableBlurState(),
   nowMs: 50_000,
 };
@@ -62,7 +65,7 @@ describe("blurDecision", () => {
           detected: true,
           confidence: 0.91,
         },
-        BLUR_ON_THRESHOLD
+        UI_SENSITIVITY
       )
     ).toBe(true);
 
@@ -74,7 +77,7 @@ describe("blurDecision", () => {
           detected: false,
           confidence: 0.91,
         },
-        BLUR_ON_THRESHOLD
+        UI_SENSITIVITY
       )
     ).toBe(false);
   });
@@ -232,7 +235,7 @@ describe("blurDecision", () => {
     ).toEqual({ action: "DROP", reason: "stale_frame" });
   });
 
-  it("BLUR when violence meets threshold with region boxes", () => {
+  it("BLURs the full frame when violence is detected", () => {
     const evaluation = evaluateBlurState({
       ...baseState,
       violenceScore: 0.88,
@@ -244,7 +247,7 @@ describe("blurDecision", () => {
     });
     expect(evaluation.action).toBe("BLUR");
     if (evaluation.action === "BLUR") {
-      expect(evaluation.blurMode).toBe("regions");
+      expect(evaluation.blurMode).toBe("full");
     }
   });
 

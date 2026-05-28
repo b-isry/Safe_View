@@ -15,11 +15,13 @@ import romance_loader
 
 logger = logging.getLogger(__name__)
 
-# BR-01: minimum confidence regardless of user sensitivity
-CONFIDENCE_FLOOR = 0.75
-
 ACTION_BLUR = "BLUR"
 ACTION_ALLOW = "ALLOW"
+
+
+def normalize_sensitivity(sensitivity: float) -> float:
+    """Clamp the UI sensitivity to the valid confidence range."""
+    return max(0.0, min(1.0, float(sensitivity)))
 
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
@@ -38,7 +40,7 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
 
 def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
     """
-    Run romance/kissing classification and apply BR-01 threshold.
+    Run romance/kissing classification and apply the UI sensitivity threshold.
 
     Returns sigmoid romance probability as confidence.
     """
@@ -51,7 +53,7 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             "label": "SFW",
         }
 
-    effective_threshold = max(CONFIDENCE_FLOOR, sensitivity)
+    effective_threshold = normalize_sensitivity(sensitivity)
 
     try:
         batch = preprocess_image(image)

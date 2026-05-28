@@ -24,7 +24,7 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
 
     Args:
         image: Decoded JPEG frame from the client.
-        sensitivity: User sensitivity (0.0–1.0); BR-01 floor still applies.
+        sensitivity: User sensitivity (0.0–1.0) used directly as threshold.
 
     Returns:
         dict: category, detected, confidence, action, label, model_loaded.

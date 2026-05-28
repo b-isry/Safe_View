@@ -46,6 +46,8 @@ describe("aiClient", () => {
       protectionEnabled: true,
       backendUrl: "http://localhost:8000",
       sensitivity: 0.75,
+      nuditySensitivity: 0.75,
+      violenceSensitivity: 0.75,
       categories: { nudity: true, violence: false, kissing: false, profanity: false, lgbtq: false },
     };
     global.fetch = jest.fn();

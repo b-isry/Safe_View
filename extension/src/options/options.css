@@ -135,6 +135,12 @@ body {
   accent-color: var(--color-accent);
 }
 
+.options__threshold-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .options__slider-labels {
   display: flex;
   justify-content: space-between;

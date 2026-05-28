@@ -13,7 +13,6 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-UNSAFE_THRESHOLD = 0.72
 GATE_SAMPLE_SIZE = 128
 
 # Heuristic thresholds tuned for cartoon/anime vs live-action footage.
@@ -148,12 +147,13 @@ def build_gated_nudity_response(
     nudity_confidence: float,
     nudity_positive: bool,
     model_loaded: bool,
+    threshold: float,
 ) -> Dict[str, Any]:
     """
-    Apply animation/human gate and UNSAFE_THRESHOLD to raw nudity model output.
+    Apply animation/human gate and UI sensitivity to raw nudity model output.
 
     Blur only when:
-        real human AND NOT animation AND nudity positive AND confidence >= 0.72
+        real human AND NOT animation AND nudity positive AND confidence >= threshold
     """
     gate_reason = content_type.get("gate_reason")
 
@@ -179,7 +179,7 @@ def build_gated_nudity_response(
             "model_loaded": model_loaded,
         }
 
-    if nudity_positive and nudity_confidence >= UNSAFE_THRESHOLD:
+    if nudity_positive and nudity_confidence >= threshold:
         logger.info(
             "[SafeView][Gate] real_human_nudity confidence=%.2f",
             nudity_confidence,

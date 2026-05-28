@@ -10,6 +10,18 @@ import { initBlurManager } from "./blurManager";
 import { initElementAudioPipelineListener } from "./elementAudioPipeline";
 import { startStaticImageMonitor } from "./imageMonitor";
 import { startVideoMonitor } from "./videoMonitor";
+import { MESSAGE_ACTION_SETTINGS_UPDATED } from "../shared/settingsMessages";
+
+function requestDefaultProtectionStart(reason: string): void {
+  void chrome.runtime
+    .sendMessage({
+      action: MESSAGE_ACTION_SETTINGS_UPDATED,
+      reason,
+    })
+    .catch(() => {
+      /* The service worker may be waking up; storage migration still keeps defaults enabled. */
+    });
+}
 
 /**
  * Bootstrap SafeView: monitor videos, send frames to service worker, apply blur on BLUR.
@@ -30,6 +42,11 @@ function initContentScript(): void {
   console.info(
     "[SafeView] Content script ready (video + images) — use this page's DevTools Console for [SafeView] logs."
   );
+
+  requestDefaultProtectionStart("content_boot_auto_start");
+  window.setTimeout(() => {
+    requestDefaultProtectionStart("content_boot_auto_start_retry");
+  }, 1500);
 }
 
 void ensureVisionProtectionDefaults()

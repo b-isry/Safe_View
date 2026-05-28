@@ -5,14 +5,12 @@
 
 import { checkBackendHealthAt } from "../background/aiClient";
 import {
-  CONFIDENCE_FLOOR,
   DEFAULT_SETTINGS,
   effectiveThreshold,
   loadSettings,
+  MAX_DETECTION_THRESHOLD,
+  MIN_DETECTION_THRESHOLD,
   saveSettings,
-  SENSITIVITY_HIGH,
-  SENSITIVITY_LOW,
-  SENSITIVITY_MEDIUM,
   type CategoryToggles,
   type SafeViewSettings,
 } from "../background/businessRules";
@@ -27,19 +25,19 @@ const CATEGORY_FIELDS: { key: keyof CategoryToggles; label: string }[] = [
   { key: "lgbtq", label: "LGBTQ+ Themes" },
 ];
 
-const SENSITIVITY_STOPS = [
-  { index: 0, value: SENSITIVITY_LOW, label: "Low" },
-  { index: 1, value: SENSITIVITY_MEDIUM, label: "Medium" },
-  { index: 2, value: SENSITIVITY_HIGH, label: "High" },
-] as const;
-
 let currentSettings: SafeViewSettings = { ...DEFAULT_SETTINGS };
 
-const sensitivitySlider = document.getElementById(
-  "sensitivitySlider"
+const nuditySensitivitySlider = document.getElementById(
+  "nuditySensitivitySlider"
 ) as HTMLInputElement;
-const sensitivityValue = document.getElementById(
-  "sensitivityValue"
+const nuditySensitivityValue = document.getElementById(
+  "nuditySensitivityValue"
+) as HTMLParagraphElement;
+const violenceSensitivitySlider = document.getElementById(
+  "violenceSensitivitySlider"
+) as HTMLInputElement;
+const violenceSensitivityValue = document.getElementById(
+  "violenceSensitivityValue"
 ) as HTMLParagraphElement;
 const backendUrlInput = document.getElementById("backendUrl") as HTMLInputElement;
 const testConnectionButton = document.getElementById(
@@ -68,44 +66,43 @@ const categoryCheckboxes = CATEGORY_FIELDS.map(({ key }) =>
   ) as HTMLInputElement
 );
 
-/**
- * Map sensitivity float to slider index 0–2.
- *
- * @param sensitivity - Stored sensitivity value.
- * @returns Nearest slider stop index.
- */
-function sensitivityToSliderIndex(sensitivity: number): number {
-  const match = SENSITIVITY_STOPS.reduce((best, stop) => {
-    const bestDelta = Math.abs(SENSITIVITY_STOPS[best].value - sensitivity);
-    const stopDelta = Math.abs(stop.value - sensitivity);
-    return stopDelta < bestDelta ? stop.index : best;
-  }, 0);
-  return match;
+function thresholdFromSlider(slider: HTMLInputElement): number {
+  return effectiveThreshold(Number(slider.value));
 }
 
 /**
- * Map slider index to sensitivity float.
+ * Update threshold hint text under a slider.
  *
- * @param index - Slider value 0, 1, or 2.
- * @returns Sensitivity float for storage.
+ * @param element - Hint paragraph to update.
+ * @param label - Category label.
+ * @param threshold - Current threshold value.
  */
-function sliderIndexToSensitivity(index: number): number {
-  const stop = SENSITIVITY_STOPS.find((item) => item.index === index);
-  return stop?.value ?? SENSITIVITY_MEDIUM;
+function updateThresholdHint(
+  element: HTMLParagraphElement,
+  label: string,
+  threshold: number
+): void {
+  element.textContent = `${label} threshold ${effectiveThreshold(threshold).toFixed(2)}`;
 }
 
-/**
- * Update sensitivity hint text under the slider.
- *
- * @param sensitivity - Current sensitivity value.
- */
-function updateSensitivityHint(sensitivity: number): void {
-  const stop = SENSITIVITY_STOPS.find(
-    (item) => Math.abs(item.value - sensitivity) < 0.001
+function syncThresholdSliders(settings: SafeViewSettings): void {
+  nuditySensitivitySlider.min = String(MIN_DETECTION_THRESHOLD);
+  nuditySensitivitySlider.max = String(MAX_DETECTION_THRESHOLD);
+  nuditySensitivitySlider.value = settings.nuditySensitivity.toFixed(2);
+  updateThresholdHint(
+    nuditySensitivityValue,
+    "Nudity",
+    settings.nuditySensitivity
   );
-  const label = stop?.label ?? "Custom";
-  const effective = effectiveThreshold(sensitivity);
-  sensitivityValue.textContent = `${label} — effective floor ${effective.toFixed(2)} (BR-01, min ${CONFIDENCE_FLOOR})`;
+
+  violenceSensitivitySlider.min = String(MIN_DETECTION_THRESHOLD);
+  violenceSensitivitySlider.max = String(MAX_DETECTION_THRESHOLD);
+  violenceSensitivitySlider.value = settings.violenceSensitivity.toFixed(2);
+  updateThresholdHint(
+    violenceSensitivityValue,
+    "Violence",
+    settings.violenceSensitivity
+  );
 }
 
 /**
@@ -146,9 +143,7 @@ function renderForm(settings: SafeViewSettings): void {
     checkbox.checked = currentSettings.categories[key];
   });
 
-  const sliderIndex = sensitivityToSliderIndex(currentSettings.sensitivity);
-  sensitivitySlider.value = String(sliderIndex);
-  updateSensitivityHint(currentSettings.sensitivity);
+  syncThresholdSliders(currentSettings);
 
   backendUrlInput.value = currentSettings.backendUrl;
   renderProfanityList();
@@ -198,12 +193,28 @@ async function handleCategoryChange(): Promise<void> {
 }
 
 /**
- * Handle sensitivity slider change — save immediately.
+ * Handle threshold slider change — save immediately.
  */
-async function handleSensitivityChange(): Promise<void> {
-  const index = Number(sensitivitySlider.value);
-  currentSettings.sensitivity = sliderIndexToSensitivity(index);
-  updateSensitivityHint(currentSettings.sensitivity);
+async function handleThresholdChange(category: "nudity" | "violence"): Promise<void> {
+  if (category === "nudity") {
+    currentSettings.nuditySensitivity = thresholdFromSlider(nuditySensitivitySlider);
+    currentSettings.sensitivity = currentSettings.nuditySensitivity;
+    updateThresholdHint(
+      nuditySensitivityValue,
+      "Nudity",
+      currentSettings.nuditySensitivity
+    );
+  } else {
+    currentSettings.violenceSensitivity = thresholdFromSlider(
+      violenceSensitivitySlider
+    );
+    updateThresholdHint(
+      violenceSensitivityValue,
+      "Violence",
+      currentSettings.violenceSensitivity
+    );
+  }
+
   await persistSettings();
 }
 
@@ -309,12 +320,28 @@ async function initOptions(): Promise<void> {
     });
   });
 
-  sensitivitySlider.addEventListener("input", () => {
-    updateSensitivityHint(sliderIndexToSensitivity(Number(sensitivitySlider.value)));
+  nuditySensitivitySlider.addEventListener("input", () => {
+    updateThresholdHint(
+      nuditySensitivityValue,
+      "Nudity",
+      thresholdFromSlider(nuditySensitivitySlider)
+    );
   });
 
-  sensitivitySlider.addEventListener("change", () => {
-    void handleSensitivityChange();
+  nuditySensitivitySlider.addEventListener("change", () => {
+    void handleThresholdChange("nudity");
+  });
+
+  violenceSensitivitySlider.addEventListener("input", () => {
+    updateThresholdHint(
+      violenceSensitivityValue,
+      "Violence",
+      thresholdFromSlider(violenceSensitivitySlider)
+    );
+  });
+
+  violenceSensitivitySlider.addEventListener("change", () => {
+    void handleThresholdChange("violence");
   });
 
   backendUrlInput.addEventListener("change", () => {

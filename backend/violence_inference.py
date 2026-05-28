@@ -14,11 +14,13 @@ import violence_loader
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_VIOLENCE_THRESHOLD = 0.50
-YOLO_MIN_BOX_CONF = 0.1
-
 ACTION_BLUR = "BLUR"
 ACTION_ALLOW = "ALLOW"
+
+
+def normalize_sensitivity(sensitivity: float) -> float:
+    """Clamp the UI sensitivity to the valid confidence range."""
+    return max(0.0, min(1.0, float(sensitivity)))
 
 
 def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
@@ -27,7 +29,7 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
 
     Args:
         image: RGB frame from the client.
-        sensitivity: User sensitivity; effective threshold is max(0.50, sensitivity) capped at 1.0.
+        sensitivity: User sensitivity; detections below this confidence are ignored.
 
     Returns:
         dict with detected, confidence, action, label, detections (with box when available).
@@ -43,7 +45,7 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             "gate_reason": "violence_model_not_loaded",
         }
 
-    effective_threshold = max(DEFAULT_VIOLENCE_THRESHOLD, min(1.0, float(sensitivity)))
+    effective_threshold = normalize_sensitivity(sensitivity)
     rgb_image = image.convert("RGB")
     width, height = rgb_image.size
 
@@ -51,7 +53,7 @@ def run_detection(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
         results = model.predict(
             rgb_image,
             verbose=False,
-            conf=YOLO_MIN_BOX_CONF,
+            conf=effective_threshold,
         )
     except Exception as exc:
         logger.error("[SafeView] Violence inference failed: %s", exc)

@@ -245,7 +245,7 @@ More detail: [`android/README.md`](android/README.md)
 2. **Extension:** `npm run build` → load unpacked → enable protection → visit a page with `<video>`.
 3. **Android:** `flutter run` → set backend URL → Test Connection → enable protection → Browser or Overlay mode.
 
-Default sensitivity uses a **0.75 confidence floor** (BR-01): effective threshold = `max(0.75, userSensitivity)`.
+Default sensitivity is **0.75** (Medium). The selected UI sensitivity is used directly as the detection threshold.
 
 ---
 
@@ -256,8 +256,13 @@ Default sensitivity uses a **0.75 confidence floor** (BR-01): effective threshol
 ```json
 {
   "status": "ok",
+  "models": {
+    "nudity": { "loaded": true },
+    "violence": { "loaded": true }
+  },
   "model": "dino_v3_linear",
-  "model_loaded": true
+  "model_loaded": true,
+  "whisper_loaded": true
 }
 ```
 
@@ -269,7 +274,7 @@ Multipart form-data:
 |-------|------|-------------|
 | `frame` | JPEG file | Video/screen frame |
 | `sensitivity` | float | 0.0–1.0 from user settings |
-| `category` | string | `nudity`, `violence`, `kissing`, `profanity`, `lgbtq` |
+| `category` | string | `nudity`, `violence`, `all` |
 
 Example response:
 
@@ -287,7 +292,8 @@ Example response:
 
 ## Known limitations
 
-- **Nudity only (real model):** `dino_v3_linear.pth` powers nudity detection. Violence, kissing, profanity, and LGBTQ+ categories are **stubs** that always return no detection until real models are added.
+- **Active local models:** `dino_v3_linear.pth` powers nudity detection, `violence.pt` powers violence detection, and Whisper + blacklist files power audio profanity muting. Kissing and LGBTQ+ categories remain disabled placeholders.
+- **Audio dependency:** Profanity audio detection requires `openai-whisper`, `pydub`, and system `ffmpeg` available on `PATH`.
 - **Full-screen blur only:** No coordinate-based or “surgical” masking — entire `<video>` (extension), WebView overlay (browser mode), or full-screen layer (Android overlay).
 - **Local backend only:** No cloud inference; clients must reach your machine on the LAN or localhost. No offline/on-device model in the extension or app.
 - **Chrome desktop only:** MV3 extension targets Chromium desktop; no Firefox/Safari, no iOS.

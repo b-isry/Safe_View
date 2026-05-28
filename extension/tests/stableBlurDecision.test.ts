@@ -6,11 +6,11 @@ import {
   evaluateStableDemoBlur,
 } from "../src/background/stableBlurDecision";
 import {
-  BLUR_ON_THRESHOLD,
-  BLUR_OFF_THRESHOLD,
   MIN_BLUR_HOLD_MS,
   SAFE_FRAMES_TO_CLEAR,
 } from "../src/shared/stableBlurPolicy";
+
+const UI_SENSITIVITY = 0.5;
 
 const unsafeResponse = {
   model_loaded: true,
@@ -34,11 +34,12 @@ const safeResponse = {
 };
 
 describe("stableBlurDecision", () => {
-  it("BLUR when score is at or above BLUR_ON_THRESHOLD", () => {
+  it("BLUR when score is at or above UI sensitivity", () => {
     const state = createStableBlurState();
     const result = decideStableBlur(unsafeResponse, state, {
       nowMs: 10_000,
       backendTrusted: true,
+      sensitivity: UI_SENSITIVITY,
     });
     expect(result.command).toBe("BLUR");
     expect(result.reason).toBe("unsafe_above_blur_on_threshold");
@@ -48,14 +49,19 @@ describe("stableBlurDecision", () => {
   it("CLEAR when score drops below 50% after blur", () => {
     let state = createStableBlurState();
     const t0 = 30_000;
-    state = decideStableBlur(unsafeResponse, state, { nowMs: t0 }).state;
+    state = decideStableBlur(unsafeResponse, state, {
+      nowMs: t0,
+      sensitivity: UI_SENSITIVITY,
+    }).state;
     for (let i = 1; i < SAFE_FRAMES_TO_CLEAR; i += 1) {
       state = decideStableBlur(belowThresholdResponse, state, {
         nowMs: t0 + MIN_BLUR_HOLD_MS,
+        sensitivity: UI_SENSITIVITY,
       }).state;
     }
     const cleared = decideStableBlur(belowThresholdResponse, state, {
       nowMs: t0 + MIN_BLUR_HOLD_MS + 100,
+      sensitivity: UI_SENSITIVITY,
     });
     expect(cleared.command).toBe("CLEAR");
     expect(cleared.state.isBlurred).toBe(false);
@@ -64,11 +70,15 @@ describe("stableBlurDecision", () => {
   it("CLEAR only after safe streak and minimum hold", () => {
     let state = createStableBlurState();
     const t0 = 20_000;
-    state = decideStableBlur(unsafeResponse, state, { nowMs: t0 }).state;
+    state = decideStableBlur(unsafeResponse, state, {
+      nowMs: t0,
+      sensitivity: UI_SENSITIVITY,
+    }).state;
 
     for (let i = 1; i < SAFE_FRAMES_TO_CLEAR; i += 1) {
       const mid = decideStableBlur(safeResponse, state, {
         nowMs: t0 + i * 100,
+        sensitivity: UI_SENSITIVITY,
       });
       expect(mid.command).toBe("KEEP");
       expect(mid.reason).toBe("waiting_for_safe_confirmation");
@@ -77,11 +87,13 @@ describe("stableBlurDecision", () => {
 
     const beforeHold = decideStableBlur(safeResponse, state, {
       nowMs: t0 + MIN_BLUR_HOLD_MS - 1,
+      sensitivity: UI_SENSITIVITY,
     });
     expect(beforeHold.command).toBe("KEEP");
 
     const cleared = decideStableBlur(safeResponse, beforeHold.state, {
       nowMs: t0 + MIN_BLUR_HOLD_MS,
+      sensitivity: UI_SENSITIVITY,
     });
     expect(cleared.command).toBe("CLEAR");
     expect(cleared.reason).toBe("safe_confirmed");
@@ -90,7 +102,10 @@ describe("stableBlurDecision", () => {
 
   it("score below 50% does not turn blur on when unblurred", () => {
     const state = createStableBlurState();
-    const result = decideStableBlur(belowThresholdResponse, state, { nowMs: 1_000 });
+    const result = decideStableBlur(belowThresholdResponse, state, {
+      nowMs: 1_000,
+      sensitivity: UI_SENSITIVITY,
+    });
     expect(result.command).toBe("CLEAR");
     expect(result.state.isBlurred).toBe(false);
   });
@@ -105,7 +120,7 @@ describe("stableBlurDecision", () => {
         confidence: 0.5,
       },
       state,
-      { nowMs: 1_000 }
+      { nowMs: 1_000, sensitivity: UI_SENSITIVITY }
     );
     expect(result.command).toBe("BLUR");
     expect(result.state.isBlurred).toBe(true);
@@ -121,7 +136,7 @@ describe("stableBlurDecision", () => {
         confidence: 0.77,
       },
       state,
-      { nowMs: 1_000, backendTrusted: true }
+      { nowMs: 1_000, backendTrusted: true, sensitivity: UI_SENSITIVITY }
     );
     expect(result.command).toBe("BLUR");
     expect(result.reason).toBe("unsafe_above_blur_on_threshold");
@@ -139,26 +154,43 @@ describe("stableBlurDecision", () => {
       resultGeneration: 1,
       currentGeneration: 1,
       backendTrusted: true,
+      sensitivity: UI_SENSITIVITY,
     });
     expect(result).toEqual({ dropped: true, reason: "stale_frame" });
   });
 
   it("keeps blur on backend error when already blurred", () => {
     let state = createStableBlurState();
-    state = decideStableBlur(unsafeResponse, state, { nowMs: 5_000 }).state;
+    state = decideStableBlur(unsafeResponse, state, {
+      nowMs: 5_000,
+      sensitivity: UI_SENSITIVITY,
+    }).state;
     const result = decideStableBlur(
       { model_loaded: false, action: "ALLOW", detected: false, confidence: 0 },
       state,
-      { nowMs: 5_100, backendTrusted: false }
+      { nowMs: 5_100, backendTrusted: false, sensitivity: UI_SENSITIVITY }
     );
     expect(result.command).toBe("KEEP");
     expect(result.reason).toBe("backend_unavailable_keep_blur");
   });
 
-  it("uses 50% as blur on/off split", () => {
-    expect(BLUR_ON_THRESHOLD).toBe(0.5);
-    expect(BLUR_OFF_THRESHOLD).toBe(0.5);
-    expect(belowThresholdResponse.confidence).toBeLessThan(BLUR_OFF_THRESHOLD);
-    expect(unsafeResponse.confidence).toBeGreaterThanOrEqual(BLUR_ON_THRESHOLD);
+  it("uses supplied UI sensitivity as the blur threshold", () => {
+    const state = createStableBlurState();
+    const result = decideStableBlur(
+      {
+        model_loaded: true,
+        action: "ALLOW",
+        detected: false,
+        confidence: 0.77,
+      },
+      state,
+      { nowMs: 1_000, backendTrusted: true, sensitivity: 0.9 }
+    );
+    expect(result.command).toBe("CLEAR");
+  });
+
+  it("uses 50% in tests only when that is the supplied UI sensitivity", () => {
+    expect(belowThresholdResponse.confidence).toBeLessThan(UI_SENSITIVITY);
+    expect(unsafeResponse.confidence).toBeGreaterThanOrEqual(UI_SENSITIVITY);
   });
 });

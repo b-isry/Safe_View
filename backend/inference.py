@@ -14,12 +14,8 @@ from PIL import Image
 from torchvision import transforms
 
 import model_loader
-import vision_service
 
 logger = logging.getLogger(__name__)
-
-# BR-01: confidence floor regardless of user sensitivity setting
-CONFIDENCE_FLOOR = vision_service.VISION_THRESHOLD
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -39,6 +35,11 @@ _preprocess_transform = transforms.Compose(
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ]
 )
+
+
+def normalize_sensitivity(sensitivity: float) -> float:
+    """Clamp the UI sensitivity to the valid confidence range."""
+    return max(0.0, min(1.0, float(sensitivity)))
 
 
 def preprocess(pil_image: Image.Image) -> torch.Tensor:
@@ -157,7 +158,7 @@ def run_inference(tensor: torch.Tensor, sensitivity: float) -> Dict[str, Any]:
             "label": "SFW",
         }
 
-    effective_threshold = max(CONFIDENCE_FLOOR, sensitivity)
+    effective_threshold = normalize_sensitivity(sensitivity)
     detected = False
     confidence = 0.0
     action = ACTION_ALLOW

@@ -3,19 +3,25 @@
 // Bahir Dar Institute of Technology — Software Engineering Capstone, 2018 EC
 // Purpose: BR-01 through BR-08 helpers for the extension service worker.
 
-/** BR-01: minimum confidence threshold regardless of user sensitivity. */
-export const CONFIDENCE_FLOOR = 0.75;
+/** Lowest valid confidence threshold from the UI threshold sliders. */
+export const MIN_DETECTION_THRESHOLD = 0;
+
+/** Highest valid confidence threshold from the UI threshold sliders. */
+export const MAX_DETECTION_THRESHOLD = 0.9;
 
 /** Default backend URL for local FastAPI during development. */
 export const DEFAULT_BACKEND_URL = "http://localhost:8000";
 
-/** Default user sensitivity (Medium stop). */
-export const DEFAULT_SENSITIVITY = 0.75;
+/** Default visual detection threshold. */
+export const DEFAULT_DETECTION_THRESHOLD = 0.75;
 
-/** Sensitivity slider stops (options page). */
+/** @deprecated Use DEFAULT_DETECTION_THRESHOLD. */
+export const DEFAULT_SENSITIVITY = DEFAULT_DETECTION_THRESHOLD;
+
+/** @deprecated Legacy labels kept for older tests/imports. */
 export const SENSITIVITY_LOW = 0.6;
-export const SENSITIVITY_MEDIUM = 0.75;
-export const SENSITIVITY_HIGH = 0.9;
+export const SENSITIVITY_MEDIUM = DEFAULT_DETECTION_THRESHOLD;
+export const SENSITIVITY_HIGH = MAX_DETECTION_THRESHOLD;
 
 /** Default profanity blacklist (BR-03) — user-editable in options. */
 export const DEFAULT_PROFANITY_WORDS: string[] = [];
@@ -50,7 +56,12 @@ export interface CategoryToggles {
 export interface SafeViewSettings {
   protectionEnabled: boolean;
   backendUrl: string;
+  /** @deprecated Legacy shared threshold; kept for old stored settings migration. */
   sensitivity: number;
+  /** Nudity confidence threshold from the options UI. */
+  nuditySensitivity: number;
+  /** Violence confidence threshold from the options UI. */
+  violenceSensitivity: number;
   categories: CategoryToggles;
   /** BR-03: editable profanity blacklist (subtitle / audio stub). */
   profanityWords: string[];
@@ -61,19 +72,21 @@ export interface SafeViewSettings {
 /** Storage keys for SafeView settings. */
 export const SETTINGS_STORAGE_KEY = "safeview_settings";
 
-/** One-time migration: enable protection + nudity without using the popup. */
-export const VISION_DEFAULTS_MIGRATION_KEY = "safeview_vision_defaults_v2";
+/** One-time migration: enable demo-ready protections without using the popup. */
+export const VISION_DEFAULTS_MIGRATION_KEY = "safeview_vision_defaults_v4";
 
 /** Default settings applied when nothing is stored yet. */
 export const DEFAULT_SETTINGS: SafeViewSettings = {
   protectionEnabled: true,
   backendUrl: DEFAULT_BACKEND_URL,
-  sensitivity: DEFAULT_SENSITIVITY,
+  sensitivity: DEFAULT_DETECTION_THRESHOLD,
+  nuditySensitivity: DEFAULT_DETECTION_THRESHOLD,
+  violenceSensitivity: DEFAULT_DETECTION_THRESHOLD,
   categories: {
     nudity: true,
-    violence: false,
+    violence: true,
     kissing: false,
-    profanity: false,
+    profanity: true,
     lgbtq: false,
   },
   profanityWords: [...DEFAULT_PROFANITY_WORDS],
@@ -86,13 +99,16 @@ let cachedSettings: SafeViewSettings = { ...DEFAULT_SETTINGS };
 let settingsCacheListenerRegistered = false;
 
 /**
- * Compute BR-01 effective detection threshold.
+ * Compute the effective detection threshold from UI sensitivity.
  *
  * @param userSensitivity - User sensitivity from settings (0.0–1.0).
- * @returns max(0.75, userSensitivity).
+ * @returns User sensitivity clamped to [0, 1].
  */
 export function effectiveThreshold(userSensitivity: number): number {
-  return Math.max(CONFIDENCE_FLOOR, userSensitivity);
+  return Math.max(
+    MIN_DETECTION_THRESHOLD,
+    Math.min(MAX_DETECTION_THRESHOLD, userSensitivity)
+  );
 }
 
 /**
@@ -125,11 +141,23 @@ function mergeSettings(raw: Partial<SafeViewSettings> | undefined): SafeViewSett
     return { ...DEFAULT_SETTINGS };
   }
 
+  const legacySensitivity = effectiveThreshold(
+    raw.sensitivity ?? DEFAULT_SETTINGS.sensitivity
+  );
+  const nuditySensitivity = effectiveThreshold(
+    raw.nuditySensitivity ?? legacySensitivity
+  );
+  const violenceSensitivity = effectiveThreshold(
+    raw.violenceSensitivity ?? legacySensitivity
+  );
+
   return {
     protectionEnabled:
       raw.protectionEnabled ?? DEFAULT_SETTINGS.protectionEnabled,
     backendUrl: raw.backendUrl ?? DEFAULT_SETTINGS.backendUrl,
-    sensitivity: raw.sensitivity ?? DEFAULT_SETTINGS.sensitivity,
+    sensitivity: legacySensitivity,
+    nuditySensitivity,
+    violenceSensitivity,
     categories: {
       ...DEFAULT_SETTINGS.categories,
       ...raw.categories,
@@ -154,7 +182,7 @@ export function getCachedSettings(): SafeViewSettings {
 }
 
 /**
- * Persist default protection + nudity on first install or when storage is empty.
+ * Persist default protection + active demo categories on first install or migration.
  * Also runs a one-time migration so older installs work without opening the popup.
  */
 export async function ensureVisionProtectionDefaults(): Promise<void> {
@@ -181,6 +209,8 @@ export async function ensureVisionProtectionDefaults(): Promise<void> {
     const settings = mergeSettings(raw);
     settings.protectionEnabled = true;
     settings.categories.nudity = true;
+    settings.categories.violence = true;
+    settings.categories.profanity = true;
     await saveSettings(settings);
     await chrome.storage.local.set({ [VISION_DEFAULTS_MIGRATION_KEY]: true });
   } catch (error) {

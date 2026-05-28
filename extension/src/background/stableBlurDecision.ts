@@ -3,8 +3,6 @@
 
 import type { AnalyzeImageResponse } from "../shared/apiTypes";
 import {
-  BLUR_OFF_THRESHOLD,
-  BLUR_ON_THRESHOLD,
   BLUR_TTL_MS,
   MIN_BLUR_HOLD_MS,
   SAFE_FRAMES_TO_CLEAR,
@@ -46,6 +44,7 @@ export interface StableBlurEvaluateInput {
   resultGeneration: number;
   currentGeneration: number;
   backendTrusted: boolean;
+  sensitivity: number;
   nowMs?: number;
 }
 
@@ -70,11 +69,16 @@ export function decideStableBlur(
     "model_loaded" | "action" | "detected" | "confidence"
   >,
   state: StableBlurState,
-  options: { nowMs?: number; backendTrusted?: boolean } = {}
+  options: {
+    nowMs?: number;
+    backendTrusted?: boolean;
+    sensitivity: number;
+  }
 ): StableBlurDecision {
   const now = options.nowMs ?? Date.now();
   const backendTrusted = options.backendTrusted ?? true;
   const score = Number(response.confidence ?? 0);
+  const threshold = Math.max(0, Math.min(1, options.sensitivity));
   const next: StableBlurState = { ...state };
 
   if (!backendTrusted || response.model_loaded === false) {
@@ -129,14 +133,11 @@ export function decideStableBlur(
     };
   }
 
-  // Demo: score drives blur ON/OFF — backend gate may return ALLOW while confidence is high.
+  // Demo: score drives blur ON/OFF using the UI sensitivity threshold.
   const isUnsafe =
-    response.model_loaded !== false && score >= BLUR_ON_THRESHOLD;
+    response.model_loaded !== false && score >= threshold;
 
-  const isDefinitelySafe = score < BLUR_OFF_THRESHOLD;
-
-  const isBorderline =
-    score >= BLUR_OFF_THRESHOLD && score < BLUR_ON_THRESHOLD;
+  const isDefinitelySafe = score < threshold;
 
   if (isUnsafe) {
     next.unsafeStreak += 1;
@@ -148,18 +149,6 @@ export function decideStableBlur(
     return {
       command: "BLUR",
       reason: "unsafe_above_blur_on_threshold",
-      mode: "full",
-      score,
-      state: next,
-    };
-  }
-
-  if (isBorderline && next.isBlurred) {
-    next.lastResultAt = now;
-    next.lastCommand = "KEEP";
-    return {
-      command: "KEEP",
-      reason: "borderline_keep_existing_blur",
       mode: "full",
       score,
       state: next,
@@ -254,6 +243,7 @@ export function evaluateStableDemoBlur(
   const decision = decideStableBlur(input.response, withSeq, {
     nowMs: input.nowMs,
     backendTrusted: input.backendTrusted,
+    sensitivity: input.sensitivity,
   });
 
   decision.state.latestAppliedFrameSeq = Math.max(

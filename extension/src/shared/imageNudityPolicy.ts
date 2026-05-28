@@ -1,9 +1,6 @@
 // SafeView — imageNudityPolicy.ts
 // Purpose: Website <img> nudity scan constants (separate from video sampling policy).
 
-/** Blur website images when nudity confidence is at or above this (images only). */
-export const IMAGE_NUDITY_BLUR_THRESHOLD = 0.5;
-
 /** Show a small on-image badge with the last nudity score (debug/feedback). */
 export const IMAGE_SHOW_SCORE_LABEL = true;
 

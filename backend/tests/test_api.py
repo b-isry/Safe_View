@@ -46,6 +46,8 @@ def test_health_response_shape(client: TestClient) -> None:
     assert models["nudity"]["supports_boxes"] is False
     assert models["violence"]["supports_boxes"] is True
     assert str(paths.NUDITY_MODEL_PATH) in models["nudity"]["path"]
+    assert str(paths.VIOLENCE_MODEL_PATH) in models["violence"]["path"]
+    assert isinstance(body["whisper_loaded"], bool)
 
 
 def test_analyze_image_blank_jpeg_response_shape(
@@ -71,11 +73,11 @@ def test_analyze_image_blank_jpeg_response_shape(
     assert body["supports_boxes"] is False
 
 
-def test_br01_threshold_floor_low_sensitivity() -> None:
-    """BR-01: sensitivity=0.1 still uses effective threshold floor (not 0.1)."""
+def test_nudity_uses_ui_sensitivity_directly() -> None:
+    """Nudity detection uses the request sensitivity without a hardcoded floor."""
     low_sensitivity = 0.1
-    effective = max(inference.CONFIDENCE_FLOOR, low_sensitivity)
-    assert effective == inference.CONFIDENCE_FLOOR
+    effective = inference.normalize_sensitivity(low_sensitivity)
+    assert effective == low_sensitivity
 
     mock_model = MagicMock()
     mock_model.training = False
@@ -89,8 +91,8 @@ def test_br01_threshold_floor_low_sensitivity() -> None:
     ):
         result = inference.run_inference(tensor, low_sensitivity)
 
-    assert result["detected"] is False
-    assert result["action"] == inference.ACTION_ALLOW
+    assert result["detected"] is True
+    assert result["action"] == inference.ACTION_BLUR
     assert result["confidence"] == pytest.approx(0.3775, rel=1e-2)
 
 

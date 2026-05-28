@@ -15,7 +15,6 @@ import model_loader
 logger = logging.getLogger(__name__)
 
 CATEGORY = "nudity"
-UNSAFE_THRESHOLD = content_gate.UNSAFE_THRESHOLD
 
 
 def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
@@ -24,7 +23,7 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
 
     High-confidence NSFW from the classifier always triggers BLUR (no partial-region boxes).
     """
-    del sensitivity  # Threshold fixed at UNSAFE_THRESHOLD for nudity classifier.
+    effective_threshold = inference.normalize_sensitivity(sensitivity)
 
     if not model_loader.MODEL_LOADED or model_loader.get_model() is None:
         logger.warning(
@@ -41,7 +40,7 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
         confidence = float(raw["confidence"])
 
         # Trust classifier when confidence is high — do not block on weak heuristics.
-        if nudity_positive and confidence >= UNSAFE_THRESHOLD:
+        if nudity_positive and confidence >= effective_threshold:
             return {
                 "category": CATEGORY,
                 "detected": True,
@@ -60,6 +59,7 @@ def analyze(image: Image.Image, sensitivity: float) -> Dict[str, Any]:
             nudity_confidence=confidence,
             nudity_positive=nudity_positive,
             model_loaded=True,
+            threshold=effective_threshold,
         )
 
         return {

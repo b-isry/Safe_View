@@ -1,18 +1,6 @@
 // SafeView — latencyPolicy.ts
 // Purpose: Client blur latency policy (full-frame nudity + region/full violence).
 
-/** Nudity classifier threshold (demo blur ON at ≥ 50% confidence). */
-export const NUDITY_THRESHOLD = 0.5;
-
-/** Violence detection threshold when backend action is BLUR. */
-export const VIOLENCE_THRESHOLD = 0.5;
-
-/** @deprecated Alias — use NUDITY_THRESHOLD for nudity decisions. */
-export const UNSAFE_THRESHOLD = NUDITY_THRESHOLD;
-
-/** Below this with detected === false: treat as safe. */
-export const SAFE_THRESHOLD = 0.5;
-
 /** Safe frames to clear preemptive blur on first trusted result. */
 export const FIRST_SAFE_CLEAR_STREAK = 1;
 

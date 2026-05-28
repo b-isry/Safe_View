@@ -1,5 +1,5 @@
 // SafeView — imageMonitor.ts
-// Purpose: Scan visible webpage images and blur when nudity score ≥ 0.50.
+// Purpose: Scan visible webpage images and apply backend/UI sensitivity decisions.
 
 import {
   isNudityProtectionActive,
@@ -18,7 +18,6 @@ import {
   IMAGE_MIN_DIMENSION_PX,
   IMAGE_BATCH_PER_RESCAN,
   IMAGE_MIN_RESCAN_INTERVAL_MS,
-  IMAGE_NUDITY_BLUR_THRESHOLD,
   IMAGE_SHOW_SCORE_LABEL,
   IMAGE_SKIP_RESCAN_WHEN_SETTLED,
   IMAGE_RESCAN_INTERVAL_MS,
@@ -217,27 +216,14 @@ function applyScanResultToImage(
   if (result.shouldBlur) {
     applyImageBlur(img);
     console.info(
-      "[SafeView][Image] Blur applied score=%s threshold=%s (%sx%s visible)",
+      "[SafeView][Image] Blur applied score=%s (%sx%s visible)",
       result.score.toFixed(2),
-      IMAGE_NUDITY_BLUR_THRESHOLD.toFixed(2),
       Math.round(img.getBoundingClientRect().width),
       Math.round(img.getBoundingClientRect().height)
     );
   } else {
     clearImageBlur(img);
-    if (result.score > 0 && result.score < IMAGE_NUDITY_BLUR_THRESHOLD) {
-      console.info(
-        "[SafeView][Image] Clear score=%s (below threshold %s)",
-        result.score.toFixed(2),
-        IMAGE_NUDITY_BLUR_THRESHOLD.toFixed(2)
-      );
-    } else {
-      console.info(
-        "[SafeView][Image] Clear score=%s threshold=%s",
-        result.score.toFixed(2),
-        IMAGE_NUDITY_BLUR_THRESHOLD.toFixed(2)
-      );
-    }
+    console.info("[SafeView][Image] Clear score=%s", result.score.toFixed(2));
   }
 }
 
@@ -693,16 +679,14 @@ function applyScanResultToBackground(
   if (result.shouldBlur) {
     applyElementImageBlur(element);
     console.info(
-      "[SafeView][Image] Blur applied (background) score=%s threshold=%s",
-      result.score.toFixed(2),
-      IMAGE_NUDITY_BLUR_THRESHOLD.toFixed(2)
+      "[SafeView][Image] Blur applied (background) score=%s",
+      result.score.toFixed(2)
     );
   } else {
     clearElementImageBlur(element);
     console.info(
-      "[SafeView][Image] Clear (background) score=%s threshold=%s",
-      result.score.toFixed(2),
-      IMAGE_NUDITY_BLUR_THRESHOLD.toFixed(2)
+      "[SafeView][Image] Clear (background) score=%s",
+      result.score.toFixed(2)
     );
   }
 }
